@@ -10,13 +10,14 @@ import sys
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v1.3.4"
+APP_VERSION = "v1.3.5"
 UPDATE_LOG = """
 - v1.3.0: 採用 (H+L+C)/3 公式計算成交金額。
 - v1.3.1: 修正 API 名稱。
 - v1.3.2: 增加 API 自動降級機制。
 - v1.3.3: 新增智慧欄位對應。
-- v1.3.4: 新增「純數字代號」濾網，過濾掉 API 回傳的類股指數 (如 Electronic)。
+- v1.3.4: 新增「純數字代號」濾網。
+- v1.3.5: 新增「前 300 名詳細清單」，標註剔除原因（解決分母不一致的疑問）。
 """
 
 # ==========================================
@@ -24,7 +25,7 @@ UPDATE_LOG = """
 # ==========================================
 API_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJkYXRlIjoiMjAyNi0wMS0xNCAxOTowMDowNiIsInVzZXJfaWQiOiJcdTllYzNcdTRlYzFcdTVhMDEiLCJlbWFpbCI6ImExOTE3NjZAZ21haWwuY29tIiwiaXAiOiIifQ.JFPtMDNbxKzhl8HsxkOlA1tMlwq8y_NA6NpbRel6HCk"
 TOP_N = 300              
-RANK_DISPLAY_N = 600     
+RANK_DISPLAY_N = 300     # 配合使用者需求，這裡主要顯示前 300 檔的詳細狀況
 BREADTH_THRESHOLD = 0.65
 EXCLUDE_ETF_PREFIX = "00"
 
@@ -84,52 +85,78 @@ def fetch_data(_api):
         st.error(f"資料欄位解析失敗: {e}")
         return None
 
-    # 3. 過濾雜訊 (關鍵修改 v1.3.4)
-    # (1) 確保代號是字串
+    # 3. 過濾雜訊
     df_all['MyId'] = df_all['MyId'].astype(str)
-    # (2) 只保留「純數字」的代號 (過濾掉 Electronic, Semiconductor 等類股指數)
-    df_all = df_all[df_all['MyId'].str.isdigit()]
-    # (3) 排除 00 開頭的 ETF
-    df_all = df_all[~df_all['MyId'].str.startswith(EXCLUDE_ETF_PREFIX)]
-    # (4) 再次確保排除大盤 (雖然 isdigit 應該已經排除了 TAIEX)
-    df_all = df_all[df_all['MyId'] != "TAIEX"]
+    df_all = df_all[df_all['MyId'].str.isdigit()]  # 只留純數字 (過濾 Electronic 等指數)
+    df_all = df_all[~df_all['MyId'].str.startswith(EXCLUDE_ETF_PREFIX)] # 過濾 ETF
+    df_all = df_all[df_all['MyId'] != "TAIEX"] # 過濾大盤
 
-    # 4. 計算成交金額 (百萬)
+    # 4. 計算成交金額並排序
     df_all['avg_price'] = (df_all['MyHigh'] + df_all['MyLow'] + df_all['MyClose']) / 3.0
     df_all['turnover_val'] = (df_all['avg_price'] * df_all['MyVol']) / 1_000_000.0
     
-    # 5. 排序與取樣
-    df_ranked = df_all.sort_values('turnover_val', ascending=False).head(RANK_DISPLAY_N)
-    top_codes = df_ranked.head(TOP_N)['MyId'].tolist() 
+    # 取前 300 名作為「候選名單」
+    df_candidates = df_all.sort_values('turnover_val', ascending=False).head(TOP_N).copy()
     
     results = []
-    progress_bar = st.progress(0, text="分析個股 MA5 狀態中...")
+    detailed_status = [] # 用來存 300 檔的詳細狀態
     
-    for i, code in enumerate(top_codes):
+    progress_bar = st.progress(0, text="逐檔檢查 K 線資料完整性...")
+    total_candidates = len(df_candidates)
+
+    # 5. 逐一檢查這 300 檔
+    for i, (idx, row) in enumerate(df_candidates.iterrows()):
+        code = row['MyId']
+        rank = i + 1
+        note = ""
+        status = "未知"
+        is_valid = False
+        
         try:
+            # 抓取個股歷史資料
             stock_df = _api.taiwan_stock_daily(
                 stock_id=code,
                 start_date=(datetime.now() - timedelta(days=15)).strftime("%Y-%m-%d")
             )
-            # 確保資料長度足夠 (這就是為什麼會有 299/300 的原因)
+            
+            # 檢查資料長度
             if len(stock_df) >= 6:
                 stock_df['MA5'] = stock_df['close'].rolling(5).mean()
                 curr_row = stock_df.iloc[-1]
                 prev_row = stock_df.iloc[-2]
                 
+                # 加入廣度計算
                 results.append({
-                    "code": code,
                     "d_curr_ok": curr_row['close'] > curr_row['MA5'],
                     "d_prev_ok": prev_row['close'] > prev_row['MA5']
                 })
-        except:
-            continue
+                status = "✅ 納入"
+                is_valid = True
+            else:
+                status = "❌ 剔除"
+                note = f"資料不足 (僅 {len(stock_df)} 筆，需 6 筆)"
+                
+        except Exception as e:
+            status = "❌ 剔除"
+            note = f"API 抓取失敗: {str(e)}"
         
+        # 記錄詳細清單
+        detailed_status.append({
+            "排名": rank,
+            "代號": code,
+            "收盤": row['MyClose'],
+            "成交額(百萬)": round(row['turnover_val'], 2),
+            "狀態": status,
+            "備註": note
+        })
+
         if i % 10 == 0:
-            progress_bar.progress((i + 1) / len(top_codes), text=f"進度: {i+1}/{len(top_codes)}")
+            progress_bar.progress((i + 1) / total_candidates, text=f"檢查中: 排名 {rank} ({code})")
     
     progress_bar.empty()
+    
     res_df = pd.DataFrame(results)
+    detail_df = pd.DataFrame(detailed_status)
     
     # 大盤 MA5 斜率
     twii_df = _api.taiwan_stock_daily(
@@ -152,7 +179,7 @@ def fetch_data(_api):
         "ma5_t": ma5_t,
         "ma5_t_1": ma5_t_1,
         "slope": slope,
-        "rank_list": df_ranked[['MyId', 'MyClose', 'turnover_val']].head(10)
+        "detail_df": detail_df # 回傳完整清單
     }
 
 # ==========================================
@@ -177,7 +204,7 @@ def run_streamlit():
         st.cache_data.clear()
 
     try:
-        with st.spinner("正在獲取盤中數據..."):
+        with st.spinner("正在獲取並檢查前 300 檔個股資料..."):
             data = fetch_data(api)
             
         if data is None:
@@ -201,16 +228,31 @@ def run_streamlit():
             st.success(f"✅ 結論（{data['d_curr']} 的隔日）：可進場")
         else:
             st.error(f"⛔ 結論（{data['d_curr']} 的隔日）：不可進場")
+        
+        st.write(f"- 廣度連兩天 ≥ 65%：{'✅ 通過' if cond1 else '❌ 未通過'}")
+        st.write(f"- 大盤 MA5 斜率 > 0：{'✅ 通過' if cond2 else '❌ 未通過'} (MA5斜率: {data['slope']:.2f})")
 
-        col_list, col_detail = st.columns([1, 1])
-        with col_list:
-            st.write("📊 **今日成交金額排行 (Top 10)**")
-            st.dataframe(data['rank_list'].rename(columns={'MyId':'代號', 'MyClose':'收盤', 'turnover_val':'金額(百萬)'}))
-
-        with col_detail:
-            st.write("🔍 **判斷條件詳情**")
-            st.write(f"- 廣度連兩天 ≥ 65%：{'通過' if cond1 else '未通過'}")
-            st.write(f"- 大盤 MA5 斜率 > 0：{'通過' if cond2 else '未通過'}")
+        st.divider()
+        
+        # 顯示完整名單與剔除原因
+        st.subheader(f"📋 前 {TOP_N} 大成交值個股檢查清單")
+        st.info("💡 點擊欄位標題可排序，或使用右上角搜尋框輸入「剔除」來查看被排除的股票。")
+        
+        # 為了讓使用者更容易看到剔除項，我們先把剔除的排在前面，或者維持排名
+        df_show = data['detail_df']
+        
+        # 顯示 Dataframe
+        st.dataframe(
+            df_show, 
+            column_config={
+                "排名": st.column_config.NumberColumn(format="%d"),
+                "成交額(百萬)": st.column_config.NumberColumn(format="$%.2f"),
+                "收盤": st.column_config.NumberColumn(format="%.2f"),
+            },
+            use_container_width=True,
+            height=600,
+            hide_index=True
+        )
 
     except Exception as e:
         st.error(f"執行出錯: {e}")
