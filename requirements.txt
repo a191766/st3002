@@ -1,8 +1,4 @@
-streamlit
+FinMind>=1.7.0
+streamlit>=1.30.0
 pandas
-plotly
-FinMind
-requests
-yfinance
-urllib3
-tqdm
+numpy
