@@ -10,12 +10,13 @@ import sys
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v1.3.3"
+APP_VERSION = "v1.3.4"
 UPDATE_LOG = """
 - v1.3.0: 採用 (H+L+C)/3 公式計算成交金額。
 - v1.3.1: 修正 API 名稱。
 - v1.3.2: 增加 API 自動降級機制。
-- v1.3.3: 新增智慧欄位對應，解決 max/min 與 High/Low 欄位名稱不一致導致的 KeyError。
+- v1.3.3: 新增智慧欄位對應。
+- v1.3.4: 新增「純數字代號」濾網，過濾掉 API 回傳的類股指數 (如 Electronic)。
 """
 
 # ==========================================
@@ -35,7 +36,6 @@ st.set_page_config(page_title="盤中權證進場判斷", layout="wide")
 
 def get_trading_days(api):
     """ 取得最近交易日 """
-    # 為了避免 AttributeError，這裡只使用最基本的 taiwan_stock_daily
     df = api.taiwan_stock_daily(
         stock_id="0050", 
         start_date=(datetime.now() - timedelta(days=20)).strftime("%Y-%m-%d")
@@ -43,10 +43,7 @@ def get_trading_days(api):
     return sorted(df['date'].unique().tolist())
 
 def smart_get_column(df, target_type):
-    """ 
-    智慧欄位對應：自動處理不同 API 回傳的欄位名稱差異 
-    target_type: 'High', 'Low', 'Close', 'Volume', 'Id'
-    """
+    """ 智慧欄位對應 """
     mappings = {
         'High': ['High', 'high', 'max', 'Max'],
         'Low': ['Low', 'low', 'min', 'Min'],
@@ -54,14 +51,11 @@ def smart_get_column(df, target_type):
         'Volume': ['Volume', 'volume', 'Trading_Volume', 'vol'],
         'Id': ['stock_id', 'stock_code', 'code', 'SecurityCode']
     }
-    
     candidates = mappings.get(target_type, [])
     for c in candidates:
         if c in df.columns:
             return df[c]
-            
-    # 若都找不到，列出當前欄位供除錯
-    raise KeyError(f"找不到 {target_type} 對應的欄位。DataFrame 欄位列表: {df.columns.tolist()}")
+    raise KeyError(f"找不到 {target_type} 對應的欄位。")
 
 @st.cache_data(ttl=300)
 def fetch_data(_api):
@@ -70,19 +64,16 @@ def fetch_data(_api):
     d_curr_str = all_days[-1]
     d_prev_str = all_days[-2]
     
-    # 1. 抓取當日全個股 (防禦性寫法)
+    # 1. 抓取當日全市場資料
     try:
-        # 優先嘗試 short 版本 (通常欄位是 High/Low)
         if hasattr(_api, 'taiwan_stock_daily_short'):
             df_all = _api.taiwan_stock_daily_short(stock_id="", start_date=d_curr_str)
         else:
             raise AttributeError("API too old")
     except (AttributeError, Exception):
-        # 回退機制：使用標準 daily API (通常欄位是 max/min)
         df_all = _api.taiwan_stock_daily(stock_id="", start_date=d_curr_str)
     
-    # 2. 統一欄位名稱並計算成交金額
-    # 使用 smart_get_column 抓取資料，不管欄位叫 max 還是 High 都能抓到
+    # 2. 欄位標準化
     try:
         df_all['MyClose'] = smart_get_column(df_all, 'Close')
         df_all['MyHigh'] = smart_get_column(df_all, 'High')
@@ -93,14 +84,21 @@ def fetch_data(_api):
         st.error(f"資料欄位解析失敗: {e}")
         return None
 
-    # 公式: ((High + Low + Close) / 3 * Volume) / 1,000,000
+    # 3. 過濾雜訊 (關鍵修改 v1.3.4)
+    # (1) 確保代號是字串
+    df_all['MyId'] = df_all['MyId'].astype(str)
+    # (2) 只保留「純數字」的代號 (過濾掉 Electronic, Semiconductor 等類股指數)
+    df_all = df_all[df_all['MyId'].str.isdigit()]
+    # (3) 排除 00 開頭的 ETF
+    df_all = df_all[~df_all['MyId'].str.startswith(EXCLUDE_ETF_PREFIX)]
+    # (4) 再次確保排除大盤 (雖然 isdigit 應該已經排除了 TAIEX)
+    df_all = df_all[df_all['MyId'] != "TAIEX"]
+
+    # 4. 計算成交金額 (百萬)
     df_all['avg_price'] = (df_all['MyHigh'] + df_all['MyLow'] + df_all['MyClose']) / 3.0
     df_all['turnover_val'] = (df_all['avg_price'] * df_all['MyVol']) / 1_000_000.0
     
-    # 3. 排除 ETF 與大盤
-    df_all = df_all[~df_all['MyId'].str.startswith(EXCLUDE_ETF_PREFIX)]
-    df_all = df_all[df_all['MyId'] != "TAIEX"] 
-    
+    # 5. 排序與取樣
     df_ranked = df_all.sort_values('turnover_val', ascending=False).head(RANK_DISPLAY_N)
     top_codes = df_ranked.head(TOP_N)['MyId'].tolist() 
     
@@ -113,6 +111,7 @@ def fetch_data(_api):
                 stock_id=code,
                 start_date=(datetime.now() - timedelta(days=15)).strftime("%Y-%m-%d")
             )
+            # 確保資料長度足夠 (這就是為什麼會有 299/300 的原因)
             if len(stock_df) >= 6:
                 stock_df['MA5'] = stock_df['close'].rolling(5).mean()
                 curr_row = stock_df.iloc[-1]
@@ -178,7 +177,7 @@ def run_streamlit():
         st.cache_data.clear()
 
     try:
-        with st.spinner("正在獲取盤中數據 (可能會切換至備用 API)..."):
+        with st.spinner("正在獲取盤中數據..."):
             data = fetch_data(api)
             
         if data is None:
