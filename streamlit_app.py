@@ -1,0 +1,182 @@
+# -*- coding: utf-8 -*-
+import streamlit as st
+import pandas as pd
+import numpy as np
+from FinMind.data import DataLoader
+from datetime import datetime, timedelta
+import traceback
+import sys
+
+# ==========================================
+# 版本資訊 (每次修改請更新此處)
+# ==========================================
+APP_VERSION = "v1.2.0"
+UPDATE_LOG = """
+- v1.0.0: 初始即時網頁版開發。
+- v1.1.0: 新增 FinMind API 對接與盤中即時計算功能。
+- v1.2.0: 硬編碼 FinMind Token，移除手動輸入框，優化開啟速度。
+"""
+
+# ==========================================
+# 參數與 Token 設定
+# ==========================================
+API_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJkYXRlIjoiMjAyNi0wMS0xNCAxOTowMDowNiIsInVzZXJfaWQiOiJcdTllYzNcdTRlYzFcdTVhMDEiLCJlbWFpbCI6ImExOTE3NjZAZ21haWwuY29tIiwiaXAiOiIifQ.JFPtMDNbxKzhl8HsxkOlA1tMlwq8y_NA6NpbRel6HCk"
+TOP_N = 300
+BREADTH_THRESHOLD = 0.65
+EXCLUDE_ETF_PREFIX = "00"
+
+st.set_page_config(page_title="盤中進場判斷監控", layout="wide")
+
+# ==========================================
+# 功能函式
+# ==========================================
+
+def get_trading_days(api):
+    """ 取得最近的交易日期列表 """
+    df = api.taiwan_stock_daily_short(
+        stock_id="0050", 
+        start_date=(datetime.now() - timedelta(days=20)).strftime("%Y-%m-%d")
+    )
+    return sorted(df['date'].unique().tolist())
+
+@st.cache_data(ttl=300)
+def fetch_data(_api):
+    """ 抓取排行與計算廣度 """
+    all_days = get_trading_days(_api)
+    d_curr_str = all_days[-1]
+    d_prev_str = all_days[-2]
+    
+    # 抓取當日全個股報價並依成交值排序
+    df_all = _api.taiwan_stock_daily_short(stock_id="", start_date=d_curr_str)
+    df_all = df_all[~df_all['stock_id'].str.startswith(EXCLUDE_ETF_PREFIX)]
+    df_top = df_all.sort_values('Volume_Cash', ascending=False).head(TOP_N)
+    top_codes = df_top['stock_id'].tolist()
+    
+    results = []
+    progress_text = "正在分析個股 MA5 狀態..."
+    progress_bar = st.progress(0, text=progress_text)
+    
+    for i, code in enumerate(top_codes):
+        try:
+            # 抓取足夠計算 MA5 的資料
+            stock_df = _api.taiwan_stock_daily(
+                stock_id=code,
+                start_date=(datetime.now() - timedelta(days=15)).strftime("%Y-%m-%d")
+            )
+            if len(stock_df) >= 6:
+                stock_df['MA5'] = stock_df['close'].rolling(5).mean()
+                curr_row = stock_df.iloc[-1]
+                prev_row = stock_df.iloc[-2]
+                
+                results.append({
+                    "code": code,
+                    "d_curr_ok": curr_row['close'] > curr_row['MA5'],
+                    "d_prev_ok": prev_row['close'] > prev_row['MA5']
+                })
+        except:
+            continue
+        progress_bar.progress((i + 1) / len(top_codes), text=f"分析中: {code}")
+    
+    progress_bar.empty()
+    res_df = pd.DataFrame(results)
+    
+    # TWII 斜率
+    twii_df = _api.taiwan_stock_daily(
+        stock_id="TAIEX", 
+        start_date=(datetime.now() - timedelta(days=15)).strftime("%Y-%m-%d")
+    )
+    twii_df['MA5'] = twii_df['close'].rolling(5).mean()
+    ma5_t = twii_df['MA5'].iloc[-1]
+    ma5_t_1 = twii_df['MA5'].iloc[-2]
+    slope = ma5_t - ma5_t_1
+    
+    return {
+        "d_curr": d_curr_str,
+        "d_prev": d_prev_str,
+        "br_curr": res_df['d_curr_ok'].mean(),
+        "br_prev": res_df['d_prev_ok'].mean(),
+        "hit_curr": res_df['d_curr_ok'].sum(),
+        "hit_prev": res_df['d_prev_ok'].sum(),
+        "valid": len(res_df),
+        "ma5_t": ma5_t,
+        "ma5_t_1": ma5_t_1,
+        "slope": slope
+    }
+
+# ==========================================
+# Streamlit UI 介面
+# ==========================================
+
+def run_streamlit():
+    st.title("📈 盤中權證進場判斷監控")
+
+    # 側邊欄顯示版本與紀錄
+    with st.sidebar:
+        st.subheader("系統狀態")
+        st.success("API Token 已載入")
+        st.divider()
+        st.subheader("版本資訊")
+        st.code(f"Version: {APP_VERSION}")
+        st.markdown(UPDATE_LOG)
+
+    api = DataLoader()
+    api.login_by_token(API_TOKEN)
+
+    if st.button("🔄 立即重新整理數據"):
+        st.cache_data.clear()
+
+    try:
+        with st.spinner("正在獲取盤中數據..."):
+            data = fetch_data(api)
+
+        # 邏輯判定
+        cond1 = (data['br_curr'] >= BREADTH_THRESHOLD) and (data['br_prev'] >= BREADTH_THRESHOLD)
+        cond2 = data['slope'] > 0
+        final_decision = cond1 and cond2
+
+        st.subheader(f"📅 判斷基準日：{data['d_curr']} (盤中狀態)")
+        
+        c1, c2, c3 = st.columns(3)
+        c1.metric("今日廣度 (D)", f"{data['br_curr']:.1%}", f"{data['hit_curr']}/{data['valid']}")
+        c2.metric("昨日廣度 (D-1)", f"{data['br_prev']:.1%}", f"{data['hit_prev']}/{data['valid']}")
+        c3.metric("大盤 MA5 斜率", f"{data['slope']:.2f}", "正" if cond2 else "非正")
+
+        st.divider()
+
+        st.header("💡 進場結論")
+        if final_decision:
+            st.success(f"✅ 結論（{data['d_curr']} 的隔日）：可進場")
+        else:
+            st.error(f"⛔ 結論（{data['d_curr']} 的隔日）：不可進場")
+
+        with st.expander("查看判定條件詳情"):
+            st.write(f"1. 廣度連兩天 ≥ 65%：{'✅ 通過' if cond1 else '❌ 未通過'}")
+            st.write(f"2. 大盤 MA5 斜率 > 0：{'✅ 通過' if cond2 else '❌ 未通過'}")
+            st.write(f"(當前 MA5: {data['ma5_t']:.2f}, 前值: {data['ma5_t_1']:.2f})")
+
+    except Exception as e:
+        st.error(f"發生錯誤: {e}")
+        st.text(traceback.format_exc())
+
+# ==========================================
+# 執行與結束處理
+# ==========================================
+
+if __name__ == "__main__":
+    # 判斷是否在 Streamlit 環境下執行
+    if 'streamlit' in sys.modules:
+        run_streamlit()
+    else:
+        # 本地直接執行 (Double-click) 邏輯
+        print(f"--- 盤中權證進場判斷監控 {APP_VERSION} ---")
+        print("提示：請使用 'streamlit run 檔案名稱.py' 來啟動網頁介面。")
+        print("-" * 40)
+        try:
+            # 本地執行僅簡單測試 API 是否正常
+            api = DataLoader()
+            api.login_by_token(API_TOKEN)
+            print("FinMind API Token 驗證成功。")
+        except Exception as e:
+            print(f"錯誤：{e}")
+        
+        input("\n按 ENTER 結束程式...")
