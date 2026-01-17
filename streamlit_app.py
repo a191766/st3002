@@ -10,11 +10,12 @@ import sys
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v1.3.2"
+APP_VERSION = "v1.3.3"
 UPDATE_LOG = """
 - v1.3.0: 採用 (H+L+C)/3 公式計算成交金額。
 - v1.3.1: 修正 API 名稱。
-- v1.3.2: 增加對 FinMind 內部依賴 (tqdm) 的相容性，並加入 API 自動降級機制。
+- v1.3.2: 增加 API 自動降級機制。
+- v1.3.3: 新增智慧欄位對應，解決 max/min 與 High/Low 欄位名稱不一致導致的 KeyError。
 """
 
 # ==========================================
@@ -33,14 +34,34 @@ st.set_page_config(page_title="盤中權證進場判斷", layout="wide")
 # ==========================================
 
 def get_trading_days(api):
-    """ 取得最近交易日 (使用最穩定的基礎 API) """
+    """ 取得最近交易日 """
     # 為了避免 AttributeError，這裡只使用最基本的 taiwan_stock_daily
-    # 雖然資料量稍大，但只抓一檔 0050 非常快且穩定
     df = api.taiwan_stock_daily(
         stock_id="0050", 
         start_date=(datetime.now() - timedelta(days=20)).strftime("%Y-%m-%d")
     )
     return sorted(df['date'].unique().tolist())
+
+def smart_get_column(df, target_type):
+    """ 
+    智慧欄位對應：自動處理不同 API 回傳的欄位名稱差異 
+    target_type: 'High', 'Low', 'Close', 'Volume', 'Id'
+    """
+    mappings = {
+        'High': ['High', 'high', 'max', 'Max'],
+        'Low': ['Low', 'low', 'min', 'Min'],
+        'Close': ['Close', 'close', 'price', 'Price'],
+        'Volume': ['Volume', 'volume', 'Trading_Volume', 'vol'],
+        'Id': ['stock_id', 'stock_code', 'code', 'SecurityCode']
+    }
+    
+    candidates = mappings.get(target_type, [])
+    for c in candidates:
+        if c in df.columns:
+            return df[c]
+            
+    # 若都找不到，列出當前欄位供除錯
+    raise KeyError(f"找不到 {target_type} 對應的欄位。DataFrame 欄位列表: {df.columns.tolist()}")
 
 @st.cache_data(ttl=300)
 def fetch_data(_api):
@@ -50,30 +71,29 @@ def fetch_data(_api):
     d_prev_str = all_days[-2]
     
     # 1. 抓取當日全個股 (防禦性寫法)
-    # 嘗試使用輕量版 API，若失敗則自動切換回標準版
     try:
+        # 優先嘗試 short 版本 (通常欄位是 High/Low)
         if hasattr(_api, 'taiwan_stock_daily_short'):
             df_all = _api.taiwan_stock_daily_short(stock_id="", start_date=d_curr_str)
         else:
             raise AttributeError("API too old")
     except (AttributeError, Exception):
-        # 回退機制：使用標準 daily API
-        print("Warn: taiwan_stock_daily_short not found, using standard daily api.")
+        # 回退機制：使用標準 daily API (通常欄位是 max/min)
         df_all = _api.taiwan_stock_daily(stock_id="", start_date=d_curr_str)
     
-    # 2. 計算成交金額 (百萬) - 邏輯比照 0+1 程式
-    # 公式: ((Max + Min + Close) / 3 * Volume) / 1,000,000
-    # 確保欄位名稱正確 (有些版本是大寫有些是小寫)
-    cols = {c.lower(): c for c in df_all.columns}
-    def get_col(name): return df_all[cols.get(name.lower(), name)]
+    # 2. 統一欄位名稱並計算成交金額
+    # 使用 smart_get_column 抓取資料，不管欄位叫 max 還是 High 都能抓到
+    try:
+        df_all['MyClose'] = smart_get_column(df_all, 'Close')
+        df_all['MyHigh'] = smart_get_column(df_all, 'High')
+        df_all['MyLow'] = smart_get_column(df_all, 'Low')
+        df_all['MyVol'] = smart_get_column(df_all, 'Volume')
+        df_all['MyId'] = smart_get_column(df_all, 'Id')
+    except KeyError as e:
+        st.error(f"資料欄位解析失敗: {e}")
+        return None
 
-    # 建立統一名稱
-    df_all['MyClose'] = get_col('Close')
-    df_all['MyHigh'] = get_col('High')
-    df_all['MyLow'] = get_col('Low')
-    df_all['MyVol'] = get_col('Volume')
-    df_all['MyId'] = get_col('stock_id')
-
+    # 公式: ((High + Low + Close) / 3 * Volume) / 1,000,000
     df_all['avg_price'] = (df_all['MyHigh'] + df_all['MyLow'] + df_all['MyClose']) / 3.0
     df_all['turnover_val'] = (df_all['avg_price'] * df_all['MyVol']) / 1_000_000.0
     
@@ -105,7 +125,7 @@ def fetch_data(_api):
                 })
         except:
             continue
-        # 為了效能，每處理 10 檔才更新一次進度條
+        
         if i % 10 == 0:
             progress_bar.progress((i + 1) / len(top_codes), text=f"進度: {i+1}/{len(top_codes)}")
     
@@ -158,8 +178,11 @@ def run_streamlit():
         st.cache_data.clear()
 
     try:
-        with st.spinner("正在獲取盤中數據..."):
+        with st.spinner("正在獲取盤中數據 (可能會切換至備用 API)..."):
             data = fetch_data(api)
+            
+        if data is None:
+            st.stop()
 
         cond1 = (data['br_curr'] >= BREADTH_THRESHOLD) and (data['br_prev'] >= BREADTH_THRESHOLD)
         cond2 = data['slope'] > 0
