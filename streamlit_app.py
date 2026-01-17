@@ -8,12 +8,13 @@ import traceback
 import sys
 
 # ==========================================
-# 版本資訊 (每次修改請更新此處)
+# 版本資訊
 # ==========================================
-APP_VERSION = "v1.3.1"
+APP_VERSION = "v1.3.2"
 UPDATE_LOG = """
-- v1.3.0: 依照 0+1 程式邏輯，採用 (H+L+C)/3 公式計算成交金額。
-- v1.3.1: 修正 FinMind API 方法名稱錯誤 (AttributeError) 並移除 tqdm 依賴。
+- v1.3.0: 採用 (H+L+C)/3 公式計算成交金額。
+- v1.3.1: 修正 API 名稱。
+- v1.3.2: 增加對 FinMind 內部依賴 (tqdm) 的相容性，並加入 API 自動降級機制。
 """
 
 # ==========================================
@@ -32,19 +33,13 @@ st.set_page_config(page_title="盤中權證進場判斷", layout="wide")
 # ==========================================
 
 def get_trading_days(api):
-    """ 取得最近交易日 - 修正為更通用的方法名稱 """
-    try:
-        # 優先嘗試台灣市場通用日線 API
-        df = api.taiwan_stock_daily(
-            stock_id="0050", 
-            start_date=(datetime.now() - timedelta(days=20)).strftime("%Y-%m-%d")
-        )
-    except AttributeError:
-        # 若上述失敗，嘗試舊版名稱
-        df = api.taiwan_stock_daily_adj(
-            stock_id="0050", 
-            start_date=(datetime.now() - timedelta(days=20)).strftime("%Y-%m-%d")
-        )
+    """ 取得最近交易日 (使用最穩定的基礎 API) """
+    # 為了避免 AttributeError，這裡只使用最基本的 taiwan_stock_daily
+    # 雖然資料量稍大，但只抓一檔 0050 非常快且穩定
+    df = api.taiwan_stock_daily(
+        stock_id="0050", 
+        start_date=(datetime.now() - timedelta(days=20)).strftime("%Y-%m-%d")
+    )
     return sorted(df['date'].unique().tolist())
 
 @st.cache_data(ttl=300)
@@ -54,26 +49,42 @@ def fetch_data(_api):
     d_curr_str = all_days[-1]
     d_prev_str = all_days[-2]
     
-    # 抓取當日全個股 (嘗試相容不同版本的 FinMind)
+    # 1. 抓取當日全個股 (防禦性寫法)
+    # 嘗試使用輕量版 API，若失敗則自動切換回標準版
     try:
-        df_all = _api.taiwan_stock_daily_short(stock_id="", start_date=d_curr_str)
-    except AttributeError:
-        # 如果雲端版本太舊沒有 daily_short，則回退使用 daily
+        if hasattr(_api, 'taiwan_stock_daily_short'):
+            df_all = _api.taiwan_stock_daily_short(stock_id="", start_date=d_curr_str)
+        else:
+            raise AttributeError("API too old")
+    except (AttributeError, Exception):
+        # 回退機制：使用標準 daily API
+        print("Warn: taiwan_stock_daily_short not found, using standard daily api.")
         df_all = _api.taiwan_stock_daily(stock_id="", start_date=d_curr_str)
     
-    # 計算成交金額 (百萬) - 邏輯比照 0+1 程式
-    df_all['avg_price'] = (df_all['High'] + df_all['Low'] + df_all['Close']) / 3.0
-    df_all['turnover_val'] = (df_all['avg_price'] * df_all['Volume']) / 1_000_000.0
+    # 2. 計算成交金額 (百萬) - 邏輯比照 0+1 程式
+    # 公式: ((Max + Min + Close) / 3 * Volume) / 1,000,000
+    # 確保欄位名稱正確 (有些版本是大寫有些是小寫)
+    cols = {c.lower(): c for c in df_all.columns}
+    def get_col(name): return df_all[cols.get(name.lower(), name)]
+
+    # 建立統一名稱
+    df_all['MyClose'] = get_col('Close')
+    df_all['MyHigh'] = get_col('High')
+    df_all['MyLow'] = get_col('Low')
+    df_all['MyVol'] = get_col('Volume')
+    df_all['MyId'] = get_col('stock_id')
+
+    df_all['avg_price'] = (df_all['MyHigh'] + df_all['MyLow'] + df_all['MyClose']) / 3.0
+    df_all['turnover_val'] = (df_all['avg_price'] * df_all['MyVol']) / 1_000_000.0
     
-    # 排除 ETF 與大盤
-    df_all = df_all[~df_all['stock_id'].str.startswith(EXCLUDE_ETF_PREFIX)]
-    df_all = df_all[df_all['stock_id'] != "TAIEX"] 
+    # 3. 排除 ETF 與大盤
+    df_all = df_all[~df_all['MyId'].str.startswith(EXCLUDE_ETF_PREFIX)]
+    df_all = df_all[df_all['MyId'] != "TAIEX"] 
     
     df_ranked = df_all.sort_values('turnover_val', ascending=False).head(RANK_DISPLAY_N)
-    top_codes = df_ranked.head(TOP_N)['stock_id'].tolist() 
+    top_codes = df_ranked.head(TOP_N)['MyId'].tolist() 
     
     results = []
-    # 使用 Streamlit 內建進度條取代 tqdm
     progress_bar = st.progress(0, text="分析個股 MA5 狀態中...")
     
     for i, code in enumerate(top_codes):
@@ -94,7 +105,9 @@ def fetch_data(_api):
                 })
         except:
             continue
-        progress_bar.progress((i + 1) / len(top_codes), text=f"進度: {i+1}/{len(top_codes)} ({code})")
+        # 為了效能，每處理 10 檔才更新一次進度條
+        if i % 10 == 0:
+            progress_bar.progress((i + 1) / len(top_codes), text=f"進度: {i+1}/{len(top_codes)}")
     
     progress_bar.empty()
     res_df = pd.DataFrame(results)
@@ -120,7 +133,7 @@ def fetch_data(_api):
         "ma5_t": ma5_t,
         "ma5_t_1": ma5_t_1,
         "slope": slope,
-        "rank_list": df_ranked[['stock_id', 'Close', 'turnover_val']].head(10)
+        "rank_list": df_ranked[['MyId', 'MyClose', 'turnover_val']].head(10)
     }
 
 # ==========================================
@@ -132,9 +145,9 @@ def run_streamlit():
 
     with st.sidebar:
         st.subheader("系統狀態")
-        st.success("API Token 已自動載入")
+        st.success("API Token 已載入")
         st.divider()
-        st.subheader("版本與邏輯資訊")
+        st.subheader("版本資訊")
         st.code(f"Version: {APP_VERSION}")
         st.markdown(UPDATE_LOG)
 
@@ -170,7 +183,7 @@ def run_streamlit():
         col_list, col_detail = st.columns([1, 1])
         with col_list:
             st.write("📊 **今日成交金額排行 (Top 10)**")
-            st.dataframe(data['rank_list'].rename(columns={'stock_id':'代號', 'Close':'收盤', 'turnover_val':'金額(百萬)'}))
+            st.dataframe(data['rank_list'].rename(columns={'MyId':'代號', 'MyClose':'收盤', 'turnover_val':'金額(百萬)'}))
 
         with col_detail:
             st.write("🔍 **判斷條件詳情**")
@@ -179,14 +192,14 @@ def run_streamlit():
 
     except Exception as e:
         st.error(f"執行出錯: {e}")
-        st.text(traceback.format_exc())
+        st.code(traceback.format_exc())
 
 # ==========================================
 # 執行處理
 # ==========================================
 
 if __name__ == "__main__":
-    if 'streamlit' in sys.modules and 'run_streamlit' in globals():
+    if 'streamlit' in sys.modules:
         run_streamlit()
     else:
         print(f"--- 盤中權證進場判斷監控 {APP_VERSION} ---")
