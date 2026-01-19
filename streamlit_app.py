@@ -11,12 +11,10 @@ import yfinance as yf
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v1.8.0 (全市場即時版)"
+APP_VERSION = "v1.9.0 (時間軸強制校正版)"
 UPDATE_LOG = """
-- v1.8.0: 針對 95 檔無更新問題修復。
-  1. 改用 Yahoo Finance 批次下載 (Batch Download) 提升速度與穩定性。
-  2. 同時偵測 .TW (上市) 與 .TWO (上櫃)，解決上櫃股抓不到最新價的問題。
-  3. 新增「最新報價時間」顯示，證明資料即時性。
+- v1.8.0: 嘗試解決無更新問題，但時間視窗過窄導致盤後回退。
+- v1.9.0: 移除 14:00 限制。只要是平日 08:45 後，無條件強制鎖定「今天」為 D，確保 D-1 正確對應到上個交易日 (如上週五)。
 """
 
 # ==========================================
@@ -34,99 +32,89 @@ st.set_page_config(page_title="盤中權證進場判斷", layout="wide")
 # ==========================================
 
 def get_trading_days(api):
-    """ 取得交易日 (含強制判定) """
+    """ 取得交易日 (強制校正版) """
+    # 1. 先抓歷史 (通常只會到 1/16)
     try:
         df = api.taiwan_stock_daily(stock_id="0050", start_date=(datetime.now() - timedelta(days=20)).strftime("%Y-%m-%d"))
         dates = sorted(df['date'].unique().tolist())
     except:
         dates = []
     
+    # 2. 強制加入今天
     tw_now = datetime.now(timezone(timedelta(hours=8)))
     today_str = tw_now.strftime("%Y-%m-%d")
     current_time = tw_now.time()
     
-    # 只要是平日且在開盤時間內，強制納入今天
-    if 0 <= tw_now.weekday() <= 4 and time(8, 45) <= current_time <= time(14, 0):
+    # 邏輯修正：只要是平日 (Mon=0 ~ Fri=4) 且時間晚於 08:45，無論是否收盤，都強制把今天算進去
+    if 0 <= tw_now.weekday() <= 4 and current_time >= time(8, 45):
         if not dates or today_str > dates[-1]:
             dates.append(today_str)
+            
     return dates
 
 def fetch_yahoo_realtime_batch(codes):
-    """
-    Yahoo Finance 批次下載 (解決上市上櫃後綴問題)
-    回傳: Dict { '2330': 1050.0, '8069': 120.0 ... }
-    """
+    """ Yahoo Finance 批次下載 """
     if not codes: return {}, None
     
-    # 建立兩種後綴的清單
     tw_tickers = [f"{c}.TW" for c in codes]
     two_tickers = [f"{c}.TWO" for c in codes]
     all_tickers = tw_tickers + two_tickers
     
-    # 顯示進度
-    print(f"正在批次下載 {len(all_tickers)} 檔 Yahoo 即時報價...")
-    
     try:
-        # 批次下載，只抓當天 (period='1d')
-        # group_by='ticker' 讓回傳格式比較好處理
+        # 下載當日數據
         data = yf.download(all_tickers, period="1d", group_by='ticker', progress=False, threads=True)
-        
         realtime_map = {}
         latest_time = None
         
-        # 解析資料
-        for t in all_tickers:
-            try:
-                # 處理單一 Ticker 的資料
-                if len(all_tickers) == 1:
-                    df = data # 如果只有一檔，格式不同
-                else:
+        # 資料解析
+        if len(all_tickers) == 1:
+             # 單檔處理
+             t = all_tickers[0]
+             df = data
+             if not df.empty and not df['Close'].isna().all():
+                 realtime_map[t.split('.')[0]] = float(df['Close'].iloc[-1])
+                 latest_time = df.index[-1]
+        else:
+            # 多檔處理
+            for t in all_tickers:
+                try:
                     df = data[t]
-                
-                # 檢查是否有資料
-                if not df.empty and not df['Close'].isna().all():
-                    # 抓最後一筆 Close
-                    last_price = float(df['Close'].iloc[-1])
-                    
-                    # 抓這筆資料的時間 (轉成字串顯示)
-                    last_ts = df.index[-1]
-                    if latest_time is None or last_ts > latest_time:
-                        latest_time = last_ts
-                    
-                    # 移除後綴 (.TW / .TWO) 存回 Map
-                    clean_code = t.split('.')[0]
-                    
-                    # 優先權：如果已經有值(可能先抓到.TW)，通常保留即可；
-                    # 但考慮到有時候誤判，這裡簡單處理：有抓到就存
-                    realtime_map[clean_code] = last_price
-            except Exception:
-                continue
+                    if not df.empty and not df['Close'].isna().all():
+                        last_price = float(df['Close'].iloc[-1])
+                        last_ts = df.index[-1]
+                        if latest_time is None or last_ts > latest_time:
+                            latest_time = last_ts
+                        realtime_map[t.split('.')[0]] = last_price
+                except:
+                    continue
                 
         return realtime_map, latest_time
-        
     except Exception as e:
-        print(f"Yahoo 下載失敗: {e}")
+        print(f"Yahoo Err: {e}")
         return {}, None
 
 @st.cache_data(ttl=300)
 def fetch_data(_api):
     all_days = get_trading_days(_api)
     if len(all_days) < 2:
-        st.error("歷史資料不足。")
+        st.error(f"歷史資料不足 (抓到的日期: {all_days})。")
         return None
 
-    d_curr_str = all_days[-1] 
-    d_prev_str = all_days[-2]
+    d_curr_str = all_days[-1]  # 這應該要是今天 (1/19)
+    d_prev_str = all_days[-2]  # 這應該要是上週五 (1/16)
     
-    # === 步驟 1: 取得「昨日」排行作為候選名單 ===
-    # (盤中排行變動不大，且 FinMind 盤中排行常缺資料，用昨日最穩)
+    # 除錯訊息：讓使用者確認時間軸是否正確
+    debug_dates = f"D={d_curr_str}, D-1={d_prev_str}"
+    
+    # === 步驟 1: 取得「D-1」的排行 ===
+    # 因為 D 是盤中，排行不準，所以我們用 D-1 (1/16) 的排行來選股
     df_all = _api.taiwan_stock_daily(stock_id="", start_date=d_prev_str)
     
+    # 如果 D-1 抓不到資料 (例如 API 漏資料)，嘗試再往推一天
     if df_all.empty:
-        st.error("無法取得昨日全市場資料，請稍後再試。")
-        return None
-
-    # 欄位映射
+        d_prev_str = all_days[-3]
+        df_all = _api.taiwan_stock_daily(stock_id="", start_date=d_prev_str)
+        
     cols_map = {c.lower(): c for c in df_all.columns}
     def get_col(n): return df_all[cols_map.get(n.lower(), n)]
     
@@ -134,69 +122,66 @@ def fetch_data(_api):
         df_all['MyClose'] = get_col('Close')
         df_all['MyVol'] = get_col('Volume')
         df_all['MyId'] = get_col('stock_id')
-        # 簡易計算成交值 (用昨日收盤價概算，主要為了排序)
         df_all['turnover_val'] = df_all['MyClose'] * df_all['MyVol']
     except:
         return None
 
-    # 過濾
     df_all['MyId'] = df_all['MyId'].astype(str)
     df_all = df_all[df_all['MyId'].str.isdigit()]  
     df_all = df_all[~df_all['MyId'].str.startswith(EXCLUDE_ETF_PREFIX)] 
     
-    # 取前 N 大
     df_candidates = df_all.sort_values('turnover_val', ascending=False).head(TOP_N).copy()
     target_codes = df_candidates['MyId'].tolist()
     
-    # === 步驟 2: Yahoo 批次抓取即時價 (關鍵步驟) ===
-    # 這裡會一次抓完 300 檔的 .TW 和 .TWO
+    # === 步驟 2: Yahoo 批次抓取即時價 (for D) ===
     rt_prices, last_update_time = fetch_yahoo_realtime_batch(target_codes)
     
     # === 步驟 3: 逐檔運算 ===
     results = []
     detailed_status = []
-    
-    progress_bar = st.progress(0, text="正在整合歷史與即時數據...")
-    
-    # 統計
     updated_count = 0
+    
+    progress_bar = st.progress(0, text="數據整合中...")
     
     for i, (idx, row) in enumerate(df_candidates.iterrows()):
         code = row['MyId']
         rank = i + 1
         status = "未知"
-        price_src = "昨日收盤(無更新)"
-        current_close = row['MyClose'] # 預設用昨日
+        price_src = "歷史延用"
         
-        # 檢查是否有 Yahoo 即時價
+        # 決定 D (今日) 的價格
         if code in rt_prices:
             current_close = rt_prices[code]
             price_src = "Yahoo即時"
             updated_count += 1
+        else:
+            # 如果抓不到即時，只好先用 D-1 的收盤價 (最壞情況)
+            current_close = row['MyClose']
         
         try:
-            # 抓歷史資料 (FinMind)
+            # 抓歷史資料 (包含 D-1 及之前)
             stock_df = _api.taiwan_stock_daily(
                 stock_id=code,
-                start_date=(datetime.now() - timedelta(days=25)).strftime("%Y-%m-%d")
+                start_date=(datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
             )
             
-            # 手動合成今日 K 棒
-            if not stock_df.empty:
-                # 移除可能重複的今日 (若 FinMind 突然更新了)
-                stock_df = stock_df[stock_df['date'] != d_curr_str]
-                
-                # 拼上今日數據
-                new_row = pd.DataFrame([{
-                    'date': d_curr_str,
-                    'close': current_close
-                }])
-                # 這裡只補 close 計算 MA5 即可，其他欄位不影響廣度
-                stock_df = pd.concat([stock_df, new_row], ignore_index=True)
+            # 清理：確保 stock_df 裡沒有 D (以防 FinMind 偷跑)
+            stock_df = stock_df[stock_df['date'] < d_curr_str]
+            
+            # 手動合成 D (今日)
+            new_row = pd.DataFrame([{
+                'date': d_curr_str,
+                'close': current_close
+            }])
+            stock_df = pd.concat([stock_df, new_row], ignore_index=True)
                 
             # 計算 MA5
             if len(stock_df) >= 6:
                 stock_df['MA5'] = stock_df['close'].rolling(5).mean()
+                
+                # 這裡最關鍵：
+                # curr_row 必須是 D (最後一筆)
+                # prev_row 必須是 D-1 (倒數第二筆)
                 curr_row = stock_df.iloc[-1]
                 prev_row = stock_df.iloc[-2]
                 
@@ -226,17 +211,18 @@ def fetch_data(_api):
     res_df = pd.DataFrame(results)
     detail_df = pd.DataFrame(detailed_status)
     
-    # === 步驟 4: 大盤斜率 ===
+    # === 步驟 4: 大盤斜率 (同樣強制更新) ===
     slope = 0
     try:
-        twii_df = _api.taiwan_stock_daily(stock_id="TAIEX", start_date=(datetime.now() - timedelta(days=20)).strftime("%Y-%m-%d"))
-        # 嘗試抓大盤即時 (用 Yahoo ^TWII)
+        twii_df = _api.taiwan_stock_daily(stock_id="TAIEX", start_date=(datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"))
+        twii_df = twii_df[twii_df['date'] < d_curr_str] # 確保不含今日
+        
+        # 抓大盤即時
         try:
             twii_rt = yf.download("^TWII", period="1d", progress=False)
             if not twii_rt.empty:
                 last_twii = float(twii_rt['Close'].iloc[-1])
                 new_row = pd.DataFrame([{'date': d_curr_str, 'close': last_twii}])
-                twii_df = twii_df[twii_df['date'] != d_curr_str]
                 twii_df = pd.concat([twii_df, new_row], ignore_index=True)
         except:
             pass
@@ -257,14 +243,15 @@ def fetch_data(_api):
         "slope": slope,
         "detail_df": detail_df,
         "updated_count": updated_count,
-        "last_time": last_update_time
+        "last_time": last_update_time,
+        "debug_dates": debug_dates
     }
 
 # ==========================================
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v1.8 修正版)")
+    st.title("📈 盤中權證進場判斷 (v1.9 強制校正版)")
 
     with st.sidebar:
         st.subheader("系統狀態")
@@ -275,11 +262,11 @@ def run_streamlit():
     api = DataLoader()
     api.login_by_token(API_TOKEN)
 
-    if st.button("🔄 立即重新整理 (抓取最新報價)"):
+    if st.button("🔄 立即重新整理"):
         st.cache_data.clear()
 
     try:
-        with st.spinner("正在進行全市場批次更新 (含上市/上櫃)..."):
+        with st.spinner("正在強制校正時間軸並抓取數據..."):
             data = fetch_data(api)
             
         if data is None:
@@ -289,20 +276,17 @@ def run_streamlit():
         cond2 = data['slope'] > 0
         final_decision = cond1 and cond2
         
-        # 格式化時間顯示
-        time_str = "未知"
-        if data['last_time']:
-            # 轉換為台灣時間顯示
-            time_str = data['last_time'].strftime("%H:%M:%S")
+        time_str = data['last_time'].strftime("%H:%M:%S") if data['last_time'] else "未知"
 
+        # 這裡會顯示程式認定的 D 與 D-1，讓你確認是否修復
         st.subheader(f"📅 數據基準日：{data['d_curr']}")
-        
+        st.caption(f"ℹ️ 時間軸確認：{data['debug_dates']} (若 D 為今日，D-1 應為上週五)")
+
         # 狀態卡片
         st.info(f"""
         📊 **即時資料狀態**
-        - 成功更新：**{data['updated_count']}** / {len(data['detail_df'])} 檔
-        - 最新報價時間：**{time_str}** (以此確認是否為盤中)
-        - 資料來源：Yahoo Finance (.TW / .TWO 雙軌偵測) + FinMind 歷史
+        - 最新報價時間：**{time_str}**
+        - 即時更新數：**{data['updated_count']}** / {len(data['detail_df'])} 檔
         """)
 
         c1, c2, c3 = st.columns(3)
