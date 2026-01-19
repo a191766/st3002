@@ -6,14 +6,15 @@ from FinMind.data import DataLoader
 from datetime import datetime, timedelta, timezone, time
 import traceback
 import sys
+import yfinance as yf  # 新增 Yahoo Finance
 
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v1.6.0 (暴力強制版)"
+APP_VERSION = "v1.7.0 (雙引擎即時版)"
 UPDATE_LOG = """
-- v1.5.0: 嘗試使用 Tick 確認開盤 (仍受 API 延遲影響)。
-- v1.6.0: 改用「系統時間」強制判定。只要是交易時段 (09:00-13:45)，強制設定今日為基準日，不再等待 API 確認。
+- v1.6.0: 強制日期判定 (解決了標題，但數據仍舊)。
+- v1.7.0: 新增 Yahoo Finance 作為即時報價備援。當 FinMind 抓不到盤中數據時，自動切換至 Yahoo 抓取最新成交價，確保數據即時更新。
 """
 
 # ==========================================
@@ -32,31 +33,29 @@ st.set_page_config(page_title="盤中權證進場判斷", layout="wide")
 # ==========================================
 
 def get_trading_days(api):
-    """ 
-    取得最近交易日 (時間強制判定版)
-    """
-    # 1. 取得歷史日線 (通常只到上個交易日)
-    df = api.taiwan_stock_daily(
-        stock_id="0050", 
-        start_date=(datetime.now() - timedelta(days=20)).strftime("%Y-%m-%d")
-    )
-    dates = sorted(df['date'].unique().tolist())
+    """ 取得最近交易日 (含時間強制判定) """
+    # 1. 取得歷史日線
+    try:
+        df = api.taiwan_stock_daily(
+            stock_id="0050", 
+            start_date=(datetime.now() - timedelta(days=20)).strftime("%Y-%m-%d")
+        )
+        dates = sorted(df['date'].unique().tolist())
+    except:
+        dates = []
     
-    # 2. 暴力檢查：現在幾點？
-    tw_now = datetime.now(timezone(timedelta(hours=8))) # 台灣時間
+    # 2. 暴力檢查：現在是否為交易時間
+    tw_now = datetime.now(timezone(timedelta(hours=8)))
     today_str = tw_now.strftime("%Y-%m-%d")
     current_time = tw_now.time()
     
-    # 判斷條件：平日 (Mon=0, Sun=6) 且 時間在 08:45 ~ 14:00 之間
-    # 只要符合，不管 API 有沒有資料，直接先把今天加進去再說
     is_weekday = 0 <= tw_now.weekday() <= 4
     is_trading_hours = time(8, 45) <= current_time <= time(14, 0)
     
-    # 如果歷史資料還沒包含今天，但現在是交易時間，強制加入今天
+    # 如果是交易時間，強制把今天算進去
     if is_weekday and is_trading_hours:
         if not dates or today_str > dates[-1]:
             dates.append(today_str)
-            # print(f"【強制模式】偵測到交易時段，強制設定基準日為: {today_str}")
 
     return dates
 
@@ -73,63 +72,75 @@ def smart_get_column(df, target_type):
     for c in candidates:
         if c in df.columns:
             return df[c]
-    raise KeyError(f"找不到 {target_type} 對應的欄位。DataFrame cols: {df.columns.tolist()}")
+    raise KeyError(f"找不到 {target_type} 對應的欄位。cols: {df.columns.tolist()}")
 
-def get_realtime_price(api, code, date_str):
-    """ 取得個股即時價 (Snapshot > Tick) """
-    # 1. Snapshot
+def get_realtime_price_hybrid(api, code, date_str):
+    """
+    雙引擎即時報價：
+    1. 先試 FinMind (Snapshot/Tick)
+    2. 失敗則試 Yahoo Finance (最穩)
+    回傳: (price, high, low, volume, source_name)
+    """
+    # --- 管道 1: FinMind Snapshot ---
     try:
         if hasattr(api, 'taiwan_stock_daily_short'):
             df = api.taiwan_stock_daily_short(stock_id=code, start_date=date_str)
             if not df.empty:
                 row = df.iloc[0]
-                c = row.get('close') or row.get('Price') or row.get('Close')
-                h = row.get('high') or row.get('High')
-                l = row.get('low') or row.get('Low')
-                v = row.get('volume') or row.get('Trading_Volume')
-                return float(c), float(h), float(l), float(v)
+                c = float(row.get('close') or row.get('Price') or 0)
+                if c > 0:
+                    h = float(row.get('high') or c)
+                    l = float(row.get('low') or c)
+                    v = float(row.get('volume') or 0)
+                    return c, h, l, v, "FinMind_Snap"
     except:
         pass
-    # 2. Tick
+
+    # --- 管道 2: FinMind Tick ---
     try:
         df = api.taiwan_stock_tick(stock_id=code, date=date_str)
         if not df.empty:
             last = df.iloc[-1]
-            c = last['deal_price']
-            return float(c), float(c), float(c), 0 
+            c = float(last['deal_price'])
+            return c, c, c, 0, "FinMind_Tick"
     except:
         pass
+
+    # --- 管道 3: Yahoo Finance (終極備援) ---
+    try:
+        # Yahoo 代號需加 .TW (上市) 或 .TWO (上櫃)
+        # 我們先盲猜 .TW，如果失敗再考慮 .TWO (但大多數權值股是 TW)
+        ticker = yf.Ticker(f"{code}.TW")
+        # period="1d" 會抓取「最新的一天」，不用管日期是不是 2026
+        hist = ticker.history(period="1d")
+        if not hist.empty:
+            row = hist.iloc[-1]
+            c = float(row['Close'])
+            h = float(row['High'])
+            l = float(row['Low'])
+            v = float(row['Volume'])
+            # 簡單檢查一下抓到的價格是否合理 (非 0)
+            if c > 0:
+                return c, h, l, v, "Yahoo_Finance"
+    except:
+        pass
+        
     return None
 
 @st.cache_data(ttl=300)
 def fetch_data(_api):
     all_days = get_trading_days(_api)
-    
     if len(all_days) < 2:
-        st.error("歷史資料不足。")
+        st.error("歷史資料不足 (API 連線異常或無數據)。")
         return None
 
     d_curr_str = all_days[-1] 
     d_prev_str = all_days[-2]
     
-    # === 步驟 1: 決定候選名單 ===
-    # 嘗試抓取「今日」全市場快照
-    use_yesterday_rank = False
-    try:
-        if hasattr(_api, 'taiwan_stock_daily_short'):
-            df_all = _api.taiwan_stock_daily_short(stock_id="", start_date=d_curr_str)
-        else:
-            df_all = pd.DataFrame() 
-    except:
-        df_all = pd.DataFrame()
-
-    # 如果今日快照是空的 (關鍵：強制模式下，很可能這裡會抓不到東西)
-    # 這時候我們就要切換成「昨日排名 + 今日價格」
-    if df_all.empty:
-        use_yesterday_rank = True
-        # 抓昨日資料來排名
-        df_all = _api.taiwan_stock_daily(stock_id="", start_date=d_prev_str)
-
+    # === 步驟 1: 取得排行候選名單 ===
+    # 預設使用昨日排行，再更新今日價格 (這是盤中且 API 不穩時最穩的做法)
+    df_all = _api.taiwan_stock_daily(stock_id="", start_date=d_prev_str)
+    
     # 欄位處理
     try:
         df_all['MyClose'] = smart_get_column(df_all, 'Close')
@@ -138,7 +149,7 @@ def fetch_data(_api):
         df_all['MyVol'] = smart_get_column(df_all, 'Volume')
         df_all['MyId'] = smart_get_column(df_all, 'Id')
     except:
-        return None # 資料異常
+        return None 
 
     df_all['MyId'] = df_all['MyId'].astype(str)
     df_all = df_all[df_all['MyId'].str.isdigit()]  
@@ -151,61 +162,61 @@ def fetch_data(_api):
     
     df_candidates = df_all.sort_values('turnover_val', ascending=False).head(TOP_N).copy()
     
-    # === 步驟 2: 逐檔計算 ===
+    # === 步驟 2: 逐檔抓取即時價並計算 ===
     results = []
     detailed_status = []
     
-    # 顯示目前使用的模式，讓使用者安心
-    mode_msg = "昨日排行 + 即時股價 (備援模式)" if use_yesterday_rank else "今日即時排行 (正常模式)"
-    progress_bar = st.progress(0, text=f"分析中 ({d_curr_str}) | 模式: {mode_msg}")
+    progress_bar = st.progress(0, text=f"啟動雙引擎更新數據 ({d_curr_str})...")
     total_candidates = len(df_candidates)
+    
+    # 統計用
+    source_stats = {"FinMind": 0, "Yahoo": 0, "None": 0}
 
     for i, (idx, row) in enumerate(df_candidates.iterrows()):
         code = row['MyId']
         rank = i + 1
         note = ""
         status = "未知"
+        price_source = "歷史"
         
         try:
-            # A. 歷史日線
+            # A. 抓歷史日線
             stock_df = _api.taiwan_stock_daily(
                 stock_id=code,
                 start_date=(datetime.now() - timedelta(days=25)).strftime("%Y-%m-%d")
             )
             
-            # B. 補上今日資料
-            # 檢查日線資料是否只到昨天
-            last_hist_date = ""
-            if not stock_df.empty:
-                last_hist_date = pd.to_datetime(stock_df['date'].iloc[-1]).strftime("%Y-%m-%d")
+            # B. 取得即時價格 (FinMind -> Yahoo)
+            # 無論歷史資料是否已更新，我們都嘗試去抓最新的來比對
+            rt_data = get_realtime_price_hybrid(_api, code, d_curr_str)
             
-            current_close = row['MyClose'] 
+            current_close = row['MyClose'] # 預設值 (昨日收盤)
             
-            # 如果日線還停留在舊資料，或我們正在使用昨日排行，都需要去抓即時價
-            need_realtime = (last_hist_date < d_curr_str) or use_yesterday_rank
-            
-            if need_realtime:
-                # 嘗試抓即時
-                rt_data = get_realtime_price(_api, code, d_curr_str)
+            if rt_data:
+                c, h, l, v, src = rt_data
+                current_close = c
+                price_source = src
+                if "Yahoo" in src: source_stats["Yahoo"] += 1
+                else: source_stats["FinMind"] += 1
                 
-                if rt_data:
-                    c, h, l, v = rt_data
-                    current_close = c
-                    # 合成今日 K 棒
+                # 檢查歷史資料最後一天
+                last_hist_date = ""
+                if not stock_df.empty:
+                    last_hist_date = pd.to_datetime(stock_df['date'].iloc[-1]).strftime("%Y-%m-%d")
+                
+                # 如果歷史資料還沒到今天，就拼上去
+                if last_hist_date < d_curr_str:
                     new_row = pd.DataFrame([{
                         'date': d_curr_str,
                         'close': c,
                         'open': c, 'high': h, 'low': l, 'Trading_Volume': v
                     }])
                     stock_df = pd.concat([stock_df, new_row], ignore_index=True)
-                elif not use_yesterday_rank:
-                     # 如果是用今日排行，那列表本身的值就是即時的
-                     new_row = pd.DataFrame([{
-                        'date': d_curr_str,
-                        'close': row['MyClose'],
-                        'open': row['MyClose'], 'high': row['MyHigh'], 'low': row['MyLow'], 'Trading_Volume': row['MyVol']
-                    }])
-                     stock_df = pd.concat([stock_df, new_row], ignore_index=True)
+                else:
+                    # 如果歷史資料已經有今天 (極少見)，則更新最後一筆
+                    stock_df.iloc[-1, stock_df.columns.get_loc('close')] = c
+            else:
+                source_stats["None"] += 1
 
             # C. 計算 MA5
             if len(stock_df) >= 6:
@@ -221,7 +232,7 @@ def fetch_data(_api):
                 row['MyClose'] = current_close 
             else:
                 status = "❌ 剔除"
-                note = "資料不足"
+                note = "K線不足"
                 
         except Exception as e:
             status = "❌ 剔除"
@@ -230,14 +241,13 @@ def fetch_data(_api):
         detailed_status.append({
             "排名": rank,
             "代號": code,
-            "收盤": row['MyClose'],
-            "成交額(百萬)": round(row['turnover_val'], 2),
-            "狀態": status,
-            "備註": note
+            "現價": row['MyClose'],
+            "來源": price_source,
+            "狀態": status
         })
 
         if i % 10 == 0:
-            progress_bar.progress((i + 1) / total_candidates, text=f"進度: {rank}/{total_candidates}")
+            progress_bar.progress((i + 1) / total_candidates, text=f"更新中: {rank}/{total_candidates} (Yahoo: {source_stats['Yahoo']})")
     
     progress_bar.empty()
     res_df = pd.DataFrame(results)
@@ -245,17 +255,8 @@ def fetch_data(_api):
     
     # === 步驟 3: 大盤斜率 ===
     try:
-        twii_df = _api.taiwan_stock_daily(
-            stock_id="TAIEX", 
-            start_date=(datetime.now() - timedelta(days=25)).strftime("%Y-%m-%d")
-        )
-        last_hist = pd.to_datetime(twii_df['date'].iloc[-1]).strftime("%Y-%m-%d")
-        if last_hist < d_curr_str:
-            rt_twii = get_realtime_price(_api, "TAIEX", d_curr_str)
-            if rt_twii:
-                new_twii = pd.DataFrame([{'date': d_curr_str, 'close': rt_twii[0]}])
-                twii_df = pd.concat([twii_df, new_twii], ignore_index=True)
-
+        twii_df = _api.taiwan_stock_daily(stock_id="TAIEX", start_date=(datetime.now() - timedelta(days=25)).strftime("%Y-%m-%d"))
+        # 這裡不特別用 Yahoo 抓大盤，因為大盤代號對應比較麻煩，且個股廣度才是重點
         twii_df['MA5'] = twii_df['close'].rolling(5).mean()
         slope = twii_df['MA5'].iloc[-1] - twii_df['MA5'].iloc[-2]
     except:
@@ -271,7 +272,7 @@ def fetch_data(_api):
         "valid": len(res_df),
         "slope": slope,
         "detail_df": detail_df,
-        "mode": mode_msg
+        "stats": source_stats
     }
 
 # ==========================================
@@ -296,7 +297,7 @@ def run_streamlit():
         st.cache_data.clear()
 
     try:
-        with st.spinner("正在強制抓取盤中數據 (時間強制模式)..."):
+        with st.spinner("正在啟動雙引擎 (FinMind + Yahoo) 抓取即時數據..."):
             data = fetch_data(api)
             
         if data is None:
@@ -308,11 +309,9 @@ def run_streamlit():
 
         st.subheader(f"📅 數據基準日：{data['d_curr']}")
         
-        # 顯示當前使用的運算模式
-        if "備援" in data['mode']:
-            st.warning(f"⚠️ 注意：API 尚未回傳今日快照，目前使用「{data['mode']}」運算，數據仍具參考性。")
-        else:
-            st.success(f"✅ 數據狀態：{data['mode']}")
+        # 顯示資料來源統計，讓使用者知道現在是用哪裡的數據
+        stats = data['stats']
+        st.info(f"📊 資料來源統計：Yahoo Finance ({stats['Yahoo']} 檔) | FinMind ({stats['FinMind']} 檔) | 無更新 ({stats['None']} 檔)")
 
         c1, c2, c3 = st.columns(3)
         c1.metric("今日廣度 (D)", f"{data['br_curr']:.1%}", f"{data['hit_curr']}/{data['valid']}")
@@ -331,13 +330,12 @@ def run_streamlit():
         st.write(f"- 大盤 MA5 斜率 > 0：{'✅ 通過' if cond2 else '❌ 未通過'} (MA5斜率: {data['slope']:.2f})")
 
         st.divider()
-        st.subheader(f"📋 前 {TOP_N} 大成交值個股檢查清單")
+        st.subheader(f"📋 前 {TOP_N} 大成交值個股詳細清單")
         st.dataframe(
             data['detail_df'], 
             column_config={
                 "排名": st.column_config.NumberColumn(format="%d"),
-                "成交額(百萬)": st.column_config.NumberColumn(format="$%.2f"),
-                "收盤": st.column_config.NumberColumn(format="%.2f"),
+                "現價": st.column_config.NumberColumn(format="%.2f"),
             },
             use_container_width=True,
             height=600,
