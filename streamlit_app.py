@@ -11,10 +11,10 @@ import yfinance as yf
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v1.9.1 (除錯顯示版)"
+APP_VERSION = "v1.9.2 (欄位名稱修復版)"
 UPDATE_LOG = """
-- v1.9.0: 強制校正時間軸。
-- v1.9.1: 解除靜默失敗。當抓不到排行榜資料時，會明確顯示錯誤訊息，而非留下空白畫面。
+- v1.9.1: 解除靜默失敗。
+- v1.9.2: 修復欄位解析錯誤。重新加入智慧對應邏輯，能正確識別 'Trading_Volume' 為成交量。
 """
 
 # ==========================================
@@ -34,27 +34,44 @@ st.set_page_config(page_title="盤中權證進場判斷", layout="wide")
 def get_trading_days(api):
     """ 取得交易日 """
     try:
-        # 嘗試抓 0050 的歷史資料來判斷交易日
         df = api.taiwan_stock_daily(stock_id="0050", start_date=(datetime.now() - timedelta(days=20)).strftime("%Y-%m-%d"))
         if df.empty:
-            # 如果連 0050 都抓不到，可能是 Token 過期或 API 掛了
-            st.error("⚠️ 無法取得歷史交易日歷 (API 回傳空值)，請檢查 Token 或網路狀態。")
+            # 容錯：若抓不到 0050，回傳空陣列，讓後續邏輯處理
             return []
         dates = sorted(df['date'].unique().tolist())
-    except Exception as e:
-        st.error(f"⚠️ 取得交易日歷失敗: {e}")
+    except Exception:
         return []
     
-    # 強制加入今天 (若為交易時間)
     tw_now = datetime.now(timezone(timedelta(hours=8)))
     today_str = tw_now.strftime("%Y-%m-%d")
     current_time = tw_now.time()
     
+    # 只要是平日且開盤後，強制加入今天
     if 0 <= tw_now.weekday() <= 4 and current_time >= time(8, 45):
         if not dates or today_str > dates[-1]:
             dates.append(today_str)
             
     return dates
+
+def smart_get_column(df, candidates):
+    """ 
+    智慧欄位搜尋：依序檢查候選名單，回傳第一個存在的欄位 Series 
+    candidates: list of strings, e.g. ['Volume', 'Trading_Volume']
+    """
+    cols = df.columns
+    # 建立一個全小寫的對照表
+    lower_map = {c.lower(): c for c in cols}
+    
+    for name in candidates:
+        # 1. 精確比對
+        if name in cols:
+            return df[name]
+        # 2. 不分大小寫比對
+        if name.lower() in lower_map:
+            return df[lower_map[name.lower()]]
+            
+    # 若都找不到，拋出詳細錯誤
+    raise KeyError(f"找不到目標欄位 (嘗試過: {candidates})。現有欄位: {cols.tolist()}")
 
 def fetch_yahoo_realtime_batch(codes):
     """ Yahoo Finance 批次下載 """
@@ -65,10 +82,12 @@ def fetch_yahoo_realtime_batch(codes):
     all_tickers = tw_tickers + two_tickers
     
     try:
+        # 下載當日數據
         data = yf.download(all_tickers, period="1d", group_by='ticker', progress=False, threads=True)
         realtime_map = {}
         latest_time = None
         
+        # 單檔處理 (Yahoo 回傳格式不同)
         if len(all_tickers) == 1:
              t = all_tickers[0]
              df = data
@@ -76,6 +95,7 @@ def fetch_yahoo_realtime_batch(codes):
                  realtime_map[t.split('.')[0]] = float(df['Close'].iloc[-1])
                  latest_time = df.index[-1]
         else:
+            # 多檔處理
             for t in all_tickers:
                 try:
                     df = data[t]
@@ -96,6 +116,7 @@ def fetch_yahoo_realtime_batch(codes):
 def fetch_data(_api):
     all_days = get_trading_days(_api)
     if len(all_days) < 2:
+        st.error(f"歷史資料不足 (API 連線可能異常)。")
         return None
 
     d_curr_str = all_days[-1]
@@ -107,31 +128,29 @@ def fetch_data(_api):
     try:
         df_all = _api.taiwan_stock_daily(stock_id="", start_date=d_prev_str)
     except Exception as e:
-        st.error(f"❌ API 請求全市場資料失敗: {e}")
+        st.error(f"❌ API 請求失敗: {e}")
         return None
     
-    # 如果 D-1 抓不到，嘗試再往推一天 (D-2)
     if df_all.empty:
-        st.warning(f"⚠️ {d_prev_str} 查無全市場資料，嘗試回推至 {all_days[-3]}...")
+        # 回推機制：若 D-1 沒資料，試試 D-2 (避免連假後 API 缺漏)
         d_prev_str = all_days[-3]
         df_all = _api.taiwan_stock_daily(stock_id="", start_date=d_prev_str)
         
     if df_all.empty:
-        # 這裡就是導致空白畫面的兇手
-        st.error(f"❌ 嚴重錯誤：連續兩天 ({all_days[-2]}, {d_prev_str}) 都無法取得全市場排行資料。API 可能異常。")
+        st.error(f"❌ 無法取得全市場排行資料 (日期: {d_prev_str})。")
         return None
         
-    cols_map = {c.lower(): c for c in df_all.columns}
-    def get_col(n): return df_all[cols_map.get(n.lower(), n)]
-    
+    # === 欄位對應修復區 (v1.9.2) ===
     try:
-        df_all['MyClose'] = get_col('Close')
-        df_all['MyVol'] = get_col('Volume')
-        df_all['MyId'] = get_col('stock_id')
+        # 使用 smart_get_column 來找對應欄位，支援 Trading_Volume
+        df_all['MyClose'] = smart_get_column(df_all, ['Close', 'price', 'deal_price'])
+        df_all['MyVol'] = smart_get_column(df_all, ['Volume', 'Trading_Volume', 'vol'])
+        df_all['MyId'] = smart_get_column(df_all, ['stock_id', 'code', 'SecurityCode'])
+        
+        # 計算成交值
         df_all['turnover_val'] = df_all['MyClose'] * df_all['MyVol']
     except Exception as e:
-        # 這裡也是潛在的空白兇手
-        st.error(f"❌ 資料欄位解析失敗: {e}. 抓到的欄位有: {df_all.columns.tolist()}")
+        st.error(f"❌ 資料欄位解析失敗: {e}")
         return None
 
     df_all['MyId'] = df_all['MyId'].astype(str)
@@ -170,8 +189,10 @@ def fetch_data(_api):
                 start_date=(datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
             )
             
+            # 確保不含今日 (避免 FinMind 偶爾偷跑出不完整的今日資料)
             stock_df = stock_df[stock_df['date'] < d_curr_str]
             
+            # 手動合成今日 K 棒
             new_row = pd.DataFrame([{
                 'date': d_curr_str,
                 'close': current_close
@@ -246,7 +267,7 @@ def fetch_data(_api):
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v1.9.1 除錯版)")
+    st.title("📈 盤中權證進場判斷 (v1.9.2 修復版)")
 
     with st.sidebar:
         st.subheader("系統狀態")
@@ -265,10 +286,8 @@ def run_streamlit():
             data = fetch_data(api)
             
         if data is None:
-            # 這裡不使用 st.stop()，而是印出訊息，避免畫面全白
-            st.warning("⚠️ 程式執行完畢但未回傳有效數據，請查看上方是否有紅色錯誤訊息。")
+            st.warning("⚠️ 程式執行完畢但未回傳有效數據，請查看上方錯誤訊息。")
         else:
-            # 正常顯示區
             cond1 = (data['br_curr'] >= BREADTH_THRESHOLD) and (data['br_prev'] >= BREADTH_THRESHOLD)
             cond2 = data['slope'] > 0
             final_decision = cond1 and cond2
