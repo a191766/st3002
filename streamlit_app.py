@@ -11,10 +11,13 @@ import yfinance as yf
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v1.9.2 (欄位名稱修復版)"
+APP_VERSION = "v2.0.0 (即時排行重算版)"
 UPDATE_LOG = """
-- v1.9.1: 解除靜默失敗。
-- v1.9.2: 修復欄位解析錯誤。重新加入智慧對應邏輯，能正確識別 'Trading_Volume' 為成交量。
+- v1.9.2: 修復欄位名稱錯誤。
+- v2.0.0: 重大邏輯升級！
+  1. 不再沿用昨日排行。
+  2. 盤中直接掃描全台股 (上市+上櫃)，依據即時報價計算成交值。
+  3. 根據「即時成交值」重新排序，抓出當下真正的 Top 300 進行廣度分析。
 """
 
 # ==========================================
@@ -35,9 +38,7 @@ def get_trading_days(api):
     """ 取得交易日 """
     try:
         df = api.taiwan_stock_daily(stock_id="0050", start_date=(datetime.now() - timedelta(days=20)).strftime("%Y-%m-%d"))
-        if df.empty:
-            # 容錯：若抓不到 0050，回傳空陣列，讓後續邏輯處理
-            return []
+        if df.empty: return []
         dates = sorted(df['date'].unique().tolist())
     except Exception:
         return []
@@ -53,64 +54,127 @@ def get_trading_days(api):
             
     return dates
 
-def smart_get_column(df, candidates):
-    """ 
-    智慧欄位搜尋：依序檢查候選名單，回傳第一個存在的欄位 Series 
-    candidates: list of strings, e.g. ['Volume', 'Trading_Volume']
-    """
-    cols = df.columns
-    # 建立一個全小寫的對照表
-    lower_map = {c.lower(): c for c in cols}
-    
-    for name in candidates:
-        # 1. 精確比對
-        if name in cols:
-            return df[name]
-        # 2. 不分大小寫比對
-        if name.lower() in lower_map:
-            return df[lower_map[name.lower()]]
-            
-    # 若都找不到，拋出詳細錯誤
-    raise KeyError(f"找不到目標欄位 (嘗試過: {candidates})。現有欄位: {cols.tolist()}")
+def get_all_stock_ids(api):
+    """ 從 FinMind 取得全台股代號清單 (利用昨日資料) """
+    # 這裡我們只是要「代號列表」，所以抓最近一天的資料即可
+    prev_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    # 往前推幾天直到抓到資料
+    for i in range(5):
+        d_str = (datetime.now() - timedelta(days=i+1)).strftime("%Y-%m-%d")
+        try:
+            df = api.taiwan_stock_daily(stock_id="", start_date=d_str)
+            if not df.empty:
+                # 篩選：排除 ETF
+                df = df[~df['stock_id'].str.startswith(EXCLUDE_ETF_PREFIX)]
+                # 篩選：只留純數字代號
+                df = df[df['stock_id'].str.isdigit()]
+                return df['stock_id'].unique().tolist()
+        except:
+            continue
+    return []
 
-def fetch_yahoo_realtime_batch(codes):
-    """ Yahoo Finance 批次下載 """
-    if not codes: return {}, None
+def fetch_realtime_rank_from_yahoo(stock_ids):
+    """ 
+    核心函數：從 Yahoo 批次抓取全市場，並計算成交值排行
+    """
+    if not stock_ids: return [], {}, None
+
+    # 為了保險，我們對每個代號同時生成 .TW 和 .TWO
+    # 雖然這樣會多出一倍請求，但能確保抓到上市櫃所有資料
+    tickers_map = {}
+    all_tickers = []
     
-    tw_tickers = [f"{c}.TW" for c in codes]
-    two_tickers = [f"{c}.TWO" for c in codes]
-    all_tickers = tw_tickers + two_tickers
+    # 優化：如果有辦法區分上市上櫃更好，但這裡為了簡單暴力，先全部嘗試
+    # 由於 yfinance 批次下載會自動忽略無效代號，所以多丟沒關係
+    for c in stock_ids:
+        tw = f"{c}.TW"
+        two = f"{c}.TWO"
+        all_tickers.extend([tw, two])
+        tickers_map[tw] = c
+        tickers_map[two] = c
+    
+    print(f"準備掃描全市場 {len(stock_ids)} 檔股票 (請求數: {len(all_tickers)})...")
     
     try:
-        # 下載當日數據
+        # 下載全市場即時報價
         data = yf.download(all_tickers, period="1d", group_by='ticker', progress=False, threads=True)
-        realtime_map = {}
-        latest_time = None
         
-        # 單檔處理 (Yahoo 回傳格式不同)
-        if len(all_tickers) == 1:
-             t = all_tickers[0]
-             df = data
-             if not df.empty and not df['Close'].isna().all():
-                 realtime_map[t.split('.')[0]] = float(df['Close'].iloc[-1])
-                 latest_time = df.index[-1]
-        else:
-            # 多檔處理
-            for t in all_tickers:
-                try:
+        calculated_list = []
+        realtime_cache = {} # 存起來等下算 MA5 用
+        latest_time = None
+
+        # 解析資料 (這段比較繁瑣因為 yfinance 格式多變)
+        # 遍歷下載回來的每一個 ticker column
+        # data 的 columns 可能是 MultiIndex (Ticker, PriceType)
+        
+        # 取得所有有資料的 Ticker
+        valid_tickers = data.columns.levels[0] if isinstance(data.columns, pd.MultiIndex) else [data.name]
+        
+        for t in valid_tickers:
+            try:
+                # 取出單檔 DataFrame
+                if isinstance(data.columns, pd.MultiIndex):
                     df = data[t]
-                    if not df.empty and not df['Close'].isna().all():
-                        last_price = float(df['Close'].iloc[-1])
-                        last_ts = df.index[-1]
-                        if latest_time is None or last_ts > latest_time:
-                            latest_time = last_ts
-                        realtime_map[t.split('.')[0]] = last_price
-                except:
+                else:
+                    df = data # 只有一檔時
+                
+                if df.empty or df['Close'].isna().all() or df['Volume'].isna().all():
                     continue
-        return realtime_map, latest_time
+
+                # 抓最後一筆
+                row = df.iloc[-1]
+                c = float(row['Close'])
+                h = float(row['High'])
+                l = float(row['Low'])
+                v = float(row['Volume'])
+                
+                if v <= 0: continue
+                
+                # 計算時間
+                last_ts = df.index[-1]
+                if latest_time is None or last_ts > latest_time:
+                    latest_time = last_ts
+
+                # === 你的核心公式 ===
+                # 成交值 = ((H + L + C) / 3) * Volume / 1,000,000 (百萬)
+                avg_p = (h + l + c) / 3.0
+                turnover = (avg_p * v) / 1_000_000.0
+                
+                # 還原純數字代號
+                stock_code = tickers_map.get(t, t.split('.')[0])
+                
+                # 存入列表以便排序
+                calculated_list.append({
+                    'code': stock_code,
+                    'turnover': turnover,
+                    'close': c,
+                    'high': h,
+                    'low': l,
+                    'volume': v
+                })
+                
+                # 存入快取
+                realtime_cache[stock_code] = {
+                    'close': c, 'high': h, 'low': l, 'volume': v
+                }
+                
+            except Exception:
+                continue
+
+        # 排序：取成交值前 TOP_N
+        df_rank = pd.DataFrame(calculated_list)
+        if df_rank.empty:
+            return [], {}, None
+            
+        # 依成交值降冪排序，並去重 (以防 .TW 和 .TWO 都有數據，雖然少見)
+        df_rank = df_rank.sort_values('turnover', ascending=False).drop_duplicates('code')
+        top_n_df = df_rank.head(TOP_N)
+        
+        return top_n_df, realtime_cache, latest_time
+
     except Exception as e:
-        print(f"Yahoo Err: {e}")
-        return {}, None
+        print(f"全市場掃描失敗: {e}")
+        return [], {}, None
 
 @st.cache_data(ttl=300)
 def fetch_data(_api):
@@ -122,83 +186,54 @@ def fetch_data(_api):
     d_curr_str = all_days[-1]
     d_prev_str = all_days[-2]
     
-    debug_dates = f"D={d_curr_str}, D-1={d_prev_str}"
-    
-    # === 步驟 1: 取得「D-1」的排行 ===
-    try:
-        df_all = _api.taiwan_stock_daily(stock_id="", start_date=d_prev_str)
-    except Exception as e:
-        st.error(f"❌ API 請求失敗: {e}")
-        return None
-    
-    if df_all.empty:
-        # 回推機制：若 D-1 沒資料，試試 D-2 (避免連假後 API 缺漏)
-        d_prev_str = all_days[-3]
-        df_all = _api.taiwan_stock_daily(stock_id="", start_date=d_prev_str)
-        
-    if df_all.empty:
-        st.error(f"❌ 無法取得全市場排行資料 (日期: {d_prev_str})。")
+    # === 步驟 1: 取得全市場代號清單 ===
+    all_ids = get_all_stock_ids(_api)
+    if not all_ids:
+        st.error("無法取得股票代號清單。")
         return None
         
-    # === 欄位對應修復區 (v1.9.2) ===
-    try:
-        # 使用 smart_get_column 來找對應欄位，支援 Trading_Volume
-        df_all['MyClose'] = smart_get_column(df_all, ['Close', 'price', 'deal_price'])
-        df_all['MyVol'] = smart_get_column(df_all, ['Volume', 'Trading_Volume', 'vol'])
-        df_all['MyId'] = smart_get_column(df_all, ['stock_id', 'code', 'SecurityCode'])
-        
-        # 計算成交值
-        df_all['turnover_val'] = df_all['MyClose'] * df_all['MyVol']
-    except Exception as e:
-        st.error(f"❌ 資料欄位解析失敗: {e}")
+    # === 步驟 2: 即時掃描全市場並排行 (Yahoo) ===
+    # 這裡會花一點時間，因為要下載 2000 檔
+    with st.spinner(f"正在即時掃描全市場 {len(all_ids)} 檔股票，計算最新成交值排行..."):
+        df_top_n, rt_cache, last_time = fetch_realtime_rank_from_yahoo(all_ids)
+    
+    if df_top_n is None or df_top_n.empty:
+        st.error("全市場即時掃描失敗，無法產生排行。")
         return None
 
-    df_all['MyId'] = df_all['MyId'].astype(str)
-    df_all = df_all[df_all['MyId'].str.isdigit()]  
-    df_all = df_all[~df_all['MyId'].str.startswith(EXCLUDE_ETF_PREFIX)] 
+    # 這就是我們今天要分析的「即時母體」
+    target_candidates = df_top_n.to_dict('records')
     
-    df_candidates = df_all.sort_values('turnover_val', ascending=False).head(TOP_N).copy()
-    target_codes = df_candidates['MyId'].tolist()
-    
-    # === 步驟 2: Yahoo 批次抓取即時價 ===
-    rt_prices, last_update_time = fetch_yahoo_realtime_batch(target_codes)
-    
-    # === 步驟 3: 逐檔運算 ===
+    # === 步驟 3: 逐檔計算 MA5 (FinMind History + Yahoo Realtime) ===
     results = []
     detailed_status = []
-    updated_count = 0
     
-    progress_bar = st.progress(0, text="數據整合中...")
+    progress_bar = st.progress(0, text="正在分析 Top 300 技術指標...")
     
-    for i, (idx, row) in enumerate(df_candidates.iterrows()):
-        code = row['MyId']
+    for i, row in enumerate(target_candidates):
+        code = row['code']
+        current_close = row['close']
         rank = i + 1
         status = "未知"
-        price_src = "歷史延用"
-        
-        if code in rt_prices:
-            current_close = rt_prices[code]
-            price_src = "Yahoo即時"
-            updated_count += 1
-        else:
-            current_close = row['MyClose']
         
         try:
+            # A. 抓歷史資料 (FinMind)
             stock_df = _api.taiwan_stock_daily(
                 stock_id=code,
                 start_date=(datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
             )
             
-            # 確保不含今日 (避免 FinMind 偶爾偷跑出不完整的今日資料)
+            # 清理：確保不含今日
             stock_df = stock_df[stock_df['date'] < d_curr_str]
             
-            # 手動合成今日 K 棒
+            # B. 拼上今日即時資料 (Yahoo)
             new_row = pd.DataFrame([{
                 'date': d_curr_str,
                 'close': current_close
             }])
             stock_df = pd.concat([stock_df, new_row], ignore_index=True)
                 
+            # C. 計算指標
             if len(stock_df) >= 6:
                 stock_df['MA5'] = stock_df['close'].rolling(5).mean()
                 curr_row = stock_df.iloc[-1]
@@ -219,12 +254,12 @@ def fetch_data(_api):
             "排名": rank,
             "代號": code,
             "現價": current_close,
-            "來源": price_src,
+            "成交額(百萬)": row['turnover'],
             "狀態": status
         })
         
-        if i % 20 == 0:
-            progress_bar.progress((i + 1) / TOP_N, text=f"計算中... (已更新 {updated_count} 檔)")
+        if i % 30 == 0:
+            progress_bar.progress((i + 1) / TOP_N, text=f"分析進度: {i+1}/{TOP_N}")
             
     progress_bar.empty()
     res_df = pd.DataFrame(results)
@@ -258,16 +293,14 @@ def fetch_data(_api):
         "valid": len(res_df),
         "slope": slope,
         "detail_df": detail_df,
-        "updated_count": updated_count,
-        "last_time": last_update_time,
-        "debug_dates": debug_dates
+        "last_time": last_time
     }
 
 # ==========================================
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v1.9.2 修復版)")
+    st.title("📈 盤中權證進場判斷 (v2.0 全市場即時排行)")
 
     with st.sidebar:
         st.subheader("系統狀態")
@@ -278,15 +311,15 @@ def run_streamlit():
     api = DataLoader()
     api.login_by_token(API_TOKEN)
 
-    if st.button("🔄 立即重新整理"):
+    if st.button("🔄 立即掃描全市場 (運算約需 30秒)"):
         st.cache_data.clear()
 
     try:
-        with st.spinner("正在強制校正時間軸並抓取數據..."):
-            data = fetch_data(api)
+        # 第一次載入時自動執行
+        data = fetch_data(api)
             
         if data is None:
-            st.warning("⚠️ 程式執行完畢但未回傳有效數據，請查看上方錯誤訊息。")
+            st.warning("⚠️ 程式執行完畢但未回傳有效數據，請確認 API 連線。")
         else:
             cond1 = (data['br_curr'] >= BREADTH_THRESHOLD) and (data['br_prev'] >= BREADTH_THRESHOLD)
             cond2 = data['slope'] > 0
@@ -294,8 +327,7 @@ def run_streamlit():
             time_str = data['last_time'].strftime("%H:%M:%S") if data['last_time'] else "未知"
 
             st.subheader(f"📅 數據基準日：{data['d_curr']}")
-            st.caption(f"ℹ️ 時間軸確認：{data['debug_dates']}")
-            st.info(f"📊 即時更新數：**{data['updated_count']}** / {len(data['detail_df'])} 檔 (時間: {time_str})")
+            st.info(f"📊 統計說明：已掃描全市場並依「即時成交值」重算 Top {TOP_N}。 (最新報價: {time_str})")
 
             c1, c2, c3 = st.columns(3)
             c1.metric("今日廣度 (D)", f"{data['br_curr']:.1%}", f"{data['hit_curr']}/{data['valid']}")
@@ -309,7 +341,17 @@ def run_streamlit():
             else:
                 st.error(f"⛔ 結論：不可進場")
             
-            st.dataframe(data['detail_df'], use_container_width=True, hide_index=True)
+            st.subheader(f"📋 即時成交值排行榜 (Top {TOP_N})")
+            st.dataframe(
+                data['detail_df'], 
+                column_config={
+                    "排名": st.column_config.NumberColumn(format="%d"),
+                    "現價": st.column_config.NumberColumn(format="%.2f"),
+                    "成交額(百萬)": st.column_config.NumberColumn(format="$%.2f"),
+                },
+                use_container_width=True, 
+                hide_index=True
+            )
 
     except Exception as e:
         st.error(f"執行出錯: {e}")
