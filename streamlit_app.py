@@ -11,12 +11,10 @@ import yfinance as yf
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v2.4.0 (盤後保底版)"
+APP_VERSION = "v2.4.1 (盤後保底+欄位修復版)"
 UPDATE_LOG = """
-- v2.3.1: 空值防護。
-- v2.4.0: 修正盤後 0% 問題。
-  1. 新增「排行榜收盤價」作為備援：當 Yahoo 盤後抓不到即時價時，直接使用 FinMind 排行榜內的收盤價。
-  2. 確保只要排行榜有資料，今日廣度就絕對算得出來，不再依賴不穩定的 Yahoo。
+- v2.4.0: 新增盤後保底機制 (若 Yahoo 無資料，自動使用 FinMind 排行榜收盤價)。
+- v2.4.1: 修復 KeyError '排名' 錯誤。修正資料表欄位對應問題。
 """
 
 # ==========================================
@@ -36,6 +34,7 @@ st.set_page_config(page_title="盤中權證進場判斷", layout="wide")
 def get_current_status():
     tw_now = datetime.now(timezone(timedelta(hours=8)))
     current_time = tw_now.time()
+    # 08:45 ~ 13:30 視為盤中
     is_intraday = time(8, 45) <= current_time < time(13, 30)
     return tw_now, is_intraday
 
@@ -70,7 +69,7 @@ def fetch_yahoo_realtime_batch(codes):
     all_tickers = tw_tickers + [f"{c}.TWO" for c in codes]
     
     try:
-        # 使用 threads=False 增加穩定性，避免盤後多執行緒被擋
+        # 使用 threads=False 增加穩定性
         data = yf.download(all_tickers, period="1d", group_by='ticker', progress=False, threads=False)
         realtime_map = {}
         latest_time = None
@@ -160,7 +159,7 @@ def calc_breadth_score(_api, target_list, check_date, use_realtime, rank_source_
             # 2. 備援：如果 Yahoo 沒資料，但排行榜是「今天」的，直接用排行榜收盤價
             elif rank_source_date == check_date and item['hist_close'] > 0:
                 price_to_use = item['hist_close']
-                source_type = "FinMind(收盤)"
+                source_type = "FinMind(榜單)"
         
         try:
             # 抓歷史
@@ -177,7 +176,7 @@ def calc_breadth_score(_api, target_list, check_date, use_realtime, rank_source_
                     new_row = pd.DataFrame([{'date': check_date, 'close': price_to_use}])
                     stock_df = pd.concat([stock_df, new_row], ignore_index=True)
                 else:
-                    # 真的完全沒價格，保留原樣 (可能有 FinMind 自己更新的今日 K 線)
+                    # 沒抓到價格，不做任何動作 (保留 FinMind 原本可能已有的今日資料)
                     pass
             else:
                 # 算 D-1：切除未來數據
@@ -225,7 +224,6 @@ def fetch_data(_api):
     tw_now, is_intraday = get_current_status()
     
     # 步驟 1: 取得排行
-    # D-1 排行
     prev_rank_list = get_rank_list(_api, d_prev_str, backup_date=all_days[-3])
     
     if is_intraday:
@@ -248,11 +246,9 @@ def fetch_data(_api):
         return None
 
     progress_bar = st.progress(0, text="計算昨日數據...")
-    # D-1 計算：傳入 d_prev_str 作為 rank_source_date (雖然這裡沒用到即時價，但保持一致)
     hit_prev, valid_prev, _, _ = calc_breadth_score(_api, prev_rank_list, d_prev_str, use_realtime=False, rank_source_date=d_prev_str)
     
     progress_bar.progress(50, text=f"計算今日數據 ({mode_msg})...")
-    # D 計算：傳入 rank_source_date 讓函數知道能否用榜單價當作今日價
     hit_curr, valid_curr, details, last_time = calc_breadth_score(_api, curr_rank_list, d_curr_str, use_realtime=True, rank_source_date=rank_source_date)
     
     progress_bar.empty()
@@ -260,7 +256,8 @@ def fetch_data(_api):
     detail_df = pd.DataFrame(details)
     if not detail_df.empty:
         detail_df['狀態'] = detail_df['ok'].apply(lambda x: '✅ 納入' if x else '❌ 剔除')
-        detail_df = detail_df[['排名', 'code', 'price', 'src', '狀態']]
+        # 【修正點】這裡使用正確的欄位名稱 'rank'
+        detail_df = detail_df[['rank', 'code', 'price', 'src', '狀態']]
         detail_df.columns = ['排名', '代號', '現價', '來源', '狀態']
 
     slope = 0
@@ -290,7 +287,7 @@ def fetch_data(_api):
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v2.4.0 盤後保底)")
+    st.title("📈 盤中權證進場判斷 (v2.4.1 盤後保底修復)")
 
     with st.sidebar:
         st.subheader("系統狀態")
@@ -313,7 +310,7 @@ def run_streamlit():
             cond1 = (data['br_curr'] >= BREADTH_THRESHOLD) and (data['br_prev'] >= BREADTH_THRESHOLD)
             cond2 = data['slope'] > 0
             final_decision = cond1 and cond2
-            time_str = data['last_time'].strftime("%H:%M:%S") if data['last_time'] else "無Yahoo數據"
+            time_str = data['last_time'].strftime("%H:%M:%S") if data['last_time'] else "使用FinMind榜單價"
 
             st.subheader(f"📅 基準日：{data['d_curr']}")
             st.caption(f"D-1: {data['d_prev']} | D: {data['d_curr']}")
