@@ -11,10 +11,14 @@ import yfinance as yf
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v2.4.1 (盤後保底+欄位修復版)"
+APP_VERSION = "v2.5.1 (詳細狀態版)"
 UPDATE_LOG = """
-- v2.4.0: 新增盤後保底機制 (若 Yahoo 無資料，自動使用 FinMind 排行榜收盤價)。
-- v2.4.1: 修復 KeyError '排名' 錯誤。修正資料表欄位對應問題。
+- v2.5.0: 邏輯回歸穩定。
+- v2.5.1: 優化狀態顯示。
+  現在表格會明確區分：
+  1. 「📉 未通過」：資料有效，但股價跌破 MA5 (附註 MA5 價格)。
+  2. 「🚫 剔除」：資料不足或無報價 (不計入分母)。
+  3. 「✅ 通過」：股價站上 MA5。
 """
 
 # ==========================================
@@ -34,7 +38,6 @@ st.set_page_config(page_title="盤中權證進場判斷", layout="wide")
 def get_current_status():
     tw_now = datetime.now(timezone(timedelta(hours=8)))
     current_time = tw_now.time()
-    # 08:45 ~ 13:30 視為盤中
     is_intraday = time(8, 45) <= current_time < time(13, 30)
     return tw_now, is_intraday
 
@@ -52,7 +55,6 @@ def get_trading_days(api):
     if 0 <= tw_now.weekday() <= 4 and tw_now.time() >= time(8, 45):
         if not dates or today_str > dates[-1]:
             dates.append(today_str)
-            
     return dates
 
 def smart_get_column(df, candidates):
@@ -64,15 +66,11 @@ def smart_get_column(df, candidates):
     return None
 
 def fetch_yahoo_realtime_batch(codes):
-    if not codes: return {}, None
-    tw_tickers = [f"{c}.TW" for c in codes]
-    all_tickers = tw_tickers + [f"{c}.TWO" for c in codes]
-    
+    if not codes: return {}
+    all_tickers = [f"{c}.TW" for c in codes] + [f"{c}.TWO" for c in codes]
     try:
-        # 使用 threads=False 增加穩定性
         data = yf.download(all_tickers, period="1d", group_by='ticker', progress=False, threads=False)
         realtime_map = {}
-        latest_time = None
         
         valid_tickers = []
         if isinstance(data.columns, pd.MultiIndex):
@@ -84,25 +82,17 @@ def fetch_yahoo_realtime_batch(codes):
         if len(valid_tickers) == 0 and not data.empty and len(all_tickers) == 1:
              df = data
              if not df.empty and not df['Close'].isna().all():
-                 c = float(df['Close'].iloc[-1])
-                 realtime_map[codes[0]] = c
-                 latest_time = df.index[-1]
+                 realtime_map[codes[0]] = float(df['Close'].iloc[-1])
         else:
             for t in valid_tickers:
                 try:
                     df = data[t] if isinstance(data.columns, pd.MultiIndex) else data
                     if df.empty or df['Close'].isna().all(): continue
-                    last_price = float(df['Close'].iloc[-1])
-                    last_ts = df.index[-1]
-                    if latest_time is None or last_ts > latest_time:
-                        latest_time = last_ts
-                    stock_id = t.split('.')[0]
-                    realtime_map[stock_id] = last_price
+                    realtime_map[t.split('.')[0]] = float(df['Close'].iloc[-1])
                 except: continue
-                
-        return realtime_map, latest_time
+        return realtime_map
     except:
-        return {}, None
+        return {}
 
 def get_rank_list(api, date_str, backup_date=None):
     try:
@@ -113,7 +103,6 @@ def get_rank_list(api, date_str, backup_date=None):
 
         df_rank['ID'] = smart_get_column(df_rank, ['stock_id', 'code'])
         df_rank['Money'] = smart_get_column(df_rank, ['Trading_money', 'Trading_Money', 'turnover'])
-        df_rank['Close'] = smart_get_column(df_rank, ['close', 'Close', 'price'])
         
         df_rank['ID'] = df_rank['ID'].astype(str)
         df_rank = df_rank[df_rank['ID'].str.len() == 4]
@@ -122,96 +111,75 @@ def get_rank_list(api, date_str, backup_date=None):
             df_rank = df_rank[~df_rank['ID'].str.startswith(prefix)]
             
         df_candidates = df_rank.sort_values('Money', ascending=False).head(TOP_N)
-        target_list = []
-        for _, row in df_candidates.iterrows():
-            target_list.append({
-                'code': row['ID'],
-                'hist_close': float(row['Close']) if pd.notnull(row['Close']) else 0.0
-            })
-        return target_list
+        return df_candidates['ID'].tolist()
     except:
         return []
 
-def calc_breadth_score(_api, target_list, check_date, use_realtime, rank_source_date):
+def calc_yesterday_stats(_api, date_prev, rank_codes):
+    """ 計算昨日 (D-1) """
     hits = 0
     valid = 0
-    detail_res = []
-    
-    rt_map = {}
-    last_t = None
-    if use_realtime:
-        codes = [x['code'] for x in target_list]
-        rt_map, last_t = fetch_yahoo_realtime_batch(codes)
-        
-    for i, item in enumerate(target_list):
-        code = item['code']
-        
-        # === 核心修正：決定使用的價格 ===
-        price_to_use = 0
-        source_type = "None"
-        
-        if use_realtime:
-            # 1. 優先用 Yahoo
-            yahoo_p = rt_map.get(code, 0)
-            if yahoo_p > 0:
-                price_to_use = yahoo_p
-                source_type = "Yahoo"
-            # 2. 備援：如果 Yahoo 沒資料，但排行榜是「今天」的，直接用排行榜收盤價
-            elif rank_source_date == check_date and item['hist_close'] > 0:
-                price_to_use = item['hist_close']
-                source_type = "FinMind(榜單)"
-        
+    for code in rank_codes:
         try:
-            # 抓歷史
-            stock_df = _api.taiwan_stock_daily(
-                stock_id=code,
-                start_date=(datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-            )
-            
-            # 手動合成 K 棒邏輯
-            if use_realtime:
-                if price_to_use > 0:
-                    # 有抓到價格 (Yahoo 或 FinMind榜單)，強制合成今日
-                    stock_df = stock_df[stock_df['date'] < check_date] # 刪舊
-                    new_row = pd.DataFrame([{'date': check_date, 'close': price_to_use}])
-                    stock_df = pd.concat([stock_df, new_row], ignore_index=True)
-                else:
-                    # 沒抓到價格，不做任何動作 (保留 FinMind 原本可能已有的今日資料)
-                    pass
-            else:
-                # 算 D-1：切除未來數據
-                stock_df = stock_df[stock_df['date'] <= check_date]
-            
+            stock_df = _api.taiwan_stock_daily(stock_id=code, start_date=(datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"))
+            stock_df = stock_df[stock_df['date'] <= date_prev]
             if len(stock_df) >= 6:
                 stock_df['MA5'] = stock_df['close'].rolling(5).mean()
                 curr = stock_df.iloc[-1]
-                
-                # 日期檢查
-                last_dt = pd.to_datetime(curr['date']).strftime("%Y-%m-%d")
-                days_diff = (pd.to_datetime(check_date) - pd.to_datetime(last_dt)).days
-                
-                is_valid_date = False
-                if last_dt == check_date:
-                    is_valid_date = True
-                elif not use_realtime and 0 < days_diff <= 3: 
-                    # D-1 寬容模式
-                    is_valid_date = True
-                
-                if is_valid_date:
-                    is_ok = curr['close'] > curr['MA5']
-                    if is_ok: hits += 1
-                    valid += 1
-                    detail_res.append({
-                        'code': code, 
-                        'price': curr['close'],
-                        'ok': is_ok,
-                        'rank': i+1,
-                        'src': source_type if use_realtime else '歷史'
-                    })
-        except:
-            pass
+                if curr['close'] > curr['MA5']: hits += 1
+                valid += 1
+        except: pass
+    return hits, valid
+
+def calc_today_stats(_api, date_curr, rank_codes):
+    """ 計算今日 (D) 並回傳詳細原因 """
+    hits = 0
+    valid = 0
+    details = []
+    
+    rt_map = fetch_yahoo_realtime_batch(rank_codes)
+    
+    for i, code in enumerate(rank_codes):
+        current_price = rt_map.get(code, 0)
+        rank = i + 1
+        status = "未知"
+        
+        try:
+            stock_df = _api.taiwan_stock_daily(stock_id=code, start_date=(datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"))
+            stock_df = stock_df[stock_df['date'] < date_curr]
             
-    return hits, valid, detail_res, last_t
+            if current_price > 0:
+                new_row = pd.DataFrame([{'date': date_curr, 'close': current_price}])
+                stock_df = pd.concat([stock_df, new_row], ignore_index=True)
+                
+                if len(stock_df) >= 6:
+                    stock_df['MA5'] = stock_df['close'].rolling(5).mean()
+                    ma5_val = stock_df['MA5'].iloc[-1]
+                    curr_close = stock_df['close'].iloc[-1]
+                    
+                    if curr_close > ma5_val:
+                        hits += 1
+                        valid += 1
+                        status = "✅ 通過"
+                    else:
+                        valid += 1 # 雖未通過但資料有效，計入分母
+                        status = f"📉 未通過 (MA5:{ma5_val:.1f})"
+                else:
+                    status = f"🚫 剔除 (資料不足K={len(stock_df)})"
+            else:
+                status = "⚠️ 剔除 (無即時價)"
+                
+        except Exception as e:
+            status = f"❌ 錯誤 ({str(e)})"
+            
+        details.append({
+            '排名': rank,
+            '代號': code,
+            '現價': current_price,
+            '狀態': status
+        })
+        
+    return hits, valid, details
 
 @st.cache_data(ttl=300)
 def fetch_data(_api):
@@ -223,49 +191,39 @@ def fetch_data(_api):
     
     tw_now, is_intraday = get_current_status()
     
-    # 步驟 1: 取得排行
-    prev_rank_list = get_rank_list(_api, d_prev_str, backup_date=all_days[-3])
+    # 1. 取得昨日排行 (基準)
+    prev_rank_codes = get_rank_list(_api, d_prev_str, backup_date=all_days[-3])
     
+    # 2. 計算昨日廣度
+    if prev_rank_codes:
+        hit_prev, valid_prev = calc_yesterday_stats(_api, d_prev_str, prev_rank_codes)
+    else:
+        hit_prev, valid_prev = 0, 0
+        
+    # 3. 決定今日名單 & 計算今日廣度
     if is_intraday:
-        curr_rank_list = prev_rank_list
-        rank_source_date = d_prev_str
+        curr_rank_codes = prev_rank_codes
         mode_msg = "🚀 盤中模式 (母體:昨日排行)"
     else:
-        # 盤後嘗試抓 D
-        curr_rank_list = get_rank_list(_api, d_curr_str)
-        if curr_rank_list:
-            rank_source_date = d_curr_str
+        curr_rank_codes = get_rank_list(_api, d_curr_str)
+        if curr_rank_codes:
             mode_msg = "🐢 盤後模式 (母體:今日排行)"
         else:
-            curr_rank_list = prev_rank_list
-            rank_source_date = d_prev_str
+            curr_rank_codes = prev_rank_codes
             mode_msg = "⚠️ 盤後模式 (FinMind 未更新，沿用昨日排行)"
-
-    if not prev_rank_list:
-        st.error("無法取得排行資料")
-        return None
-
-    progress_bar = st.progress(0, text="計算昨日數據...")
-    hit_prev, valid_prev, _, _ = calc_breadth_score(_api, prev_rank_list, d_prev_str, use_realtime=False, rank_source_date=d_prev_str)
-    
-    progress_bar.progress(50, text=f"計算今日數據 ({mode_msg})...")
-    hit_curr, valid_curr, details, last_time = calc_breadth_score(_api, curr_rank_list, d_curr_str, use_realtime=True, rank_source_date=rank_source_date)
-    
+            
+    progress_bar = st.progress(0, text=f"分析中 ({mode_msg})...")
+    hit_curr, valid_curr, details = calc_today_stats(_api, d_curr_str, curr_rank_codes)
     progress_bar.empty()
     
     detail_df = pd.DataFrame(details)
-    if not detail_df.empty:
-        detail_df['狀態'] = detail_df['ok'].apply(lambda x: '✅ 納入' if x else '❌ 剔除')
-        # 【修正點】這裡使用正確的欄位名稱 'rank'
-        detail_df = detail_df[['rank', 'code', 'price', 'src', '狀態']]
-        detail_df.columns = ['排名', '代號', '現價', '來源', '狀態']
-
+    
+    # 4. 斜率
     slope = 0
     try:
         twii_df = _api.taiwan_stock_daily(stock_id="TAIEX", start_date=(datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"))
-        if not twii_df.empty:
-            twii_df['MA5'] = twii_df['close'].rolling(5).mean()
-            slope = twii_df['MA5'].iloc[-1] - twii_df['MA5'].iloc[-2]
+        twii_df['MA5'] = twii_df['close'].rolling(5).mean()
+        slope = twii_df['MA5'].iloc[-1] - twii_df['MA5'].iloc[-2]
     except: pass
     
     br_prev = hit_prev / valid_prev if valid_prev > 0 else 0
@@ -279,15 +237,14 @@ def fetch_data(_api):
         "hit_prev": hit_prev, "valid_prev": valid_prev,
         "slope": slope,
         "detail_df": detail_df,
-        "mode_msg": mode_msg,
-        "last_time": last_time
+        "mode_msg": mode_msg
     }
 
 # ==========================================
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v2.4.1 盤後保底修復)")
+    st.title("📈 盤中權證進場判斷 (v2.5.1 詳細狀態)")
 
     with st.sidebar:
         st.subheader("系統狀態")
@@ -310,10 +267,9 @@ def run_streamlit():
             cond1 = (data['br_curr'] >= BREADTH_THRESHOLD) and (data['br_prev'] >= BREADTH_THRESHOLD)
             cond2 = data['slope'] > 0
             final_decision = cond1 and cond2
-            time_str = data['last_time'].strftime("%H:%M:%S") if data['last_time'] else "使用FinMind榜單價"
 
             st.subheader(f"📅 基準日：{data['d_curr']}")
-            st.caption(f"D-1: {data['d_prev']} | D: {data['d_curr']}")
+            st.caption(f"昨日基準: {data['d_prev']}")
             st.success(f"📌 {data['mode_msg']}")
             
             c1, c2, c3 = st.columns(3)
@@ -327,7 +283,6 @@ def run_streamlit():
             else:
                 st.error(f"⛔ 結論：不可進場")
                 
-            st.caption(f"即時報價時間: {time_str}")
             st.dataframe(data['detail_df'], use_container_width=True, hide_index=True)
 
     except Exception as e:
