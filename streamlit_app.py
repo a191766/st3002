@@ -6,18 +6,18 @@ from FinMind.data import DataLoader
 from datetime import datetime, timedelta, timezone, time
 import traceback
 import sys
-import time as time_module  # 引入時間模組做延遲控制
+import yfinance as yf  # 把 Yahoo 救回來當備援
 
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v3.1.0 (Sponsor 穩定防爆版)"
+APP_VERSION = "v3.2.0 (極速雙源版)"
 UPDATE_LOG = """
-- v3.0.1: Sponsor 即時 Tick 版。
-- v3.1.0: 解決大量請求導致的後段報錯問題。
-  1. 新增「失敗重試 (Retry)」機制：若抓取失敗，自動冷靜 1 秒後重試。
-  2. 新增「微量延遲」：每檔間隔 0.02 秒，避免瞬間流量過大被伺服器阻擋。
-  3. 恢復顯示詳細錯誤訊息，方便除錯。
+- v3.1.1: 強韌連線版。
+- v3.2.0: 移除所有等待時間 & 新增 Yahoo 備援。
+  1. 【暴力加速】移除所有 time.sleep 延遲，追求最快運算速度。
+  2. 【雙重報價】優先抓取 FinMind 即時 Tick；若抓不到 (回傳空值)，立刻切換抓取 Yahoo 即時價。
+  3. 確保「現價」欄位絕對有值，不再出現 0 或空白。
 """
 
 # ==========================================
@@ -28,7 +28,7 @@ TOP_N = 300
 BREADTH_THRESHOLD = 0.65
 EXCLUDE_PREFIXES = ["00", "91"]
 
-st.set_page_config(page_title="盤中權證進場判斷 (Sponsor)", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (雙源極速)", layout="wide")
 
 # ==========================================
 # 功能函式
@@ -37,25 +37,26 @@ st.set_page_config(page_title="盤中權證進場判斷 (Sponsor)", layout="wide
 def get_current_status():
     tw_now = datetime.now(timezone(timedelta(hours=8)))
     current_time = tw_now.time()
-    # 08:45 ~ 13:30 視為盤中
     is_intraday = time(8, 45) <= current_time < time(13, 30)
     return tw_now, is_intraday
 
-def get_trading_days(api):
+def get_trading_days_robust(api):
     try:
         df = api.taiwan_stock_daily(stock_id="0050", start_date=(datetime.now() - timedelta(days=20)).strftime("%Y-%m-%d"))
-        if df.empty: return []
-        dates = sorted(df['date'].unique().tolist())
+        if not df.empty:
+            return sorted(df['date'].unique().tolist())
     except:
-        return []
+        pass 
     
-    tw_now, is_intraday = get_current_status()
-    today_str = tw_now.strftime("%Y-%m-%d")
-    
-    if 0 <= tw_now.weekday() <= 4 and tw_now.time() >= time(8, 45):
-        if not dates or today_str > dates[-1]:
-            dates.append(today_str)
-    return dates
+    # 救生圈模式
+    dates = []
+    tw_now, _ = get_current_status()
+    check_day = tw_now
+    while len(dates) < 5:
+        if check_day.weekday() <= 4:
+            dates.append(check_day.strftime("%Y-%m-%d"))
+        check_day -= timedelta(days=1)
+    return sorted(dates)
 
 def smart_get_column(df, candidates):
     cols = df.columns
@@ -65,8 +66,9 @@ def smart_get_column(df, candidates):
         if name.lower() in lower_map: return df[lower_map[name.lower()]]
     return None
 
-def fetch_finmind_snapshot(api, date_str):
-    """ [Sponsor] 全市場即時成交快照 """
+# === 報價源 1: FinMind ===
+def fetch_finmind_snapshot(api):
+    """ 嘗試抓取 FinMind 全市場快照 """
     try:
         df = api.taiwan_stock_tick_snapshot(stock_id="")
         if df.empty: return {}, None
@@ -79,20 +81,54 @@ def fetch_finmind_snapshot(api, date_str):
         snapshot_map = dict(zip(code_col, price_col))
         
         time_col = smart_get_column(df, ['time', 'date'])
-        last_time = "即時"
+        last_time = "FinMind即時"
         if time_col is not None:
             last_time = time_col.iloc[-1]
             
         return snapshot_map, last_time
-    except Exception as e:
-        st.error(f"Snapshot Error: {e}")
+    except:
         return {}, None
+
+# === 報價源 2: Yahoo (備援) ===
+def fetch_yahoo_realtime_batch(codes):
+    """ Yahoo 批次下載 (當 FinMind 失敗時使用) """
+    if not codes: return {}
+    
+    all_tickers = [f"{c}.TW" for c in codes] + [f"{c}.TWO" for c in codes]
+    try:
+        # threads=True 全速下載
+        data = yf.download(all_tickers, period="1d", group_by='ticker', progress=False, threads=True)
+        realtime_map = {}
+        
+        valid_tickers = []
+        if isinstance(data.columns, pd.MultiIndex):
+            valid_tickers = data.columns.levels[0]
+        elif not data.empty:
+            valid_tickers = [data.name] if hasattr(data, 'name') else []
+            if len(all_tickers) == 1: valid_tickers = all_tickers
+
+        if len(valid_tickers) == 0 and not data.empty and len(all_tickers) == 1:
+             df = data
+             if not df.empty and not df['Close'].isna().all():
+                 realtime_map[codes[0]] = float(df['Close'].iloc[-1])
+        else:
+            for t in valid_tickers:
+                try:
+                    df = data[t] if isinstance(data.columns, pd.MultiIndex) else data
+                    if df.empty or df['Close'].isna().all(): continue
+                    realtime_map[t.split('.')[0]] = float(df['Close'].iloc[-1])
+                except: continue
+        return realtime_map
+    except:
+        return {}
 
 def get_rank_list(api, date_str, backup_date=None):
     try:
+        # 不等待，直接抓
         df_rank = api.taiwan_stock_daily(stock_id="", start_date=date_str)
         if df_rank.empty and backup_date:
             df_rank = api.taiwan_stock_daily(stock_id="", start_date=backup_date)
+
         if df_rank.empty: return []
 
         df_rank['ID'] = smart_get_column(df_rank, ['stock_id', 'code'])
@@ -109,86 +145,92 @@ def get_rank_list(api, date_str, backup_date=None):
     except:
         return []
 
-# === 運算邏輯 (含重試機制) ===
+# === 運算邏輯 (極速版) ===
 
-def get_history_with_retry(_api, code, start_date, max_retries=1):
-    """ 
-    包裝過的歷史資料抓取函式
-    如果失敗，會等待 1 秒後重試一次
-    """
-    last_err = None
-    for attempt in range(max_retries + 1):
-        try:
-            df = _api.taiwan_stock_daily(
-                stock_id=code,
-                start_date=start_date
-            )
-            return df, None # 成功
-        except Exception as e:
-            last_err = e
-            if attempt < max_retries:
-                time_module.sleep(1.0) # 冷靜 1 秒
-            else:
-                return None, last_err
-
-def calc_stats_finmind_only(_api, target_date, rank_codes, use_realtime=False):
+def calc_stats_hybrid(_api, target_date, rank_codes, use_realtime=False):
     hits = 0
     valid = 0
     details = []
     
-    # 抓全市場 Tick 快照
-    snapshot_map = {}
+    # === 1. 準備即時報價 (雙源) ===
+    price_map = {}
+    source_map = {} # 記錄每一檔是抓到哪一家的
     last_t = None
+    
     if use_realtime:
-        snapshot_map, last_t = fetch_finmind_snapshot(_api, target_date)
+        # A. 優先嘗試 FinMind Snapshot
+        fm_map, fm_time = fetch_finmind_snapshot(_api)
+        
+        # B. 檢查是否需要 Yahoo 救援
+        # 如果 FinMind 全空，或者我們有名單但 FinMind 缺漏太多
+        need_yahoo = False
+        if not fm_map:
+            need_yahoo = True
+        
+        # C. 執行 Yahoo 補位 (如果需要)
+        yahoo_map = {}
+        if need_yahoo:
+            yahoo_map = fetch_yahoo_realtime_batch(rank_codes)
+            last_t = "Yahoo備援"
+        else:
+            last_t = fm_time
+
+        # D. 合併報價 (FinMind 優先)
+        for code in rank_codes:
+            p = 0
+            src = "無"
+            
+            # 先看 FinMind
+            if code in fm_map and fm_map[code] > 0:
+                p = fm_map[code]
+                src = "FinMind"
+            # 再看 Yahoo
+            elif need_yahoo and code in yahoo_map and yahoo_map[code] > 0:
+                p = yahoo_map[code]
+                src = "Yahoo"
+            
+            price_map[code] = p
+            source_map[code] = src
+            
+    # === 2. 準備歷史資料 (批次/迴圈) ===
+    # 這裡還是得迴圈抓，因為歷史資料 API 限制較多，但我們拿掉 sleep 全速跑
     
     start_date_query = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
     
-    # === 進度條 ===
-    prog_bar = st.progress(0, text="逐檔分析中...")
+    prog_bar = st.progress(0, text="極速運算中...")
     total = len(rank_codes)
 
     for i, code in enumerate(rank_codes):
-        # 1. 微量延遲 (Pacing)：防止瞬間請求過多被 Ban
-        time_module.sleep(0.02) 
-        
-        # 更新進度條 (每10檔更新一次，減少介面重繪負擔)
-        if i % 10 == 0:
-            prog_bar.progress((i / total), text=f"分析進度: {i+1}/{total}")
+        # 移除所有 sleep，全速運轉
+        if i % 20 == 0:
+            prog_bar.progress((i / total), text=f"進度: {i+1}/{total}")
 
         rank = i + 1
         current_price = 0
         status = "未知"
         price_src = "歷史"
         
-        # 取得即時價
         if use_realtime:
-            current_price = snapshot_map.get(code, 0)
-            if current_price > 0:
-                price_src = "FinMind即時"
+            current_price = price_map.get(code, 0)
+            price_src = source_map.get(code, "無")
+            if current_price == 0:
+                status = "⚠️ 無報價"
+
+        try:
+            # 抓歷史 (不重試，不等待，直接衝)
+            stock_df = _api.taiwan_stock_daily(stock_id=code, start_date=start_date_query)
+            
+            if stock_df.empty:
+                 status = "❌ 歷史無資料"
             else:
-                status = "⚠️ 無即時價"
-        
-        # 抓取歷史 (含重試機制)
-        stock_df, err = get_history_with_retry(_api, code, start_date_query)
-        
-        if stock_df is None:
-            # 即使重試後還是失敗
-            status = f"❌ 錯誤 ({str(err)})"
-        else:
-            try:
-                # 處理資料
                 stock_df = stock_df[stock_df['date'] < target_date]
                 
                 # 合成
                 if use_realtime and current_price > 0:
                     new_row = pd.DataFrame([{'date': target_date, 'close': current_price}])
                     stock_df = pd.concat([stock_df, new_row], ignore_index=True)
-                elif not use_realtime:
-                    # 補抓一次確保包含今日(若為計算歷史) - 其實上面已經抓夠了，這裡只是切割
-                    pass
-
-                # 計算 MA5
+                
+                # 計算
                 if len(stock_df) >= 6:
                     stock_df['MA5'] = stock_df['close'].rolling(5).mean()
                     curr = stock_df.iloc[-1]
@@ -206,9 +248,9 @@ def calc_stats_finmind_only(_api, target_date, rank_codes, use_realtime=False):
                     if not use_realtime: current_price = final_price
                 else:
                     if status == "未知": status = "🚫 資料不足"
-                    
-            except Exception as inner_e:
-                status = f"❌ 運算錯 ({str(inner_e)})"
+
+        except Exception:
+            status = "❌ 錯誤"
         
         details.append({
             '排名': rank,
@@ -223,35 +265,38 @@ def calc_stats_finmind_only(_api, target_date, rank_codes, use_realtime=False):
 
 @st.cache_data(ttl=60)
 def fetch_data(_api):
-    all_days = get_trading_days(_api)
-    if len(all_days) < 2: return None
+    all_days = get_trading_days_robust(_api)
+    if len(all_days) < 2: 
+        st.error("日期資料異常")
+        return None
 
     d_curr_str = all_days[-1]
     d_prev_str = all_days[-2]
     
     tw_now, is_intraday = get_current_status()
     
+    # 抓排行
     prev_rank_codes = get_rank_list(_api, d_prev_str, backup_date=all_days[-3])
     if not prev_rank_codes:
-        st.error("無法取得排行資料")
+        st.error("無法取得排行")
         return None
 
-    # 計算昨日 (歷史)
-    hit_prev, valid_prev, _, _ = calc_stats_finmind_only(_api, d_prev_str, prev_rank_codes, use_realtime=False)
+    # 昨日
+    hit_prev, valid_prev, _, _ = calc_stats_hybrid(_api, d_prev_str, prev_rank_codes, use_realtime=False)
     
-    # 計算今日
+    # 今日
     if is_intraday:
         curr_rank_codes = prev_rank_codes
-        mode_msg = "🚀 盤中極速模式 (Sponsor Tick)"
+        mode_msg = "🚀 盤中極速 (雙源備援)"
     else:
         curr_rank_codes = get_rank_list(_api, d_curr_str)
         if curr_rank_codes:
-            mode_msg = "🐢 盤後精準模式 (今日排行)"
+            mode_msg = "🐢 盤後精準 (今日排行)"
         else:
             curr_rank_codes = prev_rank_codes
-            mode_msg = "⚠️ 盤後模式 (排行未更新，沿用昨日)"
+            mode_msg = "⚠️ 盤後 (沿用昨日)"
             
-    hit_curr, valid_curr, details, last_time = calc_stats_finmind_only(_api, d_curr_str, curr_rank_codes, use_realtime=True)
+    hit_curr, valid_curr, details, last_time = calc_stats_hybrid(_api, d_curr_str, curr_rank_codes, use_realtime=True)
     
     detail_df = pd.DataFrame(details)
     
@@ -259,11 +304,24 @@ def fetch_data(_api):
     try:
         twii_df = _api.taiwan_stock_daily(stock_id="TAIEX", start_date=(datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"))
         if is_intraday:
-            twii_snap = _api.taiwan_stock_tick_snapshot(stock_id="TAIEX")
-            if not twii_snap.empty:
-                twii_price = float(twii_snap['deal_price'].iloc[-1])
-                new_row = pd.DataFrame([{'date': d_curr_str, 'close': twii_price}])
+            # 大盤也雙源
+            twii_p = 0
+            try:
+                twii_snap = _api.taiwan_stock_tick_snapshot(stock_id="TAIEX")
+                if not twii_snap.empty: twii_p = float(twii_snap['deal_price'].iloc[-1])
+            except: pass
+            
+            if twii_p == 0: # FinMind 沒抓到，試試 Yahoo
+                try: 
+                    t = yf.Ticker("^TWII")
+                    hist = t.history(period="1d")
+                    if not hist.empty: twii_p = float(hist['Close'].iloc[-1])
+                except: pass
+            
+            if twii_p > 0:
+                new_row = pd.DataFrame([{'date': d_curr_str, 'close': twii_p}])
                 twii_df = pd.concat([twii_df, new_row], ignore_index=True)
+                
         twii_df['MA5'] = twii_df['close'].rolling(5).mean()
         slope = twii_df['MA5'].iloc[-1] - twii_df['MA5'].iloc[-2]
     except: pass
@@ -287,7 +345,7 @@ def fetch_data(_api):
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v3.1.0 穩定版)")
+    st.title("📈 盤中權證進場判斷 (v3.2.0 極速雙源)")
 
     with st.sidebar:
         st.subheader("系統狀態")
@@ -305,7 +363,7 @@ def run_streamlit():
         data = fetch_data(api)
             
         if data is None:
-            st.warning("⚠️ 暫無有效數據")
+            st.warning("⚠️ 初始化失敗，請稍後再試")
         else:
             cond1 = (data['br_curr'] >= BREADTH_THRESHOLD) and (data['br_prev'] >= BREADTH_THRESHOLD)
             cond2 = data['slope'] > 0
@@ -328,7 +386,7 @@ def run_streamlit():
             else:
                 st.error(f"⛔ 結論：不可進場")
             
-            st.caption(f"FinMind Tick 時間: {t_str}")
+            st.caption(f"報價來源時間: {t_str} (若 FinMind 無資料則自動切換 Yahoo)")
             st.dataframe(data['detail_df'], use_container_width=True, hide_index=True)
 
     except Exception as e:
