@@ -6,18 +6,18 @@ from FinMind.data import DataLoader
 from datetime import datetime, timedelta, timezone, time
 import traceback
 import sys
-import yfinance as yf  # 把 Yahoo 救回來當備援
+import yfinance as yf
 
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v3.2.0 (極速雙源版)"
+APP_VERSION = "v3.3.0 (智慧快取省流版)"
 UPDATE_LOG = """
-- v3.1.1: 強韌連線版。
-- v3.2.0: 移除所有等待時間 & 新增 Yahoo 備援。
-  1. 【暴力加速】移除所有 time.sleep 延遲，追求最快運算速度。
-  2. 【雙重報價】優先抓取 FinMind 即時 Tick；若抓不到 (回傳空值)，立刻切換抓取 Yahoo 即時價。
-  3. 確保「現價」欄位絕對有值，不再出現 0 或空白。
+- v3.2.0: 極速雙源 (FinMind + Yahoo 備援)。
+- v3.3.0: 優化 API 呼叫效率。
+  1. 【名單快取】將「抓取排行榜」功能獨立並設定 24 小時快取。只要日期相同，當天只會抓一次，後續重新整理皆直接讀取記憶體，不再浪費 API 額度。
+  2. 【即時分離】即時報價部分維持實時更新，確保「名單固定、價格跳動」的最佳效能。
+  3. 維持極速雙源與無延遲設計。
 """
 
 # ==========================================
@@ -28,7 +28,7 @@ TOP_N = 300
 BREADTH_THRESHOLD = 0.65
 EXCLUDE_PREFIXES = ["00", "91"]
 
-st.set_page_config(page_title="盤中權證進場判斷 (雙源極速)", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (智慧快取)", layout="wide")
 
 # ==========================================
 # 功能函式
@@ -37,6 +37,7 @@ st.set_page_config(page_title="盤中權證進場判斷 (雙源極速)", layout=
 def get_current_status():
     tw_now = datetime.now(timezone(timedelta(hours=8)))
     current_time = tw_now.time()
+    # 08:45 ~ 13:30 視為盤中
     is_intraday = time(8, 45) <= current_time < time(13, 30)
     return tw_now, is_intraday
 
@@ -66,9 +67,43 @@ def smart_get_column(df, candidates):
         if name.lower() in lower_map: return df[lower_map[name.lower()]]
     return None
 
-# === 報價源 1: FinMind ===
+# === 關鍵修改：獨立的名單快取函式 ===
+# ttl=86400 秒 = 24 小時。
+# Streamlit 會根據傳入的參數 (date_str) 做雜湊。
+# 只要 date_str 沒變，這函式就不會真的去 call API，而是直接回傳上次的結果。
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_cached_rank_list(token, date_str, backup_date=None):
+    """
+    [快取專用] 取得排行榜名單
+    注意：這裡我們傳入 token 字串而不是 api 物件，確保 cache key 穩定。
+    """
+    # 因為是獨立快取，這裡需要一個臨時的 api 實例 (成本極低)
+    local_api = DataLoader()
+    local_api.login_by_token(token)
+    
+    try:
+        df_rank = local_api.taiwan_stock_daily(stock_id="", start_date=date_str)
+        if df_rank.empty and backup_date:
+            df_rank = local_api.taiwan_stock_daily(stock_id="", start_date=backup_date)
+
+        if df_rank.empty: return []
+
+        df_rank['ID'] = smart_get_column(df_rank, ['stock_id', 'code'])
+        df_rank['Money'] = smart_get_column(df_rank, ['Trading_money', 'Trading_Money', 'turnover'])
+        
+        df_rank['ID'] = df_rank['ID'].astype(str)
+        df_rank = df_rank[df_rank['ID'].str.len() == 4]
+        df_rank = df_rank[df_rank['ID'].str.isdigit()]
+        for prefix in EXCLUDE_PREFIXES:
+            df_rank = df_rank[~df_rank['ID'].str.startswith(prefix)]
+            
+        df_candidates = df_rank.sort_values('Money', ascending=False).head(TOP_N)
+        return df_candidates['ID'].tolist()
+    except:
+        return []
+
+# === 報價源 1: FinMind (不快取，即時) ===
 def fetch_finmind_snapshot(api):
-    """ 嘗試抓取 FinMind 全市場快照 """
     try:
         df = api.taiwan_stock_tick_snapshot(stock_id="")
         if df.empty: return {}, None
@@ -89,14 +124,11 @@ def fetch_finmind_snapshot(api):
     except:
         return {}, None
 
-# === 報價源 2: Yahoo (備援) ===
+# === 報價源 2: Yahoo (備援，不快取，即時) ===
 def fetch_yahoo_realtime_batch(codes):
-    """ Yahoo 批次下載 (當 FinMind 失敗時使用) """
     if not codes: return {}
-    
     all_tickers = [f"{c}.TW" for c in codes] + [f"{c}.TWO" for c in codes]
     try:
-        # threads=True 全速下載
         data = yf.download(all_tickers, period="1d", group_by='ticker', progress=False, threads=True)
         realtime_map = {}
         
@@ -122,31 +154,7 @@ def fetch_yahoo_realtime_batch(codes):
     except:
         return {}
 
-def get_rank_list(api, date_str, backup_date=None):
-    try:
-        # 不等待，直接抓
-        df_rank = api.taiwan_stock_daily(stock_id="", start_date=date_str)
-        if df_rank.empty and backup_date:
-            df_rank = api.taiwan_stock_daily(stock_id="", start_date=backup_date)
-
-        if df_rank.empty: return []
-
-        df_rank['ID'] = smart_get_column(df_rank, ['stock_id', 'code'])
-        df_rank['Money'] = smart_get_column(df_rank, ['Trading_money', 'Trading_Money', 'turnover'])
-        
-        df_rank['ID'] = df_rank['ID'].astype(str)
-        df_rank = df_rank[df_rank['ID'].str.len() == 4]
-        df_rank = df_rank[df_rank['ID'].str.isdigit()]
-        for prefix in EXCLUDE_PREFIXES:
-            df_rank = df_rank[~df_rank['ID'].str.startswith(prefix)]
-            
-        df_candidates = df_rank.sort_values('Money', ascending=False).head(TOP_N)
-        return df_candidates['ID'].tolist()
-    except:
-        return []
-
 # === 運算邏輯 (極速版) ===
-
 def calc_stats_hybrid(_api, target_date, rank_codes, use_realtime=False):
     hits = 0
     valid = 0
@@ -154,20 +162,18 @@ def calc_stats_hybrid(_api, target_date, rank_codes, use_realtime=False):
     
     # === 1. 準備即時報價 (雙源) ===
     price_map = {}
-    source_map = {} # 記錄每一檔是抓到哪一家的
+    source_map = {}
     last_t = None
     
     if use_realtime:
-        # A. 優先嘗試 FinMind Snapshot
+        # A. FinMind
         fm_map, fm_time = fetch_finmind_snapshot(_api)
         
-        # B. 檢查是否需要 Yahoo 救援
-        # 如果 FinMind 全空，或者我們有名單但 FinMind 缺漏太多
+        # B. 檢查是否需要 Yahoo
         need_yahoo = False
-        if not fm_map:
-            need_yahoo = True
+        if not fm_map: need_yahoo = True
         
-        # C. 執行 Yahoo 補位 (如果需要)
+        # C. Yahoo
         yahoo_map = {}
         if need_yahoo:
             yahoo_map = fetch_yahoo_realtime_batch(rank_codes)
@@ -175,33 +181,25 @@ def calc_stats_hybrid(_api, target_date, rank_codes, use_realtime=False):
         else:
             last_t = fm_time
 
-        # D. 合併報價 (FinMind 優先)
+        # D. 合併
         for code in rank_codes:
             p = 0
             src = "無"
-            
-            # 先看 FinMind
             if code in fm_map and fm_map[code] > 0:
                 p = fm_map[code]
                 src = "FinMind"
-            # 再看 Yahoo
             elif need_yahoo and code in yahoo_map and yahoo_map[code] > 0:
                 p = yahoo_map[code]
                 src = "Yahoo"
-            
             price_map[code] = p
             source_map[code] = src
             
-    # === 2. 準備歷史資料 (批次/迴圈) ===
-    # 這裡還是得迴圈抓，因為歷史資料 API 限制較多，但我們拿掉 sleep 全速跑
-    
+    # === 2. 準備歷史資料 ===
     start_date_query = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-    
     prog_bar = st.progress(0, text="極速運算中...")
     total = len(rank_codes)
 
     for i, code in enumerate(rank_codes):
-        # 移除所有 sleep，全速運轉
         if i % 20 == 0:
             prog_bar.progress((i / total), text=f"進度: {i+1}/{total}")
 
@@ -217,7 +215,6 @@ def calc_stats_hybrid(_api, target_date, rank_codes, use_realtime=False):
                 status = "⚠️ 無報價"
 
         try:
-            # 抓歷史 (不重試，不等待，直接衝)
             stock_df = _api.taiwan_stock_daily(stock_id=code, start_date=start_date_query)
             
             if stock_df.empty:
@@ -225,12 +222,10 @@ def calc_stats_hybrid(_api, target_date, rank_codes, use_realtime=False):
             else:
                 stock_df = stock_df[stock_df['date'] < target_date]
                 
-                # 合成
                 if use_realtime and current_price > 0:
                     new_row = pd.DataFrame([{'date': target_date, 'close': current_price}])
                     stock_df = pd.concat([stock_df, new_row], ignore_index=True)
                 
-                # 計算
                 if len(stock_df) >= 6:
                     stock_df['MA5'] = stock_df['close'].rolling(5).mean()
                     curr = stock_df.iloc[-1]
@@ -263,6 +258,7 @@ def calc_stats_hybrid(_api, target_date, rank_codes, use_realtime=False):
     prog_bar.empty()
     return hits, valid, details, last_t
 
+# 這個函式保持短時間快取 (60秒)，因為它包含「計算廣度」和「抓即時價」
 @st.cache_data(ttl=60)
 def fetch_data(_api):
     all_days = get_trading_days_robust(_api)
@@ -275,21 +271,27 @@ def fetch_data(_api):
     
     tw_now, is_intraday = get_current_status()
     
-    # 抓排行
-    prev_rank_codes = get_rank_list(_api, d_prev_str, backup_date=all_days[-3])
+    # === 使用 24H 快取取得昨日排行名單 ===
+    # 這裡呼叫的是 get_cached_rank_list，它會檢查 d_prev_str
+    # 如果今天已經抓過這個日期的名單，直接秒回，不耗 API
+    prev_rank_codes = get_cached_rank_list(API_TOKEN, d_prev_str, backup_date=all_days[-3])
+    
     if not prev_rank_codes:
         st.error("無法取得排行")
         return None
 
-    # 昨日
+    # 昨日 (歷史廣度也只跟名單有關，理論上也可以快取，但運算很快先保留)
     hit_prev, valid_prev, _, _ = calc_stats_hybrid(_api, d_prev_str, prev_rank_codes, use_realtime=False)
     
     # 今日
     if is_intraday:
-        curr_rank_codes = prev_rank_codes
-        mode_msg = "🚀 盤中極速 (雙源備援)"
+        curr_rank_codes = prev_rank_codes # 盤中沿用
+        mode_msg = "🚀 盤中極速 (雙源+智慧快取)"
     else:
-        curr_rank_codes = get_rank_list(_api, d_curr_str)
+        # 盤後嘗試抓今日排行 (這也可以用 Cache，因為今日收盤後排行也是固定的)
+        # 我們用同樣的 cache function，傳入 d_curr_str
+        curr_rank_codes = get_cached_rank_list(API_TOKEN, d_curr_str)
+        
         if curr_rank_codes:
             mode_msg = "🐢 盤後精準 (今日排行)"
         else:
@@ -311,7 +313,7 @@ def fetch_data(_api):
                 if not twii_snap.empty: twii_p = float(twii_snap['deal_price'].iloc[-1])
             except: pass
             
-            if twii_p == 0: # FinMind 沒抓到，試試 Yahoo
+            if twii_p == 0:
                 try: 
                     t = yf.Ticker("^TWII")
                     hist = t.history(period="1d")
@@ -345,7 +347,7 @@ def fetch_data(_api):
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v3.2.0 極速雙源)")
+    st.title("📈 盤中權證進場判斷 (v3.3.0 智慧快取)")
 
     with st.sidebar:
         st.subheader("系統狀態")
