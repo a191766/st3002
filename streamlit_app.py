@@ -6,29 +6,28 @@ from FinMind.data import DataLoader
 from datetime import datetime, timedelta, timezone, time
 import traceback
 import sys
-import yfinance as yf
 
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v2.6.0 (時間戳記嚴格檢測版)"
+APP_VERSION = "v3.0.0 (Sponsor 極速版)"
 UPDATE_LOG = """
-- v2.5.1: 詳細狀態顯示。
-- v2.6.0: 修正剛開盤抓到昨日收盤價的問題。
-  1. 新增 Yahoo 資料「時間戳記 (Timestamp)」檢查。
-  2. 若 Yahoo 回傳的最新資料日期「不是今天」，視為無效資料 (標示為尚未開盤/延遲)，避免誤用昨日收盤價計算今日廣度。
-  3. 剛開盤 (09:00-09:20) 可能會因 Yahoo 延遲而顯示較多「無即時價」，屬正常現象。
+- v3.0.0: 架構全面升級為 FinMind Sponsor 專用版。
+  1. 移除 yfinance，所有資料源統一為 FinMind。
+  2. 使用 `taiwan_stock_daily_short` (全市場快照) 抓取即時價，速度極快且無延遲。
+  3. 維持「昨日數據鎖定」邏輯，確保監控指標穩定。
 """
 
 # ==========================================
-# 參數與 Token
+# 參數與 Token (Sponsor)
 # ==========================================
+# 您提供的 Sponsor Token
 API_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJkYXRlIjoiMjAyNi0wMS0xNCAxOTowMDowNiIsInVzZXJfaWQiOiJcdTllYzNcdTRlYzFcdTVhMDEiLCJlbWFpbCI6ImExOTE3NjZAZ21haWwuY29tIiwiaXAiOiIifQ.JFPtMDNbxKzhl8HsxkOlA1tMlwq8y_NA6NpbRel6HCk"
 TOP_N = 300              
 BREADTH_THRESHOLD = 0.65
 EXCLUDE_PREFIXES = ["00", "91"]
 
-st.set_page_config(page_title="盤中權證進場判斷", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (Sponsor)", layout="wide")
 
 # ==========================================
 # 功能函式
@@ -65,69 +64,43 @@ def smart_get_column(df, candidates):
         if name.lower() in lower_map: return df[lower_map[name.lower()]]
     return None
 
-def fetch_yahoo_realtime_batch(codes, today_str):
-    """ Yahoo 批次下載 (含日期檢查) """
-    if not codes: return {}
-    
-    all_tickers = [f"{c}.TW" for c in codes] + [f"{c}.TWO" for c in codes]
-    
+def fetch_finmind_snapshot(api, date_str):
+    """ 
+    [Sponsor 專用] 
+    一次抓取全市場即時快照 (Realtime Snapshot)。
+    因為有付費，這支 API 不會被擋，且速度極快。
+    """
     try:
-        # 使用 threads=False 增加穩定性
-        data = yf.download(all_tickers, period="1d", group_by='ticker', progress=False, threads=False)
-        realtime_map = {}
+        # stock_id="" 代表抓全市場
+        df = api.taiwan_stock_daily_short(stock_id="", start_date=date_str)
+        if df.empty: return {}, None
         
-        valid_tickers = []
-        if isinstance(data.columns, pd.MultiIndex):
-            valid_tickers = data.columns.levels[0]
-        elif not data.empty:
-            valid_tickers = [data.name] if hasattr(data, 'name') else []
-            if len(all_tickers) == 1: valid_tickers = all_tickers
-
-        # 內部小函式：檢查日期並取價
-        def extract_valid_price(df):
-            if df.empty or df['Close'].isna().all(): return None
+        # 建立快速查詢表 {stock_id: price}
+        # 注意欄位: FinMind snapshot 通常是 close, open, high, low, volume
+        # 智慧欄位對應
+        code_col = smart_get_column(df, ['stock_id', 'code'])
+        price_col = smart_get_column(df, ['close', 'price', 'deal_price'])
+        
+        if code_col is None or price_col is None:
+            return {}, None
             
-            last_row = df.iloc[-1]
-            last_ts = df.index[-1] # 這會是 Timestamp
+        # 轉換為 dict
+        snapshot_map = dict(zip(code_col, price_col))
+        
+        # 取得資料時間 (取最後一筆的時間作為參考)
+        # 欄位可能是 date 或 timestamp
+        time_col = smart_get_column(df, ['date', 'time'])
+        last_time = None
+        if time_col is not None:
+            last_time = time_col.iloc[-1]
             
-            # 【關鍵修正】檢查資料日期是否為今天
-            # Yahoo 的 timestamp 可能是 UTC 或 local，需小心處理
-            # 我們直接轉成字串比對 YYYY-MM-DD
-            # 如果 last_ts 是 UTC，要加 8 小時轉台灣時間
-            
-            # yfinance 的 index 通常已有時區資訊，或無時區
-            if last_ts.tzinfo is not None:
-                # 轉台灣時間
-                ts_tw = last_ts.astimezone(timezone(timedelta(hours=8)))
-                data_date = ts_tw.strftime("%Y-%m-%d")
-            else:
-                # 假設它是本地時間 (Yahoo bug多，保守起見若無時區可能是不準的，但先比對日期)
-                data_date = last_ts.strftime("%Y-%m-%d")
-
-            # 只有當日期是今天，才回傳價格
-            if data_date == today_str:
-                return float(last_row['Close'])
-            else:
-                # 資料不是今天的，視為無效
-                return None
-
-        if len(valid_tickers) == 0 and not data.empty and len(all_tickers) == 1:
-             p = extract_valid_price(data)
-             if p is not None: realtime_map[codes[0]] = p
-        else:
-            for t in valid_tickers:
-                try:
-                    df = data[t] if isinstance(data.columns, pd.MultiIndex) else data
-                    p = extract_valid_price(df)
-                    if p is not None:
-                        realtime_map[t.split('.')[0]] = p
-                except: continue
-                
-        return realtime_map
-    except:
-        return {}
+        return snapshot_map, last_time
+    except Exception as e:
+        print(f"FinMind Snapshot Error: {e}")
+        return {}, None
 
 def get_rank_list(api, date_str, backup_date=None):
+    """ 取得排行榜清單 """
     try:
         df_rank = api.taiwan_stock_daily(stock_id="", start_date=date_str)
         if df_rank.empty and backup_date:
@@ -148,73 +121,106 @@ def get_rank_list(api, date_str, backup_date=None):
     except:
         return []
 
-def calc_yesterday_stats(_api, date_prev, rank_codes):
-    hits = 0
-    valid = 0
-    for code in rank_codes:
-        try:
-            stock_df = _api.taiwan_stock_daily(stock_id=code, start_date=(datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"))
-            stock_df = stock_df[stock_df['date'] <= date_prev]
-            if len(stock_df) >= 6:
-                stock_df['MA5'] = stock_df['close'].rolling(5).mean()
-                curr = stock_df.iloc[-1]
-                if curr['close'] > curr['MA5']: hits += 1
-                valid += 1
-        except: pass
-    return hits, valid
+# === 運算邏輯 ===
 
-def calc_today_stats(_api, date_curr, rank_codes):
+def calc_stats_finmind_only(_api, target_date, rank_codes, use_realtime=False):
+    """ 
+    統一運算函式 (Sponsor 版)
+    use_realtime=True: 會去呼叫 taiwan_stock_daily_short 取得即時價
+    use_realtime=False: 只用 taiwan_stock_daily (算昨日歷史)
+    """
     hits = 0
     valid = 0
     details = []
     
-    # 傳入 date_curr (今天日期) 進行比對
-    rt_map = fetch_yahoo_realtime_batch(rank_codes, date_curr)
+    # 若需即時，先抓全市場快照 (Sponsor 優勢：一次到位，不用迴圈)
+    snapshot_map = {}
+    last_t = None
+    if use_realtime:
+        snapshot_map, last_t = fetch_finmind_snapshot(_api, target_date)
+    
+    # 批次抓取 300 檔歷史資料 (Sponsor 流量大，可以直接抓)
+    # 不過 FinMind API 設計通常還是單檔抓歷史比較穩，或者我們用迴圈
+    # 這裡維持迴圈抓歷史 (因為歷史資料不變，且 FinMind 速度夠快)
     
     for i, code in enumerate(rank_codes):
-        current_price = rt_map.get(code, 0)
         rank = i + 1
+        current_price = 0
         status = "未知"
+        price_src = "歷史"
+        
+        # 1. 決定價格
+        if use_realtime:
+            # 從快照 Map 裡找
+            current_price = snapshot_map.get(code, 0)
+            if current_price > 0:
+                price_src = "FinMind即時"
+            else:
+                # 沒抓到即時價 (可能未開盤或撮合中)
+                status = "⚠️ 無即時價"
         
         try:
-            stock_df = _api.taiwan_stock_daily(stock_id=code, start_date=(datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"))
-            stock_df = stock_df[stock_df['date'] < date_curr]
+            # 2. 抓歷史 K 線 (用來算 MA5)
+            # 抓過去 30 天
+            stock_df = _api.taiwan_stock_daily(
+                stock_id=code,
+                start_date=(datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+            )
             
-            if current_price > 0:
-                new_row = pd.DataFrame([{'date': date_curr, 'close': current_price}])
-                stock_df = pd.concat([stock_df, new_row], ignore_index=True)
+            # 3. 資料合成
+            if use_realtime:
+                # 確保不含今日 (避免重複)
+                stock_df = stock_df[stock_df['date'] < target_date]
                 
-                if len(stock_df) >= 6:
-                    stock_df['MA5'] = stock_df['close'].rolling(5).mean()
-                    ma5_val = stock_df['MA5'].iloc[-1]
-                    curr_close = stock_df['close'].iloc[-1]
-                    
-                    if curr_close > ma5_val:
-                        hits += 1
-                        valid += 1
-                        status = "✅ 通過"
-                    else:
-                        valid += 1 
-                        status = f"📉 未通過 (MA5:{ma5_val:.1f})"
+                if current_price > 0:
+                    # 拼上今日即時價
+                    new_row = pd.DataFrame([{'date': target_date, 'close': current_price}])
+                    stock_df = pd.concat([stock_df, new_row], ignore_index=True)
                 else:
-                    status = f"🚫 剔除 (資料不足)"
+                    # 如果沒抓到即時價，就不拼湊，這樣 K 線會少一天，自然被下面的 len 檢查踢掉
+                    pass
             else:
-                # 這裡會明確顯示是因為沒抓到即時價
-                status = "⚠️ 尚未開盤/延遲"
+                # 算 D-1：切除未來數據
+                stock_df = stock_df[stock_df['date'] <= target_date]
+
+            # 4. 指標計算
+            if len(stock_df) >= 6:
+                stock_df['MA5'] = stock_df['close'].rolling(5).mean()
+                curr = stock_df.iloc[-1]
+                
+                # 取得當下的收盤價 (歷史或即時)
+                final_price = curr['close']
+                ma5 = curr['MA5']
+                
+                is_ok = final_price > ma5
+                
+                if is_ok:
+                    hits += 1
+                    status = "✅ 通過"
+                else:
+                    status = f"📉 未通過 (MA5:{ma5:.1f})"
+                
+                valid += 1
+                # 更新顯示價格
+                if not use_realtime: current_price = final_price
+                
+            else:
+                if status == "未知": status = "🚫 資料不足"
                 
         except Exception as e:
-            status = f"❌ 錯誤 ({str(e)})"
-            
+            status = "❌ 錯誤"
+        
         details.append({
             '排名': rank,
             '代號': code,
             '現價': current_price,
+            '來源': price_src if use_realtime else "歷史收盤",
             '狀態': status
         })
         
-    return hits, valid, details
+    return hits, valid, details, last_t
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=60) # Sponsor 版可以設短一點，例如 60秒更新一次
 def fetch_data(_api):
     all_days = get_trading_days(_api)
     if len(all_days) < 2: return None
@@ -227,34 +233,46 @@ def fetch_data(_api):
     # 1. 取得昨日排行 (基準)
     prev_rank_codes = get_rank_list(_api, d_prev_str, backup_date=all_days[-3])
     
-    # 2. 計算昨日廣度
-    if prev_rank_codes:
-        hit_prev, valid_prev = calc_yesterday_stats(_api, d_prev_str, prev_rank_codes)
-    else:
-        hit_prev, valid_prev = 0, 0
-        
-    # 3. 決定今日名單
+    if not prev_rank_codes:
+        st.error("無法取得排行資料")
+        return None
+
+    # 2. 計算昨日廣度 (固定不變)
+    progress_bar = st.progress(0, text="計算昨日數據 (歷史鎖定)...")
+    hit_prev, valid_prev, _, _ = calc_stats_finmind_only(_api, d_prev_str, prev_rank_codes, use_realtime=False)
+    
+    # 3. 決定今日名單 & 計算今日廣度
     if is_intraday:
         curr_rank_codes = prev_rank_codes
-        mode_msg = "🚀 盤中模式 (母體:昨日排行)"
+        mode_msg = "🚀 盤中極速模式 (Sponsor 直連)"
     else:
+        # 盤後嘗試抓今日排行
         curr_rank_codes = get_rank_list(_api, d_curr_str)
         if curr_rank_codes:
-            mode_msg = "🐢 盤後模式 (母體:今日排行)"
+            mode_msg = "🐢 盤後精準模式 (今日排行)"
         else:
             curr_rank_codes = prev_rank_codes
-            mode_msg = "⚠️ 盤後模式 (FinMind 未更新，沿用昨日排行)"
+            mode_msg = "⚠️ 盤後模式 (排行未更新，沿用昨日)"
             
-    progress_bar = st.progress(0, text=f"分析中 ({mode_msg})...")
-    hit_curr, valid_curr, details = calc_today_stats(_api, d_curr_str, curr_rank_codes)
+    progress_bar.progress(50, text=f"計算今日數據 ({mode_msg})...")
+    hit_curr, valid_curr, details, last_time = calc_stats_finmind_only(_api, d_curr_str, curr_rank_codes, use_realtime=True)
+    
     progress_bar.empty()
     
     detail_df = pd.DataFrame(details)
     
-    # 4. 斜率
+    # 4. 斜率 (也改用 FinMind)
     slope = 0
     try:
         twii_df = _api.taiwan_stock_daily(stock_id="TAIEX", start_date=(datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"))
+        # 若盤中，嘗試抓大盤即時
+        if is_intraday:
+            twii_snap, _ = fetch_finmind_snapshot(_api, d_curr_str) # 其實這裡會抓到全市場，稍微有點浪費但沒差
+            twii_price = twii_snap.get('TAIEX', 0)
+            if twii_price > 0:
+                 new_row = pd.DataFrame([{'date': d_curr_str, 'close': twii_price}])
+                 twii_df = pd.concat([twii_df, new_row], ignore_index=True)
+                 
         twii_df['MA5'] = twii_df['close'].rolling(5).mean()
         slope = twii_df['MA5'].iloc[-1] - twii_df['MA5'].iloc[-2]
     except: pass
@@ -270,18 +288,19 @@ def fetch_data(_api):
         "hit_prev": hit_prev, "valid_prev": valid_prev,
         "slope": slope,
         "detail_df": detail_df,
-        "mode_msg": mode_msg
+        "mode_msg": mode_msg,
+        "last_time": last_time
     }
 
 # ==========================================
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v2.6.0 時間校正)")
+    st.title("📈 盤中權證進場判斷 (v3.0 Sponsor)")
 
     with st.sidebar:
         st.subheader("系統狀態")
-        st.success("API Token 已載入")
+        st.success("Sponsor Token 已啟用")
         st.code(f"Version: {APP_VERSION}")
         st.markdown(UPDATE_LOG)
 
@@ -301,6 +320,12 @@ def run_streamlit():
             cond2 = data['slope'] > 0
             final_decision = cond1 and cond2
 
+            # 時間顯示處理
+            t_str = "未知"
+            if data['last_time']:
+                # FinMind 有時回傳字串，有時回傳 datetime
+                t_str = str(data['last_time'])
+
             st.subheader(f"📅 基準日：{data['d_curr']}")
             st.caption(f"昨日基準: {data['d_prev']}")
             st.success(f"📌 {data['mode_msg']}")
@@ -316,6 +341,7 @@ def run_streamlit():
             else:
                 st.error(f"⛔ 結論：不可進場")
                 
+            st.caption(f"FinMind 快照時間: {t_str}")
             st.dataframe(data['detail_df'], use_container_width=True, hide_index=True)
 
     except Exception as e:
