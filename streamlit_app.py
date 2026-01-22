@@ -11,14 +11,13 @@ import yfinance as yf
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v2.5.1 (詳細狀態版)"
+APP_VERSION = "v2.6.0 (時間戳記嚴格檢測版)"
 UPDATE_LOG = """
-- v2.5.0: 邏輯回歸穩定。
-- v2.5.1: 優化狀態顯示。
-  現在表格會明確區分：
-  1. 「📉 未通過」：資料有效，但股價跌破 MA5 (附註 MA5 價格)。
-  2. 「🚫 剔除」：資料不足或無報價 (不計入分母)。
-  3. 「✅ 通過」：股價站上 MA5。
+- v2.5.1: 詳細狀態顯示。
+- v2.6.0: 修正剛開盤抓到昨日收盤價的問題。
+  1. 新增 Yahoo 資料「時間戳記 (Timestamp)」檢查。
+  2. 若 Yahoo 回傳的最新資料日期「不是今天」，視為無效資料 (標示為尚未開盤/延遲)，避免誤用昨日收盤價計算今日廣度。
+  3. 剛開盤 (09:00-09:20) 可能會因 Yahoo 延遲而顯示較多「無即時價」，屬正常現象。
 """
 
 # ==========================================
@@ -38,6 +37,7 @@ st.set_page_config(page_title="盤中權證進場判斷", layout="wide")
 def get_current_status():
     tw_now = datetime.now(timezone(timedelta(hours=8)))
     current_time = tw_now.time()
+    # 08:45 ~ 13:30 視為盤中
     is_intraday = time(8, 45) <= current_time < time(13, 30)
     return tw_now, is_intraday
 
@@ -65,10 +65,14 @@ def smart_get_column(df, candidates):
         if name.lower() in lower_map: return df[lower_map[name.lower()]]
     return None
 
-def fetch_yahoo_realtime_batch(codes):
+def fetch_yahoo_realtime_batch(codes, today_str):
+    """ Yahoo 批次下載 (含日期檢查) """
     if not codes: return {}
+    
     all_tickers = [f"{c}.TW" for c in codes] + [f"{c}.TWO" for c in codes]
+    
     try:
+        # 使用 threads=False 增加穩定性
         data = yf.download(all_tickers, period="1d", group_by='ticker', progress=False, threads=False)
         realtime_map = {}
         
@@ -79,17 +83,46 @@ def fetch_yahoo_realtime_batch(codes):
             valid_tickers = [data.name] if hasattr(data, 'name') else []
             if len(all_tickers) == 1: valid_tickers = all_tickers
 
+        # 內部小函式：檢查日期並取價
+        def extract_valid_price(df):
+            if df.empty or df['Close'].isna().all(): return None
+            
+            last_row = df.iloc[-1]
+            last_ts = df.index[-1] # 這會是 Timestamp
+            
+            # 【關鍵修正】檢查資料日期是否為今天
+            # Yahoo 的 timestamp 可能是 UTC 或 local，需小心處理
+            # 我們直接轉成字串比對 YYYY-MM-DD
+            # 如果 last_ts 是 UTC，要加 8 小時轉台灣時間
+            
+            # yfinance 的 index 通常已有時區資訊，或無時區
+            if last_ts.tzinfo is not None:
+                # 轉台灣時間
+                ts_tw = last_ts.astimezone(timezone(timedelta(hours=8)))
+                data_date = ts_tw.strftime("%Y-%m-%d")
+            else:
+                # 假設它是本地時間 (Yahoo bug多，保守起見若無時區可能是不準的，但先比對日期)
+                data_date = last_ts.strftime("%Y-%m-%d")
+
+            # 只有當日期是今天，才回傳價格
+            if data_date == today_str:
+                return float(last_row['Close'])
+            else:
+                # 資料不是今天的，視為無效
+                return None
+
         if len(valid_tickers) == 0 and not data.empty and len(all_tickers) == 1:
-             df = data
-             if not df.empty and not df['Close'].isna().all():
-                 realtime_map[codes[0]] = float(df['Close'].iloc[-1])
+             p = extract_valid_price(data)
+             if p is not None: realtime_map[codes[0]] = p
         else:
             for t in valid_tickers:
                 try:
                     df = data[t] if isinstance(data.columns, pd.MultiIndex) else data
-                    if df.empty or df['Close'].isna().all(): continue
-                    realtime_map[t.split('.')[0]] = float(df['Close'].iloc[-1])
+                    p = extract_valid_price(df)
+                    if p is not None:
+                        realtime_map[t.split('.')[0]] = p
                 except: continue
+                
         return realtime_map
     except:
         return {}
@@ -116,7 +149,6 @@ def get_rank_list(api, date_str, backup_date=None):
         return []
 
 def calc_yesterday_stats(_api, date_prev, rank_codes):
-    """ 計算昨日 (D-1) """
     hits = 0
     valid = 0
     for code in rank_codes:
@@ -132,12 +164,12 @@ def calc_yesterday_stats(_api, date_prev, rank_codes):
     return hits, valid
 
 def calc_today_stats(_api, date_curr, rank_codes):
-    """ 計算今日 (D) 並回傳詳細原因 """
     hits = 0
     valid = 0
     details = []
     
-    rt_map = fetch_yahoo_realtime_batch(rank_codes)
+    # 傳入 date_curr (今天日期) 進行比對
+    rt_map = fetch_yahoo_realtime_batch(rank_codes, date_curr)
     
     for i, code in enumerate(rank_codes):
         current_price = rt_map.get(code, 0)
@@ -162,12 +194,13 @@ def calc_today_stats(_api, date_curr, rank_codes):
                         valid += 1
                         status = "✅ 通過"
                     else:
-                        valid += 1 # 雖未通過但資料有效，計入分母
+                        valid += 1 
                         status = f"📉 未通過 (MA5:{ma5_val:.1f})"
                 else:
-                    status = f"🚫 剔除 (資料不足K={len(stock_df)})"
+                    status = f"🚫 剔除 (資料不足)"
             else:
-                status = "⚠️ 剔除 (無即時價)"
+                # 這裡會明確顯示是因為沒抓到即時價
+                status = "⚠️ 尚未開盤/延遲"
                 
         except Exception as e:
             status = f"❌ 錯誤 ({str(e)})"
@@ -200,7 +233,7 @@ def fetch_data(_api):
     else:
         hit_prev, valid_prev = 0, 0
         
-    # 3. 決定今日名單 & 計算今日廣度
+    # 3. 決定今日名單
     if is_intraday:
         curr_rank_codes = prev_rank_codes
         mode_msg = "🚀 盤中模式 (母體:昨日排行)"
@@ -244,7 +277,7 @@ def fetch_data(_api):
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v2.5.1 詳細狀態)")
+    st.title("📈 盤中權證進場判斷 (v2.6.0 時間校正)")
 
     with st.sidebar:
         st.subheader("系統狀態")
