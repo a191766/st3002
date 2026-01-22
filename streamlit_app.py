@@ -6,17 +6,18 @@ from FinMind.data import DataLoader
 from datetime import datetime, timedelta, timezone, time
 import traceback
 import sys
+import time as time_module  # 引入時間模組做延遲控制
 
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v3.0.1 (Sponsor 即時Tick版)"
+APP_VERSION = "v3.1.0 (Sponsor 穩定防爆版)"
 UPDATE_LOG = """
-- v3.0.0: 架構升級為 FinMind Sponsor。
-- v3.0.1: 修正 API 端點錯誤。
-  1. 改用 `taiwan_stock_tick_snapshot` (成交快照) 取代 daily_short。
-  2. 這是 Sponsor 專用的即時報價 API，確保盤中能抓到最新價格 (deal_price)。
-  3. 解決「現價為 0」的問題。
+- v3.0.1: Sponsor 即時 Tick 版。
+- v3.1.0: 解決大量請求導致的後段報錯問題。
+  1. 新增「失敗重試 (Retry)」機制：若抓取失敗，自動冷靜 1 秒後重試。
+  2. 新增「微量延遲」：每檔間隔 0.02 秒，避免瞬間流量過大被伺服器阻擋。
+  3. 恢復顯示詳細錯誤訊息，方便除錯。
 """
 
 # ==========================================
@@ -27,7 +28,7 @@ TOP_N = 300
 BREADTH_THRESHOLD = 0.65
 EXCLUDE_PREFIXES = ["00", "91"]
 
-st.set_page_config(page_title="盤中權證進場判斷 (Sponsor Tick)", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (Sponsor)", layout="wide")
 
 # ==========================================
 # 功能函式
@@ -65,29 +66,18 @@ def smart_get_column(df, candidates):
     return None
 
 def fetch_finmind_snapshot(api, date_str):
-    """ 
-    [Sponsor 專用 - 修正版] 
-    使用 taiwan_stock_tick_snapshot 抓取最新一筆成交 (Tick)。
-    這才是盤中真正的即時價。
-    """
+    """ [Sponsor] 全市場即時成交快照 """
     try:
-        # stock_id="" 代表抓全市場最新一筆 Tick
         df = api.taiwan_stock_tick_snapshot(stock_id="")
+        if df.empty: return {}, None
         
-        if df.empty: 
-            return {}, None
-        
-        # 建立快速查詢表 {stock_id: deal_price}
         code_col = smart_get_column(df, ['stock_id', 'code'])
-        # Tick API 的價格欄位通常是 'deal_price'
         price_col = smart_get_column(df, ['deal_price', 'price', 'close'])
         
-        if code_col is None or price_col is None:
-            return {}, None
+        if code_col is None or price_col is None: return {}, None
             
         snapshot_map = dict(zip(code_col, price_col))
         
-        # 取得資料時間
         time_col = smart_get_column(df, ['time', 'date'])
         last_time = "即時"
         if time_col is not None:
@@ -119,26 +109,59 @@ def get_rank_list(api, date_str, backup_date=None):
     except:
         return []
 
-# === 運算邏輯 ===
+# === 運算邏輯 (含重試機制) ===
+
+def get_history_with_retry(_api, code, start_date, max_retries=1):
+    """ 
+    包裝過的歷史資料抓取函式
+    如果失敗，會等待 1 秒後重試一次
+    """
+    last_err = None
+    for attempt in range(max_retries + 1):
+        try:
+            df = _api.taiwan_stock_daily(
+                stock_id=code,
+                start_date=start_date
+            )
+            return df, None # 成功
+        except Exception as e:
+            last_err = e
+            if attempt < max_retries:
+                time_module.sleep(1.0) # 冷靜 1 秒
+            else:
+                return None, last_err
 
 def calc_stats_finmind_only(_api, target_date, rank_codes, use_realtime=False):
     hits = 0
     valid = 0
     details = []
     
-    # 若需即時，抓全市場 Tick 快照
+    # 抓全市場 Tick 快照
     snapshot_map = {}
     last_t = None
     if use_realtime:
         snapshot_map, last_t = fetch_finmind_snapshot(_api, target_date)
     
+    start_date_query = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+    
+    # === 進度條 ===
+    prog_bar = st.progress(0, text="逐檔分析中...")
+    total = len(rank_codes)
+
     for i, code in enumerate(rank_codes):
+        # 1. 微量延遲 (Pacing)：防止瞬間請求過多被 Ban
+        time_module.sleep(0.02) 
+        
+        # 更新進度條 (每10檔更新一次，減少介面重繪負擔)
+        if i % 10 == 0:
+            prog_bar.progress((i / total), text=f"分析進度: {i+1}/{total}")
+
         rank = i + 1
         current_price = 0
         status = "未知"
         price_src = "歷史"
         
-        # 1. 決定價格
+        # 取得即時價
         if use_realtime:
             current_price = snapshot_map.get(code, 0)
             if current_price > 0:
@@ -146,60 +169,46 @@ def calc_stats_finmind_only(_api, target_date, rank_codes, use_realtime=False):
             else:
                 status = "⚠️ 無即時價"
         
-        try:
-            # 2. 抓歷史 K 線 (抓到 D-1)
-            # 這裡我們只抓歷史，不含今日，今日的資料用拼的
-            stock_df = _api.taiwan_stock_daily(
-                stock_id=code,
-                start_date=(datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-            )
-            
-            # 確保只保留 target_date 之前的資料 (不含 target_date)
-            # 因為 target_date 是今天，我們要用歷史+即時價來算
-            stock_df = stock_df[stock_df['date'] < target_date]
-            
-            # 3. 資料合成
-            if use_realtime and current_price > 0:
-                # 拼上今日即時價
-                new_row = pd.DataFrame([{'date': target_date, 'close': current_price}])
-                stock_df = pd.concat([stock_df, new_row], ignore_index=True)
-            elif not use_realtime:
-                # 算 D-1 歷史模式 (其實這段應該用不到了，因為我們用另一組日期，但保留邏輯)
-                # 這裡要確保包含 target_date (如果 target_date 是 yesterday)
-                # 但上面的 filter 是 < target_date，這會導致 D-1 模式少一天
-                # 修正：
-                stock_df = _api.taiwan_stock_daily(
-                    stock_id=code, 
-                    start_date=(datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-                )
-                stock_df = stock_df[stock_df['date'] <= target_date]
+        # 抓取歷史 (含重試機制)
+        stock_df, err = get_history_with_retry(_api, code, start_date_query)
+        
+        if stock_df is None:
+            # 即使重試後還是失敗
+            status = f"❌ 錯誤 ({str(err)})"
+        else:
+            try:
+                # 處理資料
+                stock_df = stock_df[stock_df['date'] < target_date]
+                
+                # 合成
+                if use_realtime and current_price > 0:
+                    new_row = pd.DataFrame([{'date': target_date, 'close': current_price}])
+                    stock_df = pd.concat([stock_df, new_row], ignore_index=True)
+                elif not use_realtime:
+                    # 補抓一次確保包含今日(若為計算歷史) - 其實上面已經抓夠了，這裡只是切割
+                    pass
 
-            # 4. 指標計算
-            if len(stock_df) >= 6:
-                stock_df['MA5'] = stock_df['close'].rolling(5).mean()
-                curr = stock_df.iloc[-1]
-                
-                final_price = float(curr['close'])
-                ma5 = float(curr['MA5'])
-                
-                is_ok = final_price > ma5
-                
-                if is_ok:
-                    hits += 1
-                    status = "✅ 通過"
+                # 計算 MA5
+                if len(stock_df) >= 6:
+                    stock_df['MA5'] = stock_df['close'].rolling(5).mean()
+                    curr = stock_df.iloc[-1]
+                    
+                    final_price = float(curr['close'])
+                    ma5 = float(curr['MA5'])
+                    
+                    if final_price > ma5:
+                        hits += 1
+                        status = "✅ 通過"
+                    else:
+                        status = f"📉 未通過 (MA5:{ma5:.1f})"
+                    
+                    valid += 1
+                    if not use_realtime: current_price = final_price
                 else:
-                    status = f"📉 未通過 (MA5:{ma5:.1f})"
-                
-                valid += 1
-                
-                # 若是算歷史模式，current_price 要更新為歷史收盤價以便顯示
-                if not use_realtime: current_price = final_price
-                
-            else:
-                if status == "未知": status = "🚫 資料不足"
-                
-        except Exception as e:
-            status = "❌ 錯誤"
+                    if status == "未知": status = "🚫 資料不足"
+                    
+            except Exception as inner_e:
+                status = f"❌ 運算錯 ({str(inner_e)})"
         
         details.append({
             '排名': rank,
@@ -208,7 +217,8 @@ def calc_stats_finmind_only(_api, target_date, rank_codes, use_realtime=False):
             '來源': price_src if use_realtime else "歷史收盤",
             '狀態': status
         })
-        
+    
+    prog_bar.empty()
     return hits, valid, details, last_t
 
 @st.cache_data(ttl=60)
@@ -221,18 +231,15 @@ def fetch_data(_api):
     
     tw_now, is_intraday = get_current_status()
     
-    # 1. 取得昨日排行 (基準)
     prev_rank_codes = get_rank_list(_api, d_prev_str, backup_date=all_days[-3])
-    
     if not prev_rank_codes:
         st.error("無法取得排行資料")
         return None
 
-    # 2. 計算昨日廣度 (固定不變)
-    progress_bar = st.progress(0, text="計算昨日數據 (歷史鎖定)...")
+    # 計算昨日 (歷史)
     hit_prev, valid_prev, _, _ = calc_stats_finmind_only(_api, d_prev_str, prev_rank_codes, use_realtime=False)
     
-    # 3. 決定今日名單 & 計算今日廣度
+    # 計算今日
     if is_intraday:
         curr_rank_codes = prev_rank_codes
         mode_msg = "🚀 盤中極速模式 (Sponsor Tick)"
@@ -244,25 +251,19 @@ def fetch_data(_api):
             curr_rank_codes = prev_rank_codes
             mode_msg = "⚠️ 盤後模式 (排行未更新，沿用昨日)"
             
-    progress_bar.progress(50, text=f"計算今日數據 ({mode_msg})...")
     hit_curr, valid_curr, details, last_time = calc_stats_finmind_only(_api, d_curr_str, curr_rank_codes, use_realtime=True)
-    
-    progress_bar.empty()
     
     detail_df = pd.DataFrame(details)
     
-    # 4. 斜率
     slope = 0
     try:
         twii_df = _api.taiwan_stock_daily(stock_id="TAIEX", start_date=(datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"))
         if is_intraday:
-            # 嘗試抓大盤 Tick
             twii_snap = _api.taiwan_stock_tick_snapshot(stock_id="TAIEX")
             if not twii_snap.empty:
                 twii_price = float(twii_snap['deal_price'].iloc[-1])
                 new_row = pd.DataFrame([{'date': d_curr_str, 'close': twii_price}])
                 twii_df = pd.concat([twii_df, new_row], ignore_index=True)
-                 
         twii_df['MA5'] = twii_df['close'].rolling(5).mean()
         slope = twii_df['MA5'].iloc[-1] - twii_df['MA5'].iloc[-2]
     except: pass
@@ -286,7 +287,7 @@ def fetch_data(_api):
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v3.0.1 Sponsor)")
+    st.title("📈 盤中權證進場判斷 (v3.1.0 穩定版)")
 
     with st.sidebar:
         st.subheader("系統狀態")
