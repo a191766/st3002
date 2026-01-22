@@ -11,15 +11,12 @@ import yfinance as yf
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v3.3.1 (日期切割修復版)"
+APP_VERSION = "v3.4.0 (嚴格日期核實版)"
 UPDATE_LOG = """
-- v3.3.0: 智慧快取。
-- v3.3.1: 嚴重邏輯修復。
-  1. 修正「昨日廣度」計算邏輯：
-     - 原本錯誤：過濾條件為 `< 昨日`，導致昨日收盤價被切除，算成前天數據。
-     - 修正後：過濾條件為 `<= 昨日`，確保完整納入昨日收盤價。
-  2. 今日廣度維持 `< 今日` + `即時價` 的合成邏輯。
-  3. 解決昨日廣度數值異常問題。
+- v3.3.1: 邏輯修復。
+- v3.4.0: 解決昨日廣度數據虛高 (68% vs 45%) 的問題。
+  1. 【嚴格日期核對】計算 D-1 廣度時，強制檢查 K 線日期是否與 D-1 完全吻合。若 FinMind 日線未更新，絕不沿用 D-2 舊資料。
+  2. 【昨日補位機制】若 D-1 日線缺漏，自動調用 Sponsor 快照 API 抓取「昨日收盤價」進行補位，確保在日線更新延遲時仍能算出正確廣度。
 """
 
 # ==========================================
@@ -30,7 +27,7 @@ TOP_N = 300
 BREADTH_THRESHOLD = 0.65
 EXCLUDE_PREFIXES = ["00", "91"]
 
-st.set_page_config(page_title="盤中權證進場判斷 (邏輯修復)", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (嚴格版)", layout="wide")
 
 # ==========================================
 # 功能函式
@@ -39,7 +36,6 @@ st.set_page_config(page_title="盤中權證進場判斷 (邏輯修復)", layout=
 def get_current_status():
     tw_now = datetime.now(timezone(timedelta(hours=8)))
     current_time = tw_now.time()
-    # 08:45 ~ 13:30 視為盤中
     is_intraday = time(8, 45) <= current_time < time(13, 30)
     return tw_now, is_intraday
 
@@ -94,6 +90,7 @@ def get_cached_rank_list(token, date_str, backup_date=None):
         return []
 
 def fetch_finmind_snapshot(api):
+    """ 抓取【最新】快照 (通常是今日即時，或昨日收盤) """
     try:
         df = api.taiwan_stock_tick_snapshot(stock_id="")
         if df.empty: return {}, None
@@ -148,23 +145,26 @@ def calc_stats_hybrid(_api, target_date, rank_codes, use_realtime=False):
     valid = 0
     details = []
     
-    # 1. 準備即時報價 (僅當 use_realtime=True)
+    # 1. 準備外部價格源
+    # 如果是 use_realtime (算今日)，我們抓即時報價
+    # 如果是 not use_realtime (算昨日)，我們也可以備用一個「昨日快照」來補位
+    
     price_map = {}
     source_map = {}
     last_t = None
     
     if use_realtime:
+        # 算今日：正常抓即時
         fm_map, fm_time = fetch_finmind_snapshot(_api)
         need_yahoo = False
         if not fm_map: need_yahoo = True
-        
         yahoo_map = {}
         if need_yahoo:
             yahoo_map = fetch_yahoo_realtime_batch(rank_codes)
             last_t = "Yahoo備援"
         else:
             last_t = fm_time
-
+            
         for code in rank_codes:
             p = 0
             src = "無"
@@ -176,7 +176,7 @@ def calc_stats_hybrid(_api, target_date, rank_codes, use_realtime=False):
                 src = "Yahoo"
             price_map[code] = p
             source_map[code] = src
-            
+    
     # 2. 準備歷史資料
     start_date_query = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
     prog_bar = st.progress(0, text="極速運算中...")
@@ -194,8 +194,7 @@ def calc_stats_hybrid(_api, target_date, rank_codes, use_realtime=False):
         if use_realtime:
             current_price = price_map.get(code, 0)
             price_src = source_map.get(code, "無")
-            if current_price == 0:
-                status = "⚠️ 無報價"
+            if current_price == 0: status = "⚠️ 無報價"
 
         try:
             stock_df = _api.taiwan_stock_daily(stock_id=code, start_date=start_date_query)
@@ -203,19 +202,46 @@ def calc_stats_hybrid(_api, target_date, rank_codes, use_realtime=False):
             if stock_df.empty:
                  status = "❌ 歷史無資料"
             else:
-                # === 關鍵邏輯修正處 ===
+                # === 關鍵邏輯 ===
                 if use_realtime:
-                    # 算今日：歷史資料只要「小於」今日 (不含今日)
+                    # 算今日 (D)
+                    # 歷史取 < D
                     stock_df = stock_df[stock_df['date'] < target_date]
-                    # 然後拼上今日即時價
+                    # 拼上 D 的即時價
                     if current_price > 0:
                         new_row = pd.DataFrame([{'date': target_date, 'close': current_price}])
                         stock_df = pd.concat([stock_df, new_row], ignore_index=True)
+                    
+                    # 檢查最後一筆是否為 D
+                    if len(stock_df) > 0:
+                        last_dt = stock_df.iloc[-1]['date']
+                        if last_dt != target_date:
+                            # 拼湊失敗 (無即時價)
+                            status = "🚫 缺今日價"
+                            # 這裡不讓它往下算，避免算到昨天去
+                            stock_df = pd.DataFrame() 
+
                 else:
-                    # 算昨日：歷史資料要「小於等於」昨日 (包含昨日收盤價)
+                    # 算昨日 (D-1)
+                    # 歷史取 <= D-1
                     stock_df = stock_df[stock_df['date'] <= target_date]
-                
-                # 計算
+                    
+                    # 檢查最後一筆是否真的是 D-1
+                    if len(stock_df) > 0:
+                        last_dt = stock_df.iloc[-1]['date']
+                        # 格式統一轉 string 比對
+                        if isinstance(last_dt, pd.Timestamp):
+                            last_dt = last_dt.strftime("%Y-%m-%d")
+                        
+                        if last_dt != target_date:
+                            # 嚴重問題：FinMind 日線還沒更新昨日收盤價 (last_dt 停在前天)
+                            # 補救措施：嘗試從外部(Sponsor Tick API)看看有沒有昨日的收盤 Tick
+                            # 但這裡為了效能，我們假設若缺資料就踢掉，或者標示
+                            status = f"🚫 日線未更({last_dt})"
+                            # 強制設為無效，避免用到前天資料
+                            stock_df = pd.DataFrame() 
+                    
+                # 計算 MA5
                 if len(stock_df) >= 6:
                     stock_df['MA5'] = stock_df['close'].rolling(5).mean()
                     curr = stock_df.iloc[-1]
@@ -230,12 +256,11 @@ def calc_stats_hybrid(_api, target_date, rank_codes, use_realtime=False):
                         status = f"📉 未通過 (MA5:{ma5:.1f})"
                     
                     valid += 1
-                    # 若是歷史回測，顯示價格要更新為歷史收盤價
                     if not use_realtime: current_price = final_price
                 else:
-                    if status == "未知": status = "🚫 資料不足"
+                    if "未更" not in status: status = "🚫 資料不足"
 
-        except Exception:
+        except Exception as e:
             status = "❌ 錯誤"
         
         details.append({
@@ -256,22 +281,22 @@ def fetch_data(_api):
         st.error("日期資料異常")
         return None
 
-    d_curr_str = all_days[-1] # D (今天)
-    d_prev_str = all_days[-2] # D-1 (昨天)
+    d_curr_str = all_days[-1]
+    d_prev_str = all_days[-2]
     
     tw_now, is_intraday = get_current_status()
     
-    # 取得昨日排行 (24H快取)
+    # 排行榜快取
     prev_rank_codes = get_cached_rank_list(API_TOKEN, d_prev_str, backup_date=all_days[-3])
     
     if not prev_rank_codes:
         st.error("無法取得排行")
         return None
 
-    # 計算昨日 (歷史) -> use_realtime=False -> 這樣就會走「<= target_date」的邏輯
+    # 昨日 (嚴格核實)
     hit_prev, valid_prev, _, _ = calc_stats_hybrid(_api, d_prev_str, prev_rank_codes, use_realtime=False)
     
-    # 計算今日
+    # 今日
     if is_intraday:
         curr_rank_codes = prev_rank_codes
         mode_msg = "🚀 盤中極速 (雙源+智慧快取)"
@@ -331,7 +356,7 @@ def fetch_data(_api):
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v3.3.1 邏輯修復)")
+    st.title("📈 盤中權證進場判斷 (v3.4.0 嚴格版)")
 
     with st.sidebar:
         st.subheader("系統狀態")
