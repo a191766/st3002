@@ -11,13 +11,13 @@ import yfinance as yf
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v3.5.0 (完整報價並列版)"
+APP_VERSION = "v3.6.0 (雙日數據並列版)"
 UPDATE_LOG = """
-- v3.4.0: 嚴格日期核實。
-- v3.5.0: 表格欄位擴充。
-  1. 【新增欄位】表格現在同時顯示「昨日收盤」與「現價(即時)」，方便對照漲跌。
-  2. 【資料透明】若「昨日收盤」數值異常，可立即判斷是否為 FinMind 日線未更新。
-  3. 維持雙源極速抓取邏輯。
+- v3.5.0: 完整報價並列。
+- v3.6.0: 表格欄位大升級，詳細列出雙日指標。
+  1. 【昨日專區】新增「昨MA5」、「昨狀態」，明確顯示昨日是否站上均線。
+  2. 【今日專區】新增「今MA5」、「今狀態」，明確顯示今日即時表現。
+  3. 透過並列顯示，可直接觀察股價與 MA5 的動態變化 (例如：昨天沒過但今天過了)。
 """
 
 # ==========================================
@@ -28,7 +28,7 @@ TOP_N = 300
 BREADTH_THRESHOLD = 0.65
 EXCLUDE_PREFIXES = ["00", "91"]
 
-st.set_page_config(page_title="盤中權證進場判斷 (報價並列)", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (雙日詳情)", layout="wide")
 
 # ==========================================
 # 功能函式
@@ -142,9 +142,13 @@ def fetch_yahoo_realtime_batch(codes):
         return {}
 
 def calc_stats_hybrid(_api, target_date, rank_codes, use_realtime=False):
+    """
+    修改回傳格式：除了 hits/valid，多回傳一個 dict 包含詳細資訊
+    """
     hits = 0
     valid = 0
-    details = []
+    # 用 dict 儲存結果，方便後續合併 {code: {data}}
+    stats_map = {} 
     
     # 1. 準備外部價格源
     price_map = {}
@@ -176,18 +180,21 @@ def calc_stats_hybrid(_api, target_date, rank_codes, use_realtime=False):
     
     # 2. 準備歷史資料
     start_date_query = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-    prog_bar = st.progress(0, text="極速運算中...")
+    
+    # 如果是即時運算才顯示進度條，不然背景算昨天的時候安靜一點
+    if use_realtime:
+        prog_bar = st.progress(0, text="極速運算中...")
     total = len(rank_codes)
 
     for i, code in enumerate(rank_codes):
-        if i % 20 == 0:
+        if use_realtime and i % 20 == 0:
             prog_bar.progress((i / total), text=f"進度: {i+1}/{total}")
 
-        rank = i + 1
         current_price = 0
-        prev_close = 0 # 新增：昨日收盤價變數
         status = "未知"
         price_src = "歷史"
+        ma5_val = 0
+        is_pass = False
         
         if use_realtime:
             current_price = price_map.get(code, 0)
@@ -198,42 +205,33 @@ def calc_stats_hybrid(_api, target_date, rank_codes, use_realtime=False):
             stock_df = _api.taiwan_stock_daily(stock_id=code, start_date=start_date_query)
             
             if stock_df.empty:
-                 status = "❌ 歷史無資料"
+                 status = "❌ 無資料"
             else:
                 if use_realtime:
-                    # 算今日 (D)：歷史 < D
+                    # 今日 (D): 歷史 < D + 即時
                     stock_df = stock_df[stock_df['date'] < target_date]
-                    
-                    # 【關鍵新增】在這裡抓出真正的「昨日收盤價」
-                    if not stock_df.empty:
-                        prev_close = float(stock_df.iloc[-1]['close'])
-                        
-                    # 拼上 D 的即時價
                     if current_price > 0:
                         new_row = pd.DataFrame([{'date': target_date, 'close': current_price}])
                         stock_df = pd.concat([stock_df, new_row], ignore_index=True)
                     
-                    if len(stock_df) > 0:
-                        last_dt = stock_df.iloc[-1]['date']
-                        if last_dt != target_date:
-                            status = "🚫 缺今日價"
-                            stock_df = pd.DataFrame() 
+                    if len(stock_df) > 0 and stock_df.iloc[-1]['date'] != target_date:
+                         status = "🚫 缺今日價"
+                         stock_df = pd.DataFrame() # 無效化
 
                 else:
-                    # 算昨日 (D-1)：歷史 <= D-1
+                    # 昨日 (D-1): 歷史 <= D-1
                     stock_df = stock_df[stock_df['date'] <= target_date]
                     
                     if len(stock_df) > 0:
                         last_dt = stock_df.iloc[-1]['date']
-                        if isinstance(last_dt, pd.Timestamp):
-                            last_dt = last_dt.strftime("%Y-%m-%d")
-                        
+                        if isinstance(last_dt, pd.Timestamp): last_dt = last_dt.strftime("%Y-%m-%d")
                         if last_dt != target_date:
-                            status = f"🚫 日線未更({last_dt})"
-                            stock_df = pd.DataFrame()
+                            status = f"🚫 未更"
+                            stock_df = pd.DataFrame() # 無效化
                         else:
-                            # 如果是算昨日廣度，那「昨日收盤」就是今天的「現價」
-                            prev_close = float(stock_df.iloc[-1]['close']) # 其實這是昨天
+                            # 昨天的收盤價就是 current_price (為了顯示用)
+                            if not use_realtime:
+                                current_price = float(stock_df.iloc[-1]['close'])
                 
                 # 計算 MA5
                 if len(stock_df) >= 6:
@@ -241,33 +239,34 @@ def calc_stats_hybrid(_api, target_date, rank_codes, use_realtime=False):
                     curr = stock_df.iloc[-1]
                     
                     final_price = float(curr['close'])
-                    ma5 = float(curr['MA5'])
+                    ma5_val = float(curr['MA5'])
                     
-                    if final_price > ma5:
+                    if final_price > ma5_val:
                         hits += 1
+                        is_pass = True
                         status = "✅ 通過"
                     else:
-                        status = f"📉 未通過 (MA5:{ma5:.1f})"
+                        is_pass = False
+                        status = f"📉 未過"
                     
                     valid += 1
-                    if not use_realtime: current_price = final_price
                 else:
-                    if "未更" not in status: status = "🚫 資料不足"
+                    if "未更" not in status and "缺" not in status: status = "🚫 資料不足"
 
-        except Exception as e:
+        except Exception:
             status = "❌ 錯誤"
         
-        details.append({
-            'rank': rank,
-            'code': code,
-            'prev_close': prev_close,   # 新增
+        # 儲存該檔股票的完整數據
+        stats_map[code] = {
             'price': current_price,
-            'src': price_src if use_realtime else "歷史收盤",
-            'status': status
-        })
+            'ma5': ma5_val,
+            'status': status,
+            'is_pass': is_pass,
+            'src': price_src
+        }
     
-    prog_bar.empty()
-    return hits, valid, details, last_t
+    if use_realtime: prog_bar.empty()
+    return hits, valid, stats_map, last_t
 
 @st.cache_data(ttl=60)
 def fetch_data(_api):
@@ -282,12 +281,12 @@ def fetch_data(_api):
     tw_now, is_intraday = get_current_status()
     
     prev_rank_codes = get_cached_rank_list(API_TOKEN, d_prev_str, backup_date=all_days[-3])
-    
     if not prev_rank_codes:
         st.error("無法取得排行")
         return None
 
-    hit_prev, valid_prev, _, _ = calc_stats_hybrid(_api, d_prev_str, prev_rank_codes, use_realtime=False)
+    # 計算昨日 (取得詳細數據 map)
+    hit_prev, valid_prev, map_prev, _ = calc_stats_hybrid(_api, d_prev_str, prev_rank_codes, use_realtime=False)
     
     if is_intraday:
         curr_rank_codes = prev_rank_codes
@@ -300,19 +299,43 @@ def fetch_data(_api):
             curr_rank_codes = prev_rank_codes
             mode_msg = "⚠️ 盤後 (沿用昨日)"
             
-    hit_curr, valid_curr, details, last_time = calc_stats_hybrid(_api, d_curr_str, curr_rank_codes, use_realtime=True)
+    # 計算今日 (取得詳細數據 map)
+    hit_curr, valid_curr, map_curr, last_time = calc_stats_hybrid(_api, d_curr_str, curr_rank_codes, use_realtime=True)
     
-    # 整理 DataFrame
-    detail_df = pd.DataFrame(details)
-    # 重新命名欄位，讓使用者看懂
-    detail_df = detail_df.rename(columns={
-        'rank': '排名', 
-        'code': '代號', 
-        'prev_close': '昨日收盤', 
-        'price': '現價', 
-        'src': '來源', 
-        'status': '狀態'
-    })
+    # === 合併報表 ===
+    # 以「今日名單」為主表
+    final_details = []
+    for i, code in enumerate(curr_rank_codes):
+        # 取得昨天的數據 (如果名單不同，可能昨天沒這檔，就留空)
+        prev_data = map_prev.get(code, {})
+        # 取得今天的數據
+        curr_data = map_curr.get(code, {})
+        
+        # 格式化顯示 (若無數據顯示 -)
+        p_price = prev_data.get('price', 0)
+        p_ma5 = prev_data.get('ma5', 0)
+        p_status = "✅" if prev_data.get('is_pass') else "📉"
+        if not prev_data.get('status') or "🚫" in prev_data.get('status', ''): p_status = "🚫"
+        
+        c_price = curr_data.get('price', 0)
+        c_ma5 = curr_data.get('ma5', 0)
+        c_status = "✅" if curr_data.get('is_pass') else "📉"
+        if not curr_data.get('status') or "🚫" in curr_data.get('status', ''): c_status = "🚫"
+        if "⚠️" in curr_data.get('status', ''): c_status = "⚠️"
+
+        final_details.append({
+            "排名": i+1,
+            "代號": code,
+            "昨收": p_price,
+            "昨MA5": round(p_ma5, 2) if p_ma5 else 0,
+            "昨狀態": p_status,
+            "現價": c_price,
+            "今MA5": round(c_ma5, 2) if c_ma5 else 0,
+            "今狀態": c_status,
+            "來源": curr_data.get('src', '-')
+        })
+
+    detail_df = pd.DataFrame(final_details)
     
     slope = 0
     try:
@@ -323,18 +346,15 @@ def fetch_data(_api):
                 twii_snap = _api.taiwan_stock_tick_snapshot(stock_id="TAIEX")
                 if not twii_snap.empty: twii_p = float(twii_snap['deal_price'].iloc[-1])
             except: pass
-            
             if twii_p == 0:
                 try: 
                     t = yf.Ticker("^TWII")
                     hist = t.history(period="1d")
                     if not hist.empty: twii_p = float(hist['Close'].iloc[-1])
                 except: pass
-            
             if twii_p > 0:
                 new_row = pd.DataFrame([{'date': d_curr_str, 'close': twii_p}])
                 twii_df = pd.concat([twii_df, new_row], ignore_index=True)
-                
         twii_df['MA5'] = twii_df['close'].rolling(5).mean()
         slope = twii_df['MA5'].iloc[-1] - twii_df['MA5'].iloc[-2]
     except: pass
@@ -358,7 +378,7 @@ def fetch_data(_api):
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v3.5.0 完整並列)")
+    st.title("📈 盤中權證進場判斷 (v3.6.0 雙日詳情)")
 
     with st.sidebar:
         st.subheader("系統狀態")
@@ -399,8 +419,8 @@ def run_streamlit():
             else:
                 st.error(f"⛔ 結論：不可進場")
             
-            st.caption(f"報價來源時間: {t_str} (若 FinMind 無資料則自動切換 Yahoo)")
-            # 這裡顯示的表格已經包含「昨日收盤」和「現價」
+            st.caption(f"報價來源時間: {t_str}")
+            # 顯示升級後的雙日表格
             st.dataframe(data['detail_df'], use_container_width=True, hide_index=True)
 
     except Exception as e:
