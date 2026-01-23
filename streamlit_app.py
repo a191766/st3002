@@ -9,17 +9,18 @@ import sys
 import shioaji as sj
 import os
 import altair as alt
+import time as time_module # 引入時間模組處理倒數
 
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v4.7.1 (刻度終極修正版)"
+APP_VERSION = "v4.8.0 (自動循環更新版)"
 UPDATE_LOG = """
-- v4.7.0: 圖表高度調整。
-- v4.7.1: 解決 Y 軸刻度被自動隱藏的問題。
-  1. 【硬性列表】手動列舉 [0, 0.1...1.0] 所有刻度值。
-  2. 【強制顯示】加入 `labelOverlap=False` 參數，禁止系統自動隱藏刻度。
-  3. 【指定數量】設定 `tickCount=11`，確保 0%~100% 每 10% 都有一條線。
+- v4.7.1: 刻度終極修正。
+- v4.8.0: 新增自動更新機制。
+  1. 【自動循環】新增「啟用自動更新」選項，每 600 秒 (10分鐘) 自動執行一次。
+  2. 【倒數顯示】側邊欄顯示距離下次更新的秒數。
+  3. 【雙重觸發】無論是時間到自動跑，還是手動按重新整理，都會寫入紀錄並更新圖表。
 """
 
 # ==========================================
@@ -31,8 +32,9 @@ TOP_N = 300
 BREADTH_THRESHOLD = 0.65
 EXCLUDE_PREFIXES = ["00", "91"]
 HISTORY_FILE = "breadth_history.csv"
+AUTO_REFRESH_SECONDS = 600 # 10分鐘
 
-st.set_page_config(page_title="盤中權證進場判斷 (v4.7.1)", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (自動更新)", layout="wide")
 
 # ==========================================
 # 永豐 API 初始化
@@ -114,7 +116,7 @@ def get_cached_stock_history(token, code, start_date):
         return pd.DataFrame()
 
 # ==========================================
-# 廣度記錄與繪圖 (核心修改處)
+# 廣度記錄與繪圖
 # ==========================================
 def save_breadth_record(current_date, current_time, breadth_value):
     new_data = pd.DataFrame([{
@@ -156,7 +158,6 @@ def plot_breadth_chart():
         start_bound = pd.to_datetime(f"{base_date} 09:00:00")
         end_bound = pd.to_datetime(f"{base_date} 14:30:00")
 
-        # === 終極修正：手動列舉刻度並禁止隱藏 ===
         tick_values = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
 
         chart = alt.Chart(df).mark_line(point=True).encode(
@@ -170,9 +171,9 @@ def plot_breadth_chart():
                     scale=alt.Scale(domain=[0, 1]), 
                     axis=alt.Axis(
                         format='%',
-                        values=tick_values,    # 強制指定數值
-                        tickCount=11,          # 強制指定數量
-                        labelOverlap=False     # 禁止自動隱藏標籤
+                        values=tick_values,    
+                        tickCount=11,          
+                        labelOverlap=False     
                     )
             ),
             tooltip=[
@@ -447,10 +448,15 @@ def fetch_data():
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v4.7.1 刻度終極修正)")
+    st.title("📈 盤中權證進場判斷 (v4.8.0 自動循環)")
 
+    # 1. 處理自動更新開關
     with st.sidebar:
-        st.subheader("系統狀態")
+        st.subheader("設定與狀態")
+        
+        # 自動更新開關
+        auto_refresh = st.checkbox("啟用自動更新 (每10分鐘)", value=False)
+        
         if 'shioaji' in st.secrets:
             st.success("Secrets 設定已偵測")
         else:
@@ -458,9 +464,12 @@ def run_streamlit():
         st.code(f"Version: {APP_VERSION}")
         st.markdown(UPDATE_LOG)
 
-    if st.button("🔄 立即重新整理 (記錄廣度)"):
+    # 2. 手動更新按鈕
+    if st.button("🔄 立即重新整理"):
+        # 按鈕本身會觸發 Rerun，所以不需要寫額外邏輯
         pass 
 
+    # 3. 執行主程式
     try:
         data = fetch_data()
             
@@ -501,6 +510,30 @@ def run_streamlit():
     except Exception as e:
         st.error(f"執行出錯: {e}")
         st.code(traceback.format_exc())
+
+    # 4. 處理自動循環邏輯 (放在最後)
+    if auto_refresh:
+        # 檢查是否在盤中 (09:00 ~ 13:30)
+        tw_now, is_intraday = get_current_status()
+        
+        # 若是盤中，執行倒數
+        # 注意：Streamlit 的 time.sleep 會阻擋執行緒，這期間介面可能會無法互動
+        # 若要強制手動更新，建議直接按 F5 刷新網頁
+        if is_intraday:
+            with st.sidebar:
+                st.write("---")
+                timer_text = st.empty()
+                
+            # 簡單的倒數計時 (每秒更新一次文字)
+            for i in range(AUTO_REFRESH_SECONDS, 0, -1):
+                timer_text.info(f"⏳ 下次更新：{i} 秒後")
+                time_module.sleep(1)
+            
+            # 時間到，觸發 Rerun
+            st.rerun()
+        else:
+            with st.sidebar:
+                st.warning("目前非盤中時段，自動更新暫停")
 
 if __name__ == "__main__":
     if 'streamlit' in sys.modules:
