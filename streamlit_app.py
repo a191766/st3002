@@ -14,14 +14,12 @@ import time as time_module
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v4.9.0 (終極合併版)"
+APP_VERSION = "v4.9.1 (3分鐘自動更新版)"
 UPDATE_LOG = """
-- v4.7.1: 圖表刻度修復。
-- v4.8.0: 自動更新功能。
-- v4.9.0: 功能合併與修復。
-  1. 【找回功能】將不小心覆蓋掉的「自動更新勾選框」與「倒數計時」加回來。
-  2. 【保留圖表】維持高度 400 與 10% 強制刻度的完美圖表設定。
-  3. 現在您可以在側邊欄看到「啟用自動更新」的選項了。
+- v4.9.0: 終極合併版。
+- v4.9.1: 調整更新頻率。
+  1. 【頻率加速】將自動更新間隔由 10 分鐘縮短為 3 分鐘 (180秒)。
+  2. 此頻率下全日請求約 90 次，對 API 仍屬極度安全範圍，且能提供更細緻的走勢圖。
 """
 
 # ==========================================
@@ -33,9 +31,9 @@ TOP_N = 300
 BREADTH_THRESHOLD = 0.65
 EXCLUDE_PREFIXES = ["00", "91"]
 HISTORY_FILE = "breadth_history.csv"
-AUTO_REFRESH_SECONDS = 600 # 10分鐘
+AUTO_REFRESH_SECONDS = 180 # <--- 修改為 3 分鐘
 
-st.set_page_config(page_title="盤中權證進場判斷 (完整版)", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (3分K)", layout="wide")
 
 # ==========================================
 # 永豐 API 初始化
@@ -448,14 +446,14 @@ def fetch_data():
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v4.9.0 終極合併)")
+    st.title("📈 盤中權證進場判斷 (v4.9.1 3分鐘更新)")
 
     # 1. 處理自動更新開關
     with st.sidebar:
         st.subheader("設定與狀態")
         
-        # 自動更新開關
-        auto_refresh = st.checkbox("啟用自動更新 (每10分鐘)", value=False)
+        # 自動更新開關 (預設為 False，勾選後開啟)
+        auto_refresh = st.checkbox("啟用自動更新 (每3分鐘)", value=False)
         
         if 'shioaji' in st.secrets:
             st.success("Secrets 設定已偵測")
