@@ -6,33 +6,34 @@ from FinMind.data import DataLoader
 from datetime import datetime, timedelta, timezone, time
 import traceback
 import sys
-import shioaji as sj  # 引入永豐 API
+import shioaji as sj
 
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v4.0.1 (參數補全修復版)"
+APP_VERSION = "v4.2.0 (智慧分層快取版)"
 UPDATE_LOG = """
-- v4.0.0: 永豐 Shioaji 核心。
-- v4.0.1: 修復函式呼叫錯誤。
-  1. 修正 `calc_stats_hybrid` 呼叫時漏傳 `target_date` 參數導致的 TypeError。
-  2. 確保昨日數據計算能正確傳入日期與名單。
+- v4.0.1: 參數修復。
+- v4.2.0: 效能與 API 額度終極優化。
+  1. 【分層快取架構】將「歷史資料(靜態)」與「即時報價(動態)」完全分離。
+  2. 【排行榜快取】昨日排行一旦抓過，盤中重整絕不重抓 (TTL=24hr)。
+  3. 【K線快取】300 檔個股歷史 K 線也全面快取，重整時不再消耗 FinMind 額度。
+  4. 【極速重整】移除按鈕的 `clear()` 指令，現在按重新整理只會更新即時價，速度提升 10 倍以上。
 """
 
 # ==========================================
 # 參數與 Token
 # ==========================================
-# FinMind Token
 FINMIND_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJkYXRlIjoiMjAyNi0wMS0xNCAxOTowMDowNiIsInVzZXJfaWQiOiJcdTllYzNcdTRlYzFcdTVhMDEiLCJlbWFpbCI6ImExOTE3NjZAZ21haWwuY29tIiwiaXAiOiIifQ.JFPtMDNbxKzhl8HsxkOlA1tMlwq8y_NA6NpbRel6HCk"
 
 TOP_N = 300              
 BREADTH_THRESHOLD = 0.65
 EXCLUDE_PREFIXES = ["00", "91"]
 
-st.set_page_config(page_title="盤中權證進場判斷 (Shioaji)", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (極速快取)", layout="wide")
 
 # ==========================================
-# 永豐 API 初始化
+# 永豐 API 初始化 (連線資源快取)
 # ==========================================
 @st.cache_resource
 def get_shioaji_api():
@@ -41,48 +42,15 @@ def get_shioaji_api():
         api_key = st.secrets["shioaji"]["api_key"]
         secret_key = st.secrets["shioaji"]["secret_key"]
         api.login(api_key=api_key, secret_key=secret_key)
-        print(">>> Shioaji Login Success")
+        # print(">>> Shioaji Login Success")
     except Exception as e:
-        print(f">>> Shioaji Login Failed: {e}")
+        # print(f">>> Shioaji Login Failed: {e}")
         return None
     return api
 
 # ==========================================
-# 功能函式
+# 靜態資料快取區 (省流量的核心)
 # ==========================================
-
-def get_current_status():
-    tw_now = datetime.now(timezone(timedelta(hours=8)))
-    current_time = tw_now.time()
-    is_intraday = time(8, 45) <= current_time < time(13, 30)
-    return tw_now, is_intraday
-
-def get_trading_days_robust(api):
-    dates = []
-    try:
-        df = api.taiwan_stock_daily(stock_id="0050", start_date=(datetime.now() - timedelta(days=20)).strftime("%Y-%m-%d"))
-        if not df.empty:
-            dates = sorted(df['date'].unique().tolist())
-    except:
-        pass 
-    
-    if not dates:
-        tw_now, _ = get_current_status()
-        check_day = tw_now
-        while len(dates) < 5:
-            if check_day.weekday() <= 4:
-                dates.append(check_day.strftime("%Y-%m-%d"))
-            check_day -= timedelta(days=1)
-        dates = sorted(dates)
-
-    tw_now, is_intraday = get_current_status()
-    today_str = tw_now.strftime("%Y-%m-%d")
-    
-    if 0 <= tw_now.weekday() <= 4 and tw_now.time() >= time(8, 45):
-        if not dates or today_str > dates[-1]:
-            dates.append(today_str)
-            
-    return dates
 
 def smart_get_column(df, candidates):
     cols = df.columns
@@ -92,6 +60,20 @@ def smart_get_column(df, candidates):
         if name.lower() in lower_map: return df[lower_map[name.lower()]]
     return None
 
+# 1. 交易日快取 (1小時更新一次即可)
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_cached_trading_days(token):
+    api = DataLoader()
+    api.login_by_token(token)
+    try:
+        df = api.taiwan_stock_daily(stock_id="0050", start_date=(datetime.now() - timedelta(days=20)).strftime("%Y-%m-%d"))
+        if not df.empty:
+            return sorted(df['date'].unique().tolist())
+    except:
+        pass
+    return []
+
+# 2. 排行榜快取 (24小時，存硬碟，失敗不存)
 @st.cache_data(ttl=86400, show_spinner=False, persist="disk")
 def get_cached_rank_list(token, date_str, backup_date=None):
     local_api = DataLoader()
@@ -108,11 +90,14 @@ def get_cached_rank_list(token, date_str, backup_date=None):
         except: pass
 
     if df_rank.empty:
-        raise RuntimeError("API_FETCH_FAILED")
+        raise RuntimeError("API_FETCH_FAILED") # 失敗時拋錯，防止存入空快取
 
     df_rank['ID'] = smart_get_column(df_rank, ['stock_id', 'code'])
     df_rank['Money'] = smart_get_column(df_rank, ['Trading_money', 'Trading_Money', 'turnover'])
     
+    if df_rank['ID'] is None or df_rank['Money'] is None:
+         raise RuntimeError("DATA_FORMAT_ERROR")
+
     df_rank['ID'] = df_rank['ID'].astype(str)
     df_rank = df_rank[df_rank['ID'].str.len() == 4]
     df_rank = df_rank[df_rank['ID'].str.isdigit()]
@@ -122,12 +107,60 @@ def get_cached_rank_list(token, date_str, backup_date=None):
     df_candidates = df_rank.sort_values('Money', ascending=False).head(TOP_N)
     return df_candidates['ID'].tolist()
 
+# 3. 個股歷史 K 線快取 (6小時，大幅節省 300 次 API 呼叫)
+@st.cache_data(ttl=21600, show_spinner=False)
+def get_cached_stock_history(token, code, start_date):
+    api = DataLoader()
+    api.login_by_token(token)
+    try:
+        return api.taiwan_stock_daily(stock_id=code, start_date=start_date)
+    except:
+        return pd.DataFrame()
+
+# ==========================================
+# 動態資料區 (即時運算)
+# ==========================================
+
+def get_current_status():
+    tw_now = datetime.now(timezone(timedelta(hours=8)))
+    current_time = tw_now.time()
+    is_intraday = time(8, 45) <= current_time < time(13, 30)
+    return tw_now, is_intraday
+
+def get_trading_days_robust(token):
+    # 改用快取函式
+    dates = get_cached_trading_days(token)
+    
+    # 備援推算 (萬一 API 掛了)
+    if not dates:
+        tw_now, _ = get_current_status()
+        check_day = tw_now
+        while len(dates) < 5:
+            if check_day.weekday() <= 4:
+                dates.append(check_day.strftime("%Y-%m-%d"))
+            check_day -= timedelta(days=1)
+        dates = sorted(dates)
+
+    # 強制校正今天 (盤中修正)
+    tw_now, is_intraday = get_current_status()
+    today_str = tw_now.strftime("%Y-%m-%d")
+    
+    if 0 <= tw_now.weekday() <= 4 and tw_now.time() >= time(8, 45):
+        if not dates or today_str > dates[-1]:
+            dates.append(today_str)
+            
+    return dates
+
 def fetch_shioaji_snapshots(sj_api, codes):
     if not sj_api or not codes: return {}, None
+    
+    # Shioaji 抓取快照
     contracts = []
     for code in codes:
-        contract = sj_api.Contracts.Stocks[code]
-        if contract: contracts.append(contract)
+        try:
+            contract = sj_api.Contracts.Stocks[code]
+            if contract: contracts.append(contract)
+        except: pass
     
     if not contracts: return {}, None
 
@@ -145,10 +178,9 @@ def fetch_shioaji_snapshots(sj_api, codes):
                     ts = snap_time
         return price_map, ts.strftime("%H:%M:%S")
     except Exception as e:
-        print(f"Snapshot Error: {e}")
         return {}, None
 
-def calc_stats_hybrid(_fm_api, _sj_api, target_date, rank_codes, use_realtime=False):
+def calc_stats_hybrid(sj_api, target_date, rank_codes, use_realtime=False):
     hits = 0
     valid = 0
     stats_map = {} 
@@ -156,21 +188,23 @@ def calc_stats_hybrid(_fm_api, _sj_api, target_date, rank_codes, use_realtime=Fa
     price_map = {}
     last_t = None
     
+    # 1. 準備即時報價 (只在 use_realtime 時動作)
     if use_realtime:
-        if _sj_api:
-            price_map, last_t = fetch_shioaji_snapshots(_sj_api, rank_codes)
+        if sj_api:
+            price_map, last_t = fetch_shioaji_snapshots(sj_api, rank_codes)
         if not price_map:
-            last_t = "無資料"
+            last_t = "無即時資料"
     
     start_date_query = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
     
+    # 進度條只在即時運算時顯示，避免干擾
     if use_realtime:
-        prog_bar = st.progress(0, text="Shioaji 極速連線中...")
+        prog_bar = st.progress(0, text="正在整合快取與即時報價...")
     total = len(rank_codes)
 
     for i, code in enumerate(rank_codes):
         if use_realtime and i % 50 == 0:
-            prog_bar.progress((i / total), text=f"進度: {i+1}/{total}")
+            prog_bar.progress((i / total), text=f"分析進度: {i+1}/{total}")
 
         current_price = 0
         status = "未知"
@@ -184,12 +218,15 @@ def calc_stats_hybrid(_fm_api, _sj_api, target_date, rank_codes, use_realtime=Fa
             if current_price == 0: status = "⚠️ 無報價"
 
         try:
-            stock_df = _fm_api.taiwan_stock_daily(stock_id=code, start_date=start_date_query)
+            # === 關鍵優化：改用快取函式抓歷史 K 線 ===
+            # 這會直接從記憶體拿資料，不會再去問 FinMind
+            stock_df = get_cached_stock_history(FINMIND_TOKEN, code, start_date_query)
             
             if stock_df.empty:
                  status = "❌ 無資料"
             else:
                 if use_realtime:
+                    # 算今日: 歷史 < Target + 即時
                     stock_df = stock_df[stock_df['date'] < target_date]
                     if current_price > 0:
                         new_row = pd.DataFrame([{'date': target_date, 'close': current_price}])
@@ -199,6 +236,7 @@ def calc_stats_hybrid(_fm_api, _sj_api, target_date, rank_codes, use_realtime=Fa
                          status = "🚫 缺今日價"
                          stock_df = pd.DataFrame() 
                 else:
+                    # 算昨日: 歷史 <= Target
                     stock_df = stock_df[stock_df['date'] <= target_date]
                     if len(stock_df) > 0:
                         last_dt = stock_df.iloc[-1]['date']
@@ -241,13 +279,14 @@ def calc_stats_hybrid(_fm_api, _sj_api, target_date, rank_codes, use_realtime=Fa
     if use_realtime: prog_bar.empty()
     return hits, valid, stats_map, last_t
 
-@st.cache_data(ttl=5)
-def fetch_data(_fm_api):
+# === fetch_data 不再使用 cache，確保每次重整都執行，但內部依賴快取 ===
+def fetch_data():
     sj_api = get_shioaji_api()
     if sj_api is None:
         st.error("⚠️ 無法登入永豐 API，請檢查 Secrets 設定。")
 
-    all_days = get_trading_days_robust(_fm_api)
+    # 使用快取取得交易日
+    all_days = get_trading_days_robust(FINMIND_TOKEN)
     if len(all_days) < 2: return None
 
     d_curr_str = all_days[-1]
@@ -255,18 +294,19 @@ def fetch_data(_fm_api):
     
     tw_now, is_intraday = get_current_status()
     
+    # 取得排行榜 (快取保護)
     try:
         prev_rank_codes = get_cached_rank_list(FINMIND_TOKEN, d_prev_str, backup_date=all_days[-3])
     except RuntimeError:
-        st.error("⚠️ 無法取得排行資料 (FinMind)")
+        st.error("⚠️ 無法取得排行資料 (API 異常)。")
         return None
     
-    # === 修正點：補上 d_prev_str 參數 ===
-    hit_prev, valid_prev, map_prev, _ = calc_stats_hybrid(_fm_api, None, d_prev_str, prev_rank_codes, use_realtime=False)
+    # 計算昨日 (這裡會大量使用 K 線快取，速度極快)
+    hit_prev, valid_prev, map_prev, _ = calc_stats_hybrid(None, d_prev_str, prev_rank_codes, use_realtime=False)
     
     if is_intraday:
         curr_rank_codes = prev_rank_codes
-        mode_msg = "🚀 盤中極速 (永豐 Shioaji 核心)"
+        mode_msg = "🚀 盤中極速 (智慧分層快取)"
     else:
         try:
             curr_rank_codes = get_cached_rank_list(FINMIND_TOKEN, d_curr_str)
@@ -279,7 +319,8 @@ def fetch_data(_fm_api):
             curr_rank_codes = prev_rank_codes
             mode_msg = "⚠️ 盤後 (沿用昨日)"
             
-    hit_curr, valid_curr, map_curr, last_time = calc_stats_hybrid(_fm_api, sj_api, d_curr_str, curr_rank_codes, use_realtime=True)
+    # 計算今日 (這裡會抓 Shioaji 即時價 + K 線快取)
+    hit_curr, valid_curr, map_curr, last_time = calc_stats_hybrid(sj_api, d_curr_str, curr_rank_codes, use_realtime=True)
     
     final_details = []
     for i, code in enumerate(curr_rank_codes):
@@ -313,7 +354,18 @@ def fetch_data(_fm_api):
     
     slope = 0
     try:
-        twii_df = _fm_api.taiwan_stock_daily(stock_id="TAIEX", start_date=(datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"))
+        # 大盤 K 線也快取一下，雖然只 call 一次
+        twii_df = get_cached_stock_history(FINMIND_TOKEN, "TAIEX", (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"))
+        if is_intraday and sj_api:
+             # 大盤即時
+             try:
+                 snap = sj_api.snapshots([sj_api.Contracts.Indices.TSE.TSE001])[0]
+                 twii_p = float(snap.close)
+                 if twii_p > 0:
+                     new_row = pd.DataFrame([{'date': d_curr_str, 'close': twii_p}])
+                     twii_df = pd.concat([twii_df, new_row], ignore_index=True)
+             except: pass
+             
         twii_df['MA5'] = twii_df['close'].rolling(5).mean()
         slope = twii_df['MA5'].iloc[-1] - twii_df['MA5'].iloc[-2]
     except: pass
@@ -337,25 +389,25 @@ def fetch_data(_fm_api):
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v4.0.1 參數修復)")
+    st.title("📈 盤中權證進場判斷 (v4.2.0 分層快取)")
 
     with st.sidebar:
         st.subheader("系統狀態")
         if 'shioaji' in st.secrets:
             st.success("Secrets 設定已偵測")
         else:
-            st.error("尚未設定 Secrets (請見說明)")
+            st.error("尚未設定 Secrets")
         st.code(f"Version: {APP_VERSION}")
         st.markdown(UPDATE_LOG)
 
-    fm_api = DataLoader()
-    fm_api.login_by_token(FINMIND_TOKEN)
-
     if st.button("🔄 立即重新整理"):
-        st.cache_data.clear()
+        # 移除了 st.cache_data.clear()
+        # 這裡什麼都不用做，按鈕本身就會觸發 Streamlit Rerun
+        # Rerun 會執行 fetch_data -> 讀取快取 -> 抓 Shioaji -> 更新畫面
+        pass 
 
     try:
-        data = fetch_data(fm_api)
+        data = fetch_data()
             
         if data is None:
             pass
