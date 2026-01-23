@@ -13,13 +13,13 @@ import altair as alt
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v4.5.0 (走勢圖優化版)"
+APP_VERSION = "v4.6.0 (走勢圖手機優化版)"
 UPDATE_LOG = """
-- v4.4.0: 廣度分時走勢圖。
-- v4.5.0: 優化圖表 X 軸顯示。
-  1. 【鎖定時間軸】強制將走勢圖 X 軸範圍鎖定在 09:00 ~ 14:30。
-  2. 【視覺優化】解決盤後查看時，因時間軸自動延展導致走勢擠在左側的問題。
-  3. 維持自動記錄與每日重置功能。
+- v4.5.0: 走勢圖 X 軸範圍鎖定。
+- v4.6.0: 針對手機版面優化圖表。
+  1. 【移除標題】移除 Y 軸「廣度」文字，釋放左側空間，讓圖表在手機上更寬。
+  2. 【加密刻度】Y 軸改為每 10% 一格 (0%, 10%, 20%... 100%)。
+  3. 【拉長縱軸】圖表高度由 300 增加至 350，避免刻度過於擁擠。
 """
 
 # ==========================================
@@ -32,7 +32,7 @@ BREADTH_THRESHOLD = 0.65
 EXCLUDE_PREFIXES = ["00", "91"]
 HISTORY_FILE = "breadth_history.csv"
 
-st.set_page_config(page_title="盤中權證進場判斷 (走勢優化)", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (手機優化)", layout="wide")
 
 # ==========================================
 # 永豐 API 初始化
@@ -114,7 +114,7 @@ def get_cached_stock_history(token, code, start_date):
         return pd.DataFrame()
 
 # ==========================================
-# 廣度記錄與繪圖 (核心修改處)
+# 廣度記錄與繪圖 (本次修改重點)
 # ==========================================
 def save_breadth_record(current_date, current_time, breadth_value):
     new_data = pd.DataFrame([{
@@ -150,26 +150,26 @@ def plot_breadth_chart():
         if df.empty: return None
         
         df['Breadth_Pct'] = df['Breadth']
-        
-        # === 關鍵修改：建立完整的 Datetime 欄位 ===
-        # 將 Date 與 Time 合併，讓 Altair 能正確解析時間
         df['Datetime'] = pd.to_datetime(df['Date'].astype(str) + ' ' + df['Time'].astype(str))
         
-        # === 關鍵修改：強制設定 X 軸範圍 (09:00 ~ 14:30) ===
         base_date = df.iloc[0]['Date']
         start_bound = pd.to_datetime(f"{base_date} 09:00:00")
         end_bound = pd.to_datetime(f"{base_date} 14:30:00")
 
+        # === 修改重點：優化 Y 軸 ===
         chart = alt.Chart(df).mark_line(point=True).encode(
             x=alt.X('Datetime', 
                     title='時間', 
-                    axis=alt.Axis(format='%H:%M'), # 只顯示時:分
-                    scale=alt.Scale(domain=[start_bound, end_bound]) # 鎖定範圍
+                    axis=alt.Axis(format='%H:%M'), 
+                    scale=alt.Scale(domain=[start_bound, end_bound])
             ),
             y=alt.Y('Breadth_Pct', 
-                    title='廣度', 
+                    title=None, # 移除標題，省空間
                     scale=alt.Scale(domain=[0, 1]), 
-                    axis=alt.Axis(format='%')
+                    axis=alt.Axis(
+                        format='%',
+                        values=np.arange(0, 1.1, 0.1).tolist() # 強制設定 0, 0.1, 0.2 ... 1.0 的刻度
+                    )
             ),
             tooltip=[
                 alt.Tooltip('Datetime', title='時間', format='%H:%M:%S'), 
@@ -177,14 +177,13 @@ def plot_breadth_chart():
             ]
         ).properties(
             title=f"今日廣度走勢 ({base_date})",
-            height=300
+            height=350 # 拉長縱軸 (原為300)
         )
         
         rule = alt.Chart(pd.DataFrame({'y': [BREADTH_THRESHOLD]})).mark_rule(color='red', strokeDash=[5, 5]).encode(y='y')
         
         return chart + rule
     except Exception as e:
-        # st.error(f"Plot Error: {e}") # Debug 用
         return None
 
 # ==========================================
@@ -444,7 +443,7 @@ def fetch_data():
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v4.5.0 走勢優化)")
+    st.title("📈 盤中權證進場判斷 (v4.6.0 手機優化)")
 
     with st.sidebar:
         st.subheader("系統狀態")
