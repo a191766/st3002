@@ -14,27 +14,34 @@ import time as time_module
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v4.9.2 (週末識別修正版)"
+APP_VERSION = "v4.9.3 (資安強化版)"
 UPDATE_LOG = """
-- v4.9.1: 3分鐘自動更新。
-- v4.9.2: 修正交易時段判斷邏輯。
-  1. 【週末識別】在自動更新判斷中加入「星期幾」的檢查。
-  2. 週六、週日即使在 09:00~13:30 開啟程式，也不會觸發自動更新。
-  3. 非交易時段顯示黃色警示，避免誤以為程式在運作。
+- v4.9.2: 週末識別修正。
+- v4.9.3: 資安升級。
+  1. 【移除明文 Token】將 FinMind Token 移至 st.secrets 管理，避免外洩。
+  2. 【安全檢查】啟動時檢查 Secrets 是否設定完整，若缺漏會跳出紅色警示。
+  3. 保留所有自動更新與圖表功能。
 """
 
 # ==========================================
-# 參數與 Token
+# 參數設定
 # ==========================================
-FINMIND_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJkYXRlIjoiMjAyNi0wMS0xNCAxOTowMDowNiIsInVzZXJfaWQiOiJcdTllYzNcdTRlYzFcdTVhMDEiLCJlbWFpbCI6ImExOTE3NjZAZ21haWwuY29tIiwiaXAiOiIifQ.JFPtMDNbxKzhl8HsxkOlA1tMlwq8y_NA6NpbRel6HCk"
-
 TOP_N = 300              
 BREADTH_THRESHOLD = 0.65
 EXCLUDE_PREFIXES = ["00", "91"]
 HISTORY_FILE = "breadth_history.csv"
 AUTO_REFRESH_SECONDS = 180 # 3分鐘
 
-st.set_page_config(page_title="盤中權證進場判斷 (v4.9.2)", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (資安版)", layout="wide")
+
+# ==========================================
+# 🔐 Secrets 讀取與驗證 (核心修改)
+# ==========================================
+def get_finmind_token():
+    try:
+        return st.secrets["finmind"]["token"]
+    except:
+        return None
 
 # ==========================================
 # 永豐 API 初始化
@@ -197,14 +204,8 @@ def plot_breadth_chart():
 def get_current_status():
     tw_now = datetime.now(timezone(timedelta(hours=8)))
     current_time = tw_now.time()
-    
-    # 1. 時間判斷 (08:45 ~ 13:30)
     valid_time = time(8, 45) <= current_time < time(13, 30)
-    
-    # 2. 星期判斷 (星期一=0 ... 星期日=6)
-    # 只有 0, 1, 2, 3, 4 (週一到週五) 是交易日
     valid_day = 0 <= tw_now.weekday() <= 4
-    
     is_intraday = valid_time and valid_day
     return tw_now, is_intraday
 
@@ -222,8 +223,6 @@ def get_trading_days_robust(token):
     tw_now, is_intraday = get_current_status()
     today_str = tw_now.strftime("%Y-%m-%d")
     
-    # 在這裡我們需要一個寬鬆的檢查，只要是平日且時間過 08:45，就嘗試把今天加進去
-    # 這樣才能在盤中時段建立「今天的日期」供後續程式使用
     if 0 <= tw_now.weekday() <= 4 and tw_now.time() >= time(8, 45):
         if not dates or today_str > dates[-1]:
             dates.append(today_str)
@@ -257,6 +256,12 @@ def fetch_shioaji_snapshots(sj_api, codes):
         return {}, None
 
 def calc_stats_hybrid(sj_api, target_date, rank_codes, use_realtime=False):
+    # 需要在這裡讀取 Token
+    fm_token = get_finmind_token()
+    if not fm_token:
+        # 如果 Token 沒設定，這裡會報錯，外層會捕獲
+        raise ValueError("FinMind Token 未設定")
+
     hits = 0
     valid = 0
     stats_map = {} 
@@ -291,7 +296,7 @@ def calc_stats_hybrid(sj_api, target_date, rank_codes, use_realtime=False):
             if current_price == 0: status = "⚠️ 無報價"
 
         try:
-            stock_df = get_cached_stock_history(FINMIND_TOKEN, code, start_date_query)
+            stock_df = get_cached_stock_history(fm_token, code, start_date_query)
             
             if stock_df.empty:
                  status = "❌ 無資料"
@@ -348,11 +353,18 @@ def calc_stats_hybrid(sj_api, target_date, rank_codes, use_realtime=False):
     return hits, valid, stats_map, last_t
 
 def fetch_data():
+    # 1. 檢查 FinMind Token
+    fm_token = get_finmind_token()
+    if not fm_token:
+        st.error("🚨 請在 Secrets 中設定 [finmind] token，否則無法抓取資料！")
+        return None
+
+    # 2. 檢查永豐 API
     sj_api = get_shioaji_api()
     if sj_api is None:
         st.error("⚠️ 無法登入永豐 API，請檢查 Secrets 設定。")
 
-    all_days = get_trading_days_robust(FINMIND_TOKEN)
+    all_days = get_trading_days_robust(fm_token)
     if len(all_days) < 2: return None
 
     d_curr_str = all_days[-1]
@@ -360,7 +372,7 @@ def fetch_data():
     tw_now, is_intraday = get_current_status()
     
     try:
-        prev_rank_codes = get_cached_rank_list(FINMIND_TOKEN, d_prev_str, backup_date=all_days[-3])
+        prev_rank_codes = get_cached_rank_list(fm_token, d_prev_str, backup_date=all_days[-3])
     except RuntimeError:
         st.error("⚠️ 無法取得昨日排行資料。")
         return None
@@ -374,7 +386,7 @@ def fetch_data():
         rank_source_msg = f"名單依據：{d_prev_str} (昨日排行)"
     else:
         try:
-            curr_rank_codes = get_cached_rank_list(FINMIND_TOKEN, d_curr_str)
+            curr_rank_codes = get_cached_rank_list(fm_token, d_curr_str)
         except:
             curr_rank_codes = []
 
@@ -424,7 +436,7 @@ def fetch_data():
     
     slope = 0
     try:
-        twii_df = get_cached_stock_history(FINMIND_TOKEN, "TAIEX", (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"))
+        twii_df = get_cached_stock_history(fm_token, "TAIEX", (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"))
         if is_intraday and sj_api:
              try:
                  snap = sj_api.snapshots([sj_api.Contracts.Indices.TSE.TSE001])[0]
@@ -457,19 +469,24 @@ def fetch_data():
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v4.9.2 週末修正)")
+    st.title("📈 盤中權證進場判斷 (v4.9.3 資安版)")
 
     # 1. 處理自動更新開關
     with st.sidebar:
         st.subheader("設定與狀態")
-        
-        # 自動更新開關
         auto_refresh = st.checkbox("啟用自動更新 (每3分鐘)", value=False)
         
+        # 檢查 Token 狀態
         if 'shioaji' in st.secrets:
-            st.success("Secrets 設定已偵測")
+            st.success("✅ Shioaji Secrets OK")
         else:
-            st.error("尚未設定 Secrets")
+            st.error("❌ 缺少 [shioaji] Secrets")
+            
+        if 'finmind' in st.secrets:
+            st.success("✅ FinMind Secrets OK")
+        else:
+            st.error("❌ 缺少 [finmind] Secrets")
+
         st.code(f"Version: {APP_VERSION}")
         st.markdown(UPDATE_LOG)
 
@@ -519,7 +536,7 @@ def run_streamlit():
         st.error(f"執行出錯: {e}")
         st.code(traceback.format_exc())
 
-    # 4. 處理自動循環邏輯 (修正後)
+    # 4. 處理自動循環邏輯
     if auto_refresh:
         tw_now, is_intraday = get_current_status()
         
@@ -535,7 +552,6 @@ def run_streamlit():
             st.rerun()
         else:
             with st.sidebar:
-                # 這裡改用 warning 提醒非交易時段
                 st.warning("⏸ 目前非盤中時段，自動更新暫停")
 
 if __name__ == "__main__":
