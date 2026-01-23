@@ -14,12 +14,13 @@ import time as time_module
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v4.9.1 (3分鐘自動更新版)"
+APP_VERSION = "v4.9.2 (週末識別修正版)"
 UPDATE_LOG = """
-- v4.9.0: 終極合併版。
-- v4.9.1: 調整更新頻率。
-  1. 【頻率加速】將自動更新間隔由 10 分鐘縮短為 3 分鐘 (180秒)。
-  2. 此頻率下全日請求約 90 次，對 API 仍屬極度安全範圍，且能提供更細緻的走勢圖。
+- v4.9.1: 3分鐘自動更新。
+- v4.9.2: 修正交易時段判斷邏輯。
+  1. 【週末識別】在自動更新判斷中加入「星期幾」的檢查。
+  2. 週六、週日即使在 09:00~13:30 開啟程式，也不會觸發自動更新。
+  3. 非交易時段顯示黃色警示，避免誤以為程式在運作。
 """
 
 # ==========================================
@@ -31,9 +32,9 @@ TOP_N = 300
 BREADTH_THRESHOLD = 0.65
 EXCLUDE_PREFIXES = ["00", "91"]
 HISTORY_FILE = "breadth_history.csv"
-AUTO_REFRESH_SECONDS = 180 # <--- 修改為 3 分鐘
+AUTO_REFRESH_SECONDS = 180 # 3分鐘
 
-st.set_page_config(page_title="盤中權證進場判斷 (3分K)", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (v4.9.2)", layout="wide")
 
 # ==========================================
 # 永豐 API 初始化
@@ -196,7 +197,15 @@ def plot_breadth_chart():
 def get_current_status():
     tw_now = datetime.now(timezone(timedelta(hours=8)))
     current_time = tw_now.time()
-    is_intraday = time(8, 45) <= current_time < time(13, 30)
+    
+    # 1. 時間判斷 (08:45 ~ 13:30)
+    valid_time = time(8, 45) <= current_time < time(13, 30)
+    
+    # 2. 星期判斷 (星期一=0 ... 星期日=6)
+    # 只有 0, 1, 2, 3, 4 (週一到週五) 是交易日
+    valid_day = 0 <= tw_now.weekday() <= 4
+    
+    is_intraday = valid_time and valid_day
     return tw_now, is_intraday
 
 def get_trading_days_robust(token):
@@ -213,6 +222,8 @@ def get_trading_days_robust(token):
     tw_now, is_intraday = get_current_status()
     today_str = tw_now.strftime("%Y-%m-%d")
     
+    # 在這裡我們需要一個寬鬆的檢查，只要是平日且時間過 08:45，就嘗試把今天加進去
+    # 這樣才能在盤中時段建立「今天的日期」供後續程式使用
     if 0 <= tw_now.weekday() <= 4 and tw_now.time() >= time(8, 45):
         if not dates or today_str > dates[-1]:
             dates.append(today_str)
@@ -446,13 +457,13 @@ def fetch_data():
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v4.9.1 3分鐘更新)")
+    st.title("📈 盤中權證進場判斷 (v4.9.2 週末修正)")
 
     # 1. 處理自動更新開關
     with st.sidebar:
         st.subheader("設定與狀態")
         
-        # 自動更新開關 (預設為 False，勾選後開啟)
+        # 自動更新開關
         auto_refresh = st.checkbox("啟用自動更新 (每3分鐘)", value=False)
         
         if 'shioaji' in st.secrets:
@@ -508,12 +519,10 @@ def run_streamlit():
         st.error(f"執行出錯: {e}")
         st.code(traceback.format_exc())
 
-    # 4. 處理自動循環邏輯 (放在最後)
+    # 4. 處理自動循環邏輯 (修正後)
     if auto_refresh:
-        # 檢查是否在盤中 (09:00 ~ 13:30)
         tw_now, is_intraday = get_current_status()
         
-        # 若是盤中，執行倒數
         if is_intraday:
             with st.sidebar:
                 st.write("---")
@@ -526,7 +535,8 @@ def run_streamlit():
             st.rerun()
         else:
             with st.sidebar:
-                st.warning("非盤中時段，暫停自動更新")
+                # 這裡改用 warning 提醒非交易時段
+                st.warning("⏸ 目前非盤中時段，自動更新暫停")
 
 if __name__ == "__main__":
     if 'streamlit' in sys.modules:
