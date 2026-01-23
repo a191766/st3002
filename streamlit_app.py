@@ -8,18 +8,18 @@ import traceback
 import sys
 import shioaji as sj
 import os
-import altair as alt  # 引入繪圖套件
+import altair as alt
 
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v4.4.0 (廣度分時走勢版)"
+APP_VERSION = "v4.5.0 (走勢圖優化版)"
 UPDATE_LOG = """
-- v4.3.0: 盤後邏輯驗證。
-- v4.4.0: 新增廣度分時走勢圖。
-  1. 【自動記錄】每次重新整理時，自動將「時間」與「今日廣度」寫入 CSV。
-  2. 【每日重置】跨日自動清空舊紀錄，確保圖表只顯示當天走勢。
-  3. 【趨勢視覺化】新增折線圖，即時監控盤中多空力道變化。
+- v4.4.0: 廣度分時走勢圖。
+- v4.5.0: 優化圖表 X 軸顯示。
+  1. 【鎖定時間軸】強制將走勢圖 X 軸範圍鎖定在 09:00 ~ 14:30。
+  2. 【視覺優化】解決盤後查看時，因時間軸自動延展導致走勢擠在左側的問題。
+  3. 維持自動記錄與每日重置功能。
 """
 
 # ==========================================
@@ -30,9 +30,9 @@ FINMIND_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJkYXRlIjoiMjAyNi0wMS0xNC
 TOP_N = 300              
 BREADTH_THRESHOLD = 0.65
 EXCLUDE_PREFIXES = ["00", "91"]
-HISTORY_FILE = "breadth_history.csv" # 儲存走勢的檔案
+HISTORY_FILE = "breadth_history.csv"
 
-st.set_page_config(page_title="盤中權證進場判斷 (走勢圖)", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (走勢優化)", layout="wide")
 
 # ==========================================
 # 永豐 API 初始化
@@ -114,13 +114,9 @@ def get_cached_stock_history(token, code, start_date):
         return pd.DataFrame()
 
 # ==========================================
-# 廣度記錄與繪圖功能 (新增)
+# 廣度記錄與繪圖 (核心修改處)
 # ==========================================
 def save_breadth_record(current_date, current_time, breadth_value):
-    """
-    將當下的廣度記錄到 CSV。
-    如果發現日期換了 (例如昨天跑過，今天是新的一天)，就自動清空舊資料。
-    """
     new_data = pd.DataFrame([{
         'Date': current_date,
         'Time': current_time,
@@ -131,26 +127,21 @@ def save_breadth_record(current_date, current_time, breadth_value):
         new_data.to_csv(HISTORY_FILE, index=False)
     else:
         try:
-            # 讀取舊資料
             df = pd.read_csv(HISTORY_FILE)
             if not df.empty:
                 last_date = str(df.iloc[-1]['Date'])
-                # 如果日期不同，代表新的一天，覆蓋掉舊檔
                 if last_date != str(current_date):
                     new_data.to_csv(HISTORY_FILE, index=False)
                 else:
-                    # 同一天，檢查是否重複記錄 (避免太頻繁寫入)
                     last_time = str(df.iloc[-1]['Time'])
                     if last_time != str(current_time):
                         new_data.to_csv(HISTORY_FILE, mode='a', header=False, index=False)
             else:
                 new_data.to_csv(HISTORY_FILE, index=False)
         except:
-            # 檔案損毀或其他錯誤，重建
             new_data.to_csv(HISTORY_FILE, index=False)
 
 def plot_breadth_chart():
-    """ 讀取 CSV 並繪製折線圖 """
     if not os.path.exists(HISTORY_FILE):
         return None
     
@@ -158,26 +149,42 @@ def plot_breadth_chart():
         df = pd.read_csv(HISTORY_FILE)
         if df.empty: return None
         
-        # 轉換 Broadth 為百分比小數以便繪圖 (CSV 存的是小數 0.65)
-        # 為了圖表好看，我們轉成 0~100 的整數或保留小數
         df['Breadth_Pct'] = df['Breadth']
         
-        # 建立 Altair 圖表
-        # X軸: Time, Y軸: Breadth (設定範圍 0~1 或適當縮放)
+        # === 關鍵修改：建立完整的 Datetime 欄位 ===
+        # 將 Date 與 Time 合併，讓 Altair 能正確解析時間
+        df['Datetime'] = pd.to_datetime(df['Date'].astype(str) + ' ' + df['Time'].astype(str))
+        
+        # === 關鍵修改：強制設定 X 軸範圍 (09:00 ~ 14:30) ===
+        base_date = df.iloc[0]['Date']
+        start_bound = pd.to_datetime(f"{base_date} 09:00:00")
+        end_bound = pd.to_datetime(f"{base_date} 14:30:00")
+
         chart = alt.Chart(df).mark_line(point=True).encode(
-            x=alt.X('Time', title='時間'),
-            y=alt.Y('Breadth_Pct', title='廣度', scale=alt.Scale(domain=[0, 1]), axis=alt.Axis(format='%')),
-            tooltip=['Time', alt.Tooltip('Breadth_Pct', format='.1%')]
+            x=alt.X('Datetime', 
+                    title='時間', 
+                    axis=alt.Axis(format='%H:%M'), # 只顯示時:分
+                    scale=alt.Scale(domain=[start_bound, end_bound]) # 鎖定範圍
+            ),
+            y=alt.Y('Breadth_Pct', 
+                    title='廣度', 
+                    scale=alt.Scale(domain=[0, 1]), 
+                    axis=alt.Axis(format='%')
+            ),
+            tooltip=[
+                alt.Tooltip('Datetime', title='時間', format='%H:%M:%S'), 
+                alt.Tooltip('Breadth_Pct', title='廣度', format='.1%')
+            ]
         ).properties(
-            title=f"今日廣度走勢 ({df.iloc[0]['Date']})",
+            title=f"今日廣度走勢 ({base_date})",
             height=300
         )
         
-        # 加入 65% 警戒線 (紅線)
         rule = alt.Chart(pd.DataFrame({'y': [BREADTH_THRESHOLD]})).mark_rule(color='red', strokeDash=[5, 5]).encode(y='y')
         
         return chart + rule
-    except:
+    except Exception as e:
+        # st.error(f"Plot Error: {e}") # Debug 用
         return None
 
 # ==========================================
@@ -367,9 +374,8 @@ def fetch_data():
             
     hit_curr, valid_curr, map_curr, last_time = calc_stats_hybrid(sj_api, d_curr_str, curr_rank_codes, use_realtime=True)
     
-    # === 儲存廣度紀錄 ===
+    # 儲存紀錄
     br_curr = hit_curr / valid_curr if valid_curr > 0 else 0
-    # 格式化當下時間 (若有抓到永豐時間就用永豐的，不然用系統時間)
     record_time = last_time if last_time and "無" not in str(last_time) else datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
     save_breadth_record(d_curr_str, record_time, br_curr)
     
@@ -438,7 +444,7 @@ def fetch_data():
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v4.4.0 走勢圖)")
+    st.title("📈 盤中權證進場判斷 (v4.5.0 走勢優化)")
 
     with st.sidebar:
         st.subheader("系統狀態")
@@ -468,7 +474,7 @@ def run_streamlit():
             st.caption(f"昨日基準: {data['d_prev']}")
             st.info(f"ℹ️ {data['rank_source_msg']}") 
             
-            # === 新增：顯示走勢圖 ===
+            # 顯示走勢圖
             chart = plot_breadth_chart()
             if chart:
                 st.altair_chart(chart, use_container_width=True)
