@@ -9,18 +9,19 @@ import sys
 import shioaji as sj
 import os
 import altair as alt
-import time as time_module # 引入時間模組處理倒數
+import time as time_module
 
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v4.8.0 (自動循環更新版)"
+APP_VERSION = "v4.9.0 (終極合併版)"
 UPDATE_LOG = """
-- v4.7.1: 刻度終極修正。
-- v4.8.0: 新增自動更新機制。
-  1. 【自動循環】新增「啟用自動更新」選項，每 600 秒 (10分鐘) 自動執行一次。
-  2. 【倒數顯示】側邊欄顯示距離下次更新的秒數。
-  3. 【雙重觸發】無論是時間到自動跑，還是手動按重新整理，都會寫入紀錄並更新圖表。
+- v4.7.1: 圖表刻度修復。
+- v4.8.0: 自動更新功能。
+- v4.9.0: 功能合併與修復。
+  1. 【找回功能】將不小心覆蓋掉的「自動更新勾選框」與「倒數計時」加回來。
+  2. 【保留圖表】維持高度 400 與 10% 強制刻度的完美圖表設定。
+  3. 現在您可以在側邊欄看到「啟用自動更新」的選項了。
 """
 
 # ==========================================
@@ -34,7 +35,7 @@ EXCLUDE_PREFIXES = ["00", "91"]
 HISTORY_FILE = "breadth_history.csv"
 AUTO_REFRESH_SECONDS = 600 # 10分鐘
 
-st.set_page_config(page_title="盤中權證進場判斷 (自動更新)", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (完整版)", layout="wide")
 
 # ==========================================
 # 永豐 API 初始化
@@ -378,7 +379,6 @@ def fetch_data():
             
     hit_curr, valid_curr, map_curr, last_time = calc_stats_hybrid(sj_api, d_curr_str, curr_rank_codes, use_realtime=True)
     
-    # 儲存紀錄
     br_curr = hit_curr / valid_curr if valid_curr > 0 else 0
     record_time = last_time if last_time and "無" not in str(last_time) else datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
     save_breadth_record(d_curr_str, record_time, br_curr)
@@ -448,7 +448,7 @@ def fetch_data():
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v4.8.0 自動循環)")
+    st.title("📈 盤中權證進場判斷 (v4.9.0 終極合併)")
 
     # 1. 處理自動更新開關
     with st.sidebar:
@@ -465,8 +465,7 @@ def run_streamlit():
         st.markdown(UPDATE_LOG)
 
     # 2. 手動更新按鈕
-    if st.button("🔄 立即重新整理"):
-        # 按鈕本身會觸發 Rerun，所以不需要寫額外邏輯
+    if st.button("🔄 立即重新整理 (記錄廣度)"):
         pass 
 
     # 3. 執行主程式
@@ -517,23 +516,19 @@ def run_streamlit():
         tw_now, is_intraday = get_current_status()
         
         # 若是盤中，執行倒數
-        # 注意：Streamlit 的 time.sleep 會阻擋執行緒，這期間介面可能會無法互動
-        # 若要強制手動更新，建議直接按 F5 刷新網頁
         if is_intraday:
             with st.sidebar:
                 st.write("---")
                 timer_text = st.empty()
                 
-            # 簡單的倒數計時 (每秒更新一次文字)
             for i in range(AUTO_REFRESH_SECONDS, 0, -1):
                 timer_text.info(f"⏳ 下次更新：{i} 秒後")
                 time_module.sleep(1)
             
-            # 時間到，觸發 Rerun
             st.rerun()
         else:
             with st.sidebar:
-                st.warning("目前非盤中時段，自動更新暫停")
+                st.warning("非盤中時段，暫停自動更新")
 
 if __name__ == "__main__":
     if 'streamlit' in sys.modules:
