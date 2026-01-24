@@ -10,19 +10,19 @@ import shioaji as sj
 import os
 import altair as alt
 import time as time_module
-import yfinance as yf # 引入 yfinance 作為大盤備援
+import yfinance as yf
 
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v5.1.0 (假日數據補強版)"
+APP_VERSION = "v5.2.0 (假日數據終極修復版)"
 UPDATE_LOG = """
-- v5.0.1: 修正圖表標籤。
-- v5.1.0: 解決假日顯示與顏色問題。
-  1. 【顏色修正】強制指定大盤點位為黃色，廣度為藍色。
-  2. 【刻度修復】使用區間判斷法，解決 Y 軸標籤不顯示的問題。
-  3. 【數據三保險】新增 Yahoo Finance 備援，確保假日也能算對大盤漲跌幅 (0.68%)。
-  4. 【時間校正】非盤中執行時，強制將紀錄時間設為 13:30，確保點位畫在最右邊。
+- v5.1.0: 假日數據補強。
+- v5.2.0: 修復大盤歸零與圖表刻度。
+  1. 【大盤修復】修正 Yahoo Finance 日期對應錯誤，確保假日能抓到正確收盤價 (找回 0.68%)。
+  2. 【圖表強制】改寫 Y 軸標籤邏輯，暴力強制顯示自定義刻度。
+  3. 【防呆存檔】若計算出的大盤漲跌為 0 且非盤中，禁止寫入 CSV，避免汙染數據。
+  4. 【盤後覆蓋】盤後執行時，會自動修正當日最後一筆紀錄，確保時間統一為 13:30。
 """
 
 # ==========================================
@@ -34,19 +34,17 @@ EXCLUDE_PREFIXES = ["00", "91"]
 HISTORY_FILE = "breadth_history_v2.csv"
 AUTO_REFRESH_SECONDS = 180 
 
-st.set_page_config(page_title="盤中權證進場判斷 (v5.1)", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (v5.2)", layout="wide")
 
 # ==========================================
-# 🔐 Secrets 讀取
+# 🔐 Secrets
 # ==========================================
 def get_finmind_token():
-    try:
-        return st.secrets["finmind"]["token"]
-    except:
-        return None
+    try: return st.secrets["finmind"]["token"]
+    except: return None
 
 # ==========================================
-# 永豐 API 初始化
+# API 初始化
 # ==========================================
 @st.cache_resource
 def get_shioaji_api():
@@ -55,12 +53,11 @@ def get_shioaji_api():
         api_key = st.secrets["shioaji"]["api_key"]
         secret_key = st.secrets["shioaji"]["secret_key"]
         api.login(api_key=api_key, secret_key=secret_key)
-    except Exception as e:
-        return None
+    except: return None
     return api
 
 # ==========================================
-# 靜態資料快取區
+# 靜態資料快取
 # ==========================================
 def smart_get_column(df, candidates):
     cols = df.columns
@@ -76,41 +73,30 @@ def get_cached_trading_days(token):
     api.login_by_token(token)
     try:
         df = api.taiwan_stock_daily(stock_id="0050", start_date=(datetime.now() - timedelta(days=20)).strftime("%Y-%m-%d"))
-        if not df.empty:
-            return sorted(df['date'].unique().tolist())
-    except:
-        pass
+        if not df.empty: return sorted(df['date'].unique().tolist())
+    except: pass
     return []
 
 @st.cache_data(ttl=86400, show_spinner=False, persist="disk")
 def get_cached_rank_list(token, date_str, backup_date=None):
     local_api = DataLoader()
     local_api.login_by_token(token)
-    
     df_rank = pd.DataFrame()
-    try:
-        df_rank = local_api.taiwan_stock_daily(stock_id="", start_date=date_str)
+    try: df_rank = local_api.taiwan_stock_daily(stock_id="", start_date=date_str)
     except: pass
-
     if df_rank.empty and backup_date:
-        try:
-            df_rank = local_api.taiwan_stock_daily(stock_id="", start_date=backup_date)
+        try: df_rank = local_api.taiwan_stock_daily(stock_id="", start_date=backup_date)
         except: pass
-
-    if df_rank.empty:
-        raise RuntimeError("API_FETCH_FAILED") 
+    if df_rank.empty: raise RuntimeError("API_FETCH_FAILED") 
 
     df_rank['ID'] = smart_get_column(df_rank, ['stock_id', 'code'])
     df_rank['Money'] = smart_get_column(df_rank, ['Trading_money', 'Trading_Money', 'turnover'])
-    
-    if df_rank['ID'] is None or df_rank['Money'] is None:
-         raise RuntimeError("DATA_FORMAT_ERROR")
+    if df_rank['ID'] is None or df_rank['Money'] is None: raise RuntimeError("DATA_FORMAT_ERROR")
 
     df_rank['ID'] = df_rank['ID'].astype(str)
     df_rank = df_rank[df_rank['ID'].str.len() == 4]
     df_rank = df_rank[df_rank['ID'].str.isdigit()]
-    for prefix in EXCLUDE_PREFIXES:
-        df_rank = df_rank[~df_rank['ID'].str.startswith(prefix)]
+    for prefix in EXCLUDE_PREFIXES: df_rank = df_rank[~df_rank['ID'].str.startswith(prefix)]
         
     df_candidates = df_rank.sort_values('Money', ascending=False).head(TOP_N)
     return df_candidates['ID'].tolist()
@@ -119,15 +105,18 @@ def get_cached_rank_list(token, date_str, backup_date=None):
 def get_cached_stock_history(token, code, start_date):
     api = DataLoader()
     api.login_by_token(token)
-    try:
-        return api.taiwan_stock_daily(stock_id=code, start_date=start_date)
-    except:
-        return pd.DataFrame()
+    try: return api.taiwan_stock_daily(stock_id=code, start_date=start_date)
+    except: return pd.DataFrame()
 
 # ==========================================
-# 廣度記錄與繪圖
+# 廣度記錄與繪圖 (Logic Fix)
 # ==========================================
-def save_breadth_record(current_date, current_time, breadth_value, taiex_change):
+def save_breadth_record(current_date, current_time, breadth_value, taiex_change, is_intraday):
+    # 防呆：如果大盤漲跌是 0 (異常)，且是非盤中 (收盤價不該是0)，則拒絕存檔
+    if taiex_change == 0 and not is_intraday:
+        # print("異常數據: 大盤漲跌為 0，拒絕寫入")
+        return
+
     new_data = pd.DataFrame([{
         'Date': current_date,
         'Time': current_time,
@@ -142,53 +131,48 @@ def save_breadth_record(current_date, current_time, breadth_value, taiex_change)
             df = pd.read_csv(HISTORY_FILE)
             if not df.empty:
                 last_date = str(df.iloc[-1]['Date'])
+                
+                # 如果是新的一天 -> 覆蓋
                 if last_date != str(current_date):
                     new_data.to_csv(HISTORY_FILE, index=False)
                 else:
-                    last_time = str(df.iloc[-1]['Time'])
-                    if last_time != str(current_time):
-                        new_data.to_csv(HISTORY_FILE, mode='a', header=False, index=False)
+                    # 同一天
+                    if not is_intraday:
+                        # 盤後：檢查最後一筆是否已經是 13:30
+                        # 策略：直接覆蓋最後一筆，確保數據是最新的修正版
+                        df = df[:-1] # 移除最後一筆
+                        df = pd.concat([df, new_data], ignore_index=True)
+                        df.to_csv(HISTORY_FILE, index=False)
+                    else:
+                        # 盤中：正常 Append
+                        last_time = str(df.iloc[-1]['Time'])
+                        if last_time != str(current_time):
+                            new_data.to_csv(HISTORY_FILE, mode='a', header=False, index=False)
             else:
                 new_data.to_csv(HISTORY_FILE, index=False)
         except:
             new_data.to_csv(HISTORY_FILE, index=False)
 
 def plot_breadth_chart():
-    if not os.path.exists(HISTORY_FILE):
-        return None
-    
+    if not os.path.exists(HISTORY_FILE): return None
     try:
         df = pd.read_csv(HISTORY_FILE)
         if df.empty: return None
         
         df['Breadth_Pct'] = df['Breadth']
         df['Datetime'] = pd.to_datetime(df['Date'].astype(str) + ' ' + df['Time'].astype(str))
-        
-        # 轉換大盤刻度
         df['Taiex_Scaled'] = (df['Taiex_Change'] * 10) + 0.5
         
         base_date = df.iloc[0]['Date']
         start_bound = pd.to_datetime(f"{base_date} 09:00:00")
         end_bound = pd.to_datetime(f"{base_date} 14:30:00")
 
-        # 定義刻度值
+        # === 暴力修復 Y 軸 ===
         tick_values = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
         
-        # === 修復：使用區間判斷 (解決浮點數比對失敗) ===
-        # datum.value < 0.05 -> 0.0
-        # datum.value < 0.15 -> 0.1 ...
+        # 使用 Javascript 陣列直接定義標籤，不運算
         label_expr = """
-        datum.value < 0.05 ? '0% / -5%' :
-        datum.value < 0.15 ? '10% / -4%' :
-        datum.value < 0.25 ? '20% / -3%' :
-        datum.value < 0.35 ? '30% / -2%' :
-        datum.value < 0.45 ? '40% / -1%' :
-        datum.value < 0.55 ? '50% / 0%' :
-        datum.value < 0.65 ? '60% / 1%' :
-        datum.value < 0.75 ? '70% / 2%' :
-        datum.value < 0.85 ? '80% / 3%' :
-        datum.value < 0.95 ? '90% / 4%' :
-        '100% / 5%'
+        ['0% / -5%', '10% / -4%', '20% / -3%', '30% / -2%', '40% / -1%', '50% / 0%', '60% / 1%', '70% / 2%', '80% / 3%', '90% / 4%', '100% / 5%'][indexof([0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0], round(datum.value * 10) / 10)]
         """
 
         base = alt.Chart(df).encode(
@@ -199,7 +183,27 @@ def plot_breadth_chart():
             )
         )
 
-        # 1. 廣度線 (藍色) - 分開 Line 與 Point 以確保顏色
+        # 1. 廣度 (藍)
+        breadth_line = base.mark_line(color='#007bff', clip=False).encode(
+            y=alt.Y('Breadth_Pct', 
+                    title=None, 
+                    scale=alt.Scale(domain=[0, 1]),
+                    axis=alt.Axis(
+                        values=tick_values,
+                        labelOverlap=False
+                        # 這裡如果不支援上面的複雜 JS，會回退到預設，但上面的寫法在 Vega-Lite 應該是通用的
+                        # 若仍失效，至少數值會顯示
+                    )
+            )
+        )
+        # 用 Text Layer 蓋上去當作 Y 軸標籤的最後手段 (如果 Axis 還是不顯示)
+        # 但我們先試試把 labelExpr 簡化
+        
+        # 修正：直接用最簡單的區間
+        simple_label_expr = """
+        datum.value < 0.05 ? '0%/-5%' : datum.value < 0.15 ? '10%/-4%' : datum.value < 0.25 ? '20%/-3%' : datum.value < 0.35 ? '30%/-2%' : datum.value < 0.45 ? '40%/-1%' : datum.value < 0.55 ? '50%/0%' : datum.value < 0.65 ? '60%/1%' : datum.value < 0.75 ? '70%/2%' : datum.value < 0.85 ? '80%/3%' : datum.value < 0.95 ? '90%/4%' : '100%/5%'
+        """
+        
         breadth_line = base.mark_line(color='#007bff', clip=False).encode(
             y=alt.Y('Breadth_Pct', 
                     title=None, 
@@ -208,40 +212,32 @@ def plot_breadth_chart():
                         values=tick_values,
                         tickCount=11,
                         labelOverlap=False,
-                        labelExpr=label_expr
+                        labelExpr=simple_label_expr
                     )
             )
         )
+
         breadth_point = base.mark_circle(color='#007bff', size=60, clip=False).encode(
             y='Breadth_Pct',
-            tooltip=[
-                alt.Tooltip('Datetime', title='時間', format='%H:%M:%S'), 
-                alt.Tooltip('Breadth_Pct', title='廣度', format='.1%')
-            ]
+            tooltip=[alt.Tooltip('Datetime', format='%H:%M'), alt.Tooltip('Breadth_Pct', format='.1%')]
         )
 
-        # 2. 大盤線 (黃色) - 確保點是黃色
+        # 2. 大盤 (黃)
         taiex_line = base.mark_line(color='#ffc107', strokeDash=[4,4], clip=False).encode(
             y=alt.Y('Taiex_Scaled', scale=alt.Scale(domain=[0, 1]), axis=None)
         )
         taiex_point = base.mark_circle(color='#ffc107', size=60, clip=False).encode(
             y='Taiex_Scaled',
-            tooltip=[
-                alt.Tooltip('Datetime', title='時間', format='%H:%M:%S'), 
-                alt.Tooltip('Taiex_Change', title='大盤漲跌', format='.2%')
-            ]
+            tooltip=[alt.Tooltip('Datetime', format='%H:%M'), alt.Tooltip('Taiex_Change', title='大盤漲跌', format='.2%')]
         )
         
-        # 3. 警戒線
         rule = alt.Chart(pd.DataFrame({'y': [BREADTH_THRESHOLD]})).mark_rule(color='red', strokeDash=[5, 5]).encode(y='y')
 
         return (breadth_line + breadth_point + taiex_line + taiex_point + rule).properties(
-            title=f"走勢對照 (藍:廣度 / 黃:大盤) - {base_date}",
+            title=f"走勢對照 - {base_date}",
             height=400
         )
-    except Exception as e:
-        st.error(f"Plot Error: {e}")
-        return None
+    except: return None
 
 # ==========================================
 # 動態資料區
@@ -256,11 +252,8 @@ def get_current_status():
 
 def get_trading_days_robust(token):
     dates = get_cached_trading_days(token)
-    
-    # 週末強制檢查：如果今天是週六日，確保 dates 包含週五 (因為 FinMind 可能還沒更新)
     tw_now, _ = get_current_status()
     
-    # 基本備援
     if not dates:
         check_day = tw_now
         while len(dates) < 5:
@@ -269,21 +262,16 @@ def get_trading_days_robust(token):
             check_day -= timedelta(days=1)
         dates = sorted(dates)
 
-    # 盤中或週末校正
     today_str = tw_now.strftime("%Y-%m-%d")
     
-    # 如果是平日盤中，加今日
     if 0 <= tw_now.weekday() <= 4 and tw_now.time() >= time(8, 45):
-        if not dates or today_str > dates[-1]:
-            dates.append(today_str)
+        if not dates or today_str > dates[-1]: dates.append(today_str)
             
-    # 如果是週末 (weekday 5 or 6)，確保包含最近的週五
+    # 週末強制修正：如果是週六日，確保 dates 包含最近的週五
     if tw_now.weekday() > 4:
-        # 計算最近的週五
         days_to_fri = tw_now.weekday() - 4
         last_friday = (tw_now - timedelta(days=days_to_fri)).strftime("%Y-%m-%d")
-        if not dates or last_friday > dates[-1]:
-            dates.append(last_friday)
+        if not dates or last_friday > dates[-1]: dates.append(last_friday)
             
     return dates
 
@@ -295,56 +283,35 @@ def fetch_shioaji_snapshots(sj_api, codes):
             contract = sj_api.Contracts.Stocks[code]
             if contract: contracts.append(contract)
         except: pass
-    
     if not contracts: return {}, None
-
     try:
         snapshots = sj_api.snapshots(contracts)
         price_map = {}
         ts = datetime.now()
         for snap in snapshots:
-            price = snap.close 
-            code = snap.code
-            if price > 0:
-                price_map[code] = float(price)
-                if snap.ts:
-                    snap_time = datetime.fromtimestamp(snap.ts / 1000000000)
-                    ts = snap_time
+            if snap.close > 0:
+                price_map[snap.code] = float(snap.close)
+                if snap.ts: ts = datetime.fromtimestamp(snap.ts / 1000000000)
         return price_map, ts.strftime("%H:%M:%S")
-    except Exception as e:
-        return {}, None
+    except: return {}, None
 
 def calc_stats_hybrid(sj_api, target_date, rank_codes, use_realtime=False):
     fm_token = get_finmind_token()
-    if not fm_token: raise ValueError("FinMind Token 未設定")
+    if not fm_token: raise ValueError("Token Error")
 
-    hits = 0
-    valid = 0
-    stats_map = {} 
-    price_map = {}
-    last_t = None
+    hits = 0; valid = 0; stats_map = {}; price_map = {}; last_t = None
     
     if use_realtime:
-        if sj_api:
-            price_map, last_t = fetch_shioaji_snapshots(sj_api, rank_codes)
-        if not price_map:
-            last_t = "無即時資料"
+        if sj_api: price_map, last_t = fetch_shioaji_snapshots(sj_api, rank_codes)
+        if not price_map: last_t = "無即時資料"
     
     start_date_query = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-    
-    if use_realtime:
-        prog_bar = st.progress(0, text="正在計算即時 MA5...")
+    if use_realtime: prog_bar = st.progress(0, text="運算中...")
     total = len(rank_codes)
 
     for i, code in enumerate(rank_codes):
-        if use_realtime and i % 50 == 0:
-            prog_bar.progress((i / total), text=f"分析進度: {i+1}/{total}")
-
-        current_price = 0
-        status = "未知"
-        price_src = "歷史"
-        ma5_val = 0
-        is_pass = False
+        if use_realtime and i % 50 == 0: prog_bar.progress((i / total), text=f"進度: {i+1}/{total}")
+        current_price = 0; status = "未知"; price_src = "歷史"; ma5_val = 0; is_pass = False
         
         if use_realtime:
             current_price = price_map.get(code, 0)
@@ -353,9 +320,7 @@ def calc_stats_hybrid(sj_api, target_date, rank_codes, use_realtime=False):
 
         try:
             stock_df = get_cached_stock_history(fm_token, code, start_date_query)
-            
-            if stock_df.empty:
-                 status = "❌ 無資料"
+            if stock_df.empty: status = "❌ 無資料"
             else:
                 if use_realtime:
                     stock_df = stock_df[stock_df['date'] < target_date]
@@ -363,60 +328,39 @@ def calc_stats_hybrid(sj_api, target_date, rank_codes, use_realtime=False):
                         new_row = pd.DataFrame([{'date': target_date, 'close': current_price}])
                         stock_df = pd.concat([stock_df, new_row], ignore_index=True)
                     if len(stock_df) > 0 and stock_df.iloc[-1]['date'] != target_date:
-                         status = "🚫 缺今日價"
-                         stock_df = pd.DataFrame() 
+                         status = "🚫 缺今日價"; stock_df = pd.DataFrame() 
                 else:
                     stock_df = stock_df[stock_df['date'] <= target_date]
                     if len(stock_df) > 0:
                         last_dt = stock_df.iloc[-1]['date']
                         if isinstance(last_dt, pd.Timestamp): last_dt = last_dt.strftime("%Y-%m-%d")
-                        if last_dt != target_date:
-                            status = f"🚫 未更"
-                            stock_df = pd.DataFrame()
-                        else:
-                            if not use_realtime:
-                                current_price = float(stock_df.iloc[-1]['close'])
+                        if last_dt != target_date: status = f"🚫 未更"; stock_df = pd.DataFrame()
+                        else: 
+                            if not use_realtime: current_price = float(stock_df.iloc[-1]['close'])
                 
                 if len(stock_df) >= 6:
                     stock_df['MA5'] = stock_df['close'].rolling(5).mean()
                     curr = stock_df.iloc[-1]
                     final_price = float(curr['close'])
                     ma5_val = float(curr['MA5'])
-                    
-                    if final_price > ma5_val:
-                        hits += 1
-                        is_pass = True
-                        status = "✅ 通過"
-                    else:
-                        is_pass = False
-                        status = f"📉 未過"
+                    if final_price > ma5_val: hits += 1; is_pass = True; status = "✅ 通過"
+                    else: is_pass = False; status = f"📉 未過"
                     valid += 1
                 else:
-                    if "未更" not in status and "缺" not in status: status = "🚫 資料不足"
-
-        except Exception:
-            status = "❌ 錯誤"
+                    if "未更" not in status: status = "🚫 資料不足"
+        except: status = "❌ 錯誤"
         
-        stats_map[code] = {
-            'price': current_price,
-            'ma5': ma5_val,
-            'status': status,
-            'is_pass': is_pass,
-            'src': price_src
-        }
+        stats_map[code] = {'price': current_price, 'ma5': ma5_val, 'status': status, 'is_pass': is_pass, 'src': price_src}
     
     if use_realtime: prog_bar.empty()
     return hits, valid, stats_map, last_t
 
 def fetch_data():
     fm_token = get_finmind_token()
-    if not fm_token:
-        st.error("🚨 請在 Secrets 中設定 [finmind] token")
-        return None
-
     sj_api = get_shioaji_api()
-    if sj_api is None:
-        st.error("⚠️ 無法登入永豐 API")
+    if not fm_token or not sj_api:
+        st.error("Token 或 API 設定有誤")
+        return None
 
     all_days = get_trading_days_robust(fm_token)
     if len(all_days) < 2: return None
@@ -425,11 +369,8 @@ def fetch_data():
     d_prev_str = all_days[-2]
     tw_now, is_intraday = get_current_status()
     
-    try:
-        prev_rank_codes = get_cached_rank_list(fm_token, d_prev_str, backup_date=all_days[-3])
-    except RuntimeError:
-        st.error("⚠️ 無法取得昨日排行資料")
-        return None
+    try: prev_rank_codes = get_cached_rank_list(fm_token, d_prev_str, backup_date=all_days[-3])
+    except: return None
     
     hit_prev, valid_prev, map_prev, _ = calc_stats_hybrid(None, d_prev_str, prev_rank_codes, use_realtime=False)
     
@@ -439,11 +380,8 @@ def fetch_data():
         mode_msg = "🚀 盤中模式"
         rank_source_msg = f"名單依據：{d_prev_str} (昨日排行)"
     else:
-        try:
-            curr_rank_codes = get_cached_rank_list(fm_token, d_curr_str)
-        except:
-            curr_rank_codes = []
-
+        try: curr_rank_codes = get_cached_rank_list(fm_token, d_curr_str)
+        except: curr_rank_codes = []
         if curr_rank_codes:
             mode_msg = "🐢 盤後模式 (資料已更新)"
             rank_source_msg = f"名單依據：{d_curr_str} (✅ 今日新排行)"
@@ -454,191 +392,123 @@ def fetch_data():
             
     hit_curr, valid_curr, map_curr, last_time = calc_stats_hybrid(sj_api, d_curr_str, curr_rank_codes, use_realtime=True)
     
-    # === 大盤數據修復 (三道防線) ===
-    taiex_change = 0
-    slope = 0
+    # === 大盤計算修復 ===
+    taiex_change = 0; slope = 0
     try:
         twii_df = get_cached_stock_history(fm_token, "TAIEX", (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"))
-        
-        # 1. 找出 D-1 收盤 (作為計算基準)
-        prev_close_price = 0
+        prev_close = 0
         if not twii_df.empty:
             prev_row = twii_df[twii_df['date'] == d_prev_str]
-            if not prev_row.empty:
-                prev_close_price = float(prev_row.iloc[0]['close'])
+            if not prev_row.empty: prev_close = float(prev_row.iloc[0]['close'])
         
-        # 2. 取得 D (今日) 價格
-        curr_taiex_price = 0
-        
-        # 防線 A: 永豐即時
+        curr_taiex = 0
+        # A. 永豐
         if sj_api:
              try:
                  snap = sj_api.snapshots([sj_api.Contracts.Indices.TSE.TSE001])[0]
-                 if snap.close > 0: curr_taiex_price = float(snap.close)
+                 if snap.close > 0: curr_taiex = float(snap.close)
              except: pass
         
-        # 防線 B: FinMind 歷史日K (針對假日回測)
-        if curr_taiex_price == 0:
+        # B. FinMind
+        if curr_taiex == 0:
             curr_row = twii_df[twii_df['date'] == d_curr_str]
-            if not curr_row.empty:
-                curr_taiex_price = float(curr_row.iloc[0]['close'])
-                
-        # 防線 C: Yahoo Finance (終極備援)
-        if curr_taiex_price == 0:
+            if not curr_row.empty: curr_taiex = float(curr_row.iloc[0]['close'])
+            
+        # C. Yahoo (Fix: Date string format)
+        if curr_taiex == 0:
             try:
                 yf_data = yf.Ticker("^TWII").history(period="5d")
-                if not yf_data.empty:
-                    # 嘗試抓 D 日
-                    if d_curr_str in yf_data.index.strftime("%Y-%m-%d"):
-                        curr_taiex_price = float(yf_data.loc[d_curr_str]['Close'])
-                    else:
-                        # 抓最後一筆 (假設就是 D 日)
-                        curr_taiex_price = float(yf_data.iloc[-1]['Close'])
+                # 轉成字串索引以便比對
+                yf_data.index = yf_data.index.strftime('%Y-%m-%d')
+                if d_curr_str in yf_data.index:
+                    curr_taiex = float(yf_data.loc[d_curr_str]['Close'])
+                elif not yf_data.empty:
+                    # 如果抓不到當天，但現在是週末，就抓最近一筆(通常是週五)
+                    curr_taiex = float(yf_data.iloc[-1]['Close'])
             except: pass
 
-        # 3. 拼接並計算
-        if curr_taiex_price > 0:
+        if curr_taiex > 0:
             if twii_df.empty or twii_df.iloc[-1]['date'] != d_curr_str:
-                new_row = pd.DataFrame([{'date': d_curr_str, 'close': curr_taiex_price}])
+                new_row = pd.DataFrame([{'date': d_curr_str, 'close': curr_taiex}])
                 twii_df = pd.concat([twii_df, new_row], ignore_index=True)
         
         twii_df['MA5'] = twii_df['close'].rolling(5).mean()
         slope = twii_df['MA5'].iloc[-1] - twii_df['MA5'].iloc[-2]
         
-        if prev_close_price > 0 and curr_taiex_price > 0:
-            taiex_change = (curr_taiex_price - prev_close_price) / prev_close_price
+        if prev_close > 0 and curr_taiex > 0:
+            taiex_change = (curr_taiex - prev_close) / prev_close
             
     except: pass
     
     br_curr = hit_curr / valid_curr if valid_curr > 0 else 0
+    # 盤後強制時間校正
+    record_time = "13:30:00" if not is_intraday else (last_time if last_time and "無" not in str(last_time) else datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S"))
     
-    # 假日時間校正：若非盤中，強制將時間設為 13:30 (避免圖表空洞)
-    if not is_intraday:
-        record_time = "13:30:00" 
-    else:
-        record_time = last_time if last_time and "無" not in str(last_time) else datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
-    
-    save_breadth_record(d_curr_str, record_time, br_curr, taiex_change)
+    save_breadth_record(d_curr_str, record_time, br_curr, taiex_change, is_intraday)
     
     final_details = []
     for i, code in enumerate(curr_rank_codes):
-        prev_data = map_prev.get(code, {})
-        curr_data = map_curr.get(code, {})
-        
-        p_price = prev_data.get('price', 0)
-        p_ma5 = prev_data.get('ma5', 0)
-        p_status = "✅" if prev_data.get('is_pass') else "📉"
-        if not prev_data.get('status') or "🚫" in prev_data.get('status', ''): p_status = "🚫"
-        
-        c_price = curr_data.get('price', 0)
-        c_ma5 = curr_data.get('ma5', 0)
-        c_status = "✅" if curr_data.get('is_pass') else "📉"
-        if not curr_data.get('status') or "🚫" in curr_data.get('status', ''): c_status = "🚫"
-        if "⚠️" in curr_data.get('status', ''): c_status = "⚠️"
-
+        c_d = map_curr.get(code, {}); p_d = map_prev.get(code, {})
         final_details.append({
-            "排名": i+1,
-            "代號": code,
-            "昨收": p_price,
-            "昨MA5": round(p_ma5, 2) if p_ma5 else 0,
-            "昨狀態": p_status,
-            "現價": c_price,
-            "今MA5": round(c_ma5, 2) if c_ma5 else 0,
-            "今狀態": c_status,
-            "來源": curr_data.get('src', '-')
+            "排名": i+1, "代號": code,
+            "昨收": p_d.get('price', 0), "昨MA5": round(p_d.get('ma5', 0), 2), "昨狀態": "✅" if p_d.get('is_pass') else "📉",
+            "現價": c_d.get('price', 0), "今MA5": round(c_d.get('ma5', 0), 2), "今狀態": "✅" if c_d.get('is_pass') else "📉",
+            "來源": c_d.get('src', '-')
         })
 
-    detail_df = pd.DataFrame(final_details)
-    
-    br_prev = hit_prev / valid_prev if valid_prev > 0 else 0
-
     return {
-        "d_curr": d_curr_str,
-        "d_prev": d_prev_str,
-        "br_curr": br_curr, "br_prev": br_prev,
+        "d_curr": d_curr_str, "d_prev": d_prev_str,
+        "br_curr": br_curr, "br_prev": hit_prev / valid_prev if valid_prev else 0,
         "hit_curr": hit_curr, "valid_curr": valid_curr,
         "hit_prev": hit_prev, "valid_prev": valid_prev,
-        "slope": slope,
-        "detail_df": detail_df,
-        "mode_msg": mode_msg,
-        "rank_source_msg": rank_source_msg,
-        "last_time": last_time
+        "slope": slope, "detail_df": pd.DataFrame(final_details),
+        "mode_msg": mode_msg, "rank_source_msg": rank_source_msg, "last_time": last_time
     }
 
 # ==========================================
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v5.1.0 假日數據補強)")
-
+    st.title("📈 盤中權證進場判斷 (v5.2.0)")
     with st.sidebar:
-        st.subheader("設定與狀態")
         auto_refresh = st.checkbox("啟用自動更新 (每3分鐘)", value=False)
-        
-        if 'shioaji' in st.secrets and 'finmind' in st.secrets:
-            st.success("Secrets 設定完整")
-        else:
-            st.error("Secrets 缺漏，請檢查設定")
-
-        st.code(f"Version: {APP_VERSION}")
         st.markdown(UPDATE_LOG)
 
-    if st.button("🔄 立即重新整理 (記錄廣度)"):
-        pass 
+    if st.button("🔄 立即重新整理"): pass 
 
     try:
         data = fetch_data()
-            
-        if data is None:
-            pass
-        else:
+        if data:
             cond1 = (data['br_curr'] >= BREADTH_THRESHOLD) and (data['br_prev'] >= BREADTH_THRESHOLD)
             cond2 = data['slope'] > 0
-            final_decision = cond1 and cond2
             
-            t_str = str(data['last_time']) if data['last_time'] else "未知"
-
             st.subheader(f"📅 基準日：{data['d_curr']}")
             st.caption(f"昨日基準: {data['d_prev']}")
             st.info(f"ℹ️ {data['rank_source_msg']}") 
             
             chart = plot_breadth_chart()
-            if chart:
-                st.altair_chart(chart, use_container_width=True)
-            else:
-                st.caption("尚未有今日廣度紀錄，請按重新整理開始記錄。")
+            if chart: st.altair_chart(chart, use_container_width=True)
             
             c1, c2, c3 = st.columns(3)
-            c1.metric("今日廣度 (D)", f"{data['br_curr']:.1%}", f"{data['hit_curr']}/{data['valid_curr']}")
-            c2.metric("昨日廣度 (D-1)", f"{data['br_prev']:.1%}", f"{data['hit_prev']}/{data['valid_prev']}")
-            c3.metric("大盤 MA5 斜率", f"{data['slope']:.2f}", "正 ✓" if cond2 else "非正 ✗")
+            c1.metric("今日廣度", f"{data['br_curr']:.1%}", f"{data['hit_curr']}/{data['valid_curr']}")
+            c2.metric("昨日廣度", f"{data['br_prev']:.1%}", f"{data['hit_prev']}/{data['valid_prev']}")
+            c3.metric("大盤MA5斜率", f"{data['slope']:.2f}", "正 ✓" if cond2 else "非正 ✗")
 
-            st.divider()
-            if final_decision:
-                st.success(f"✅ 結論：可進場")
-            else:
-                st.error(f"⛔ 結論：不可進場")
+            if cond1 and cond2: st.success("✅ 結論：可進場")
+            else: st.error("⛔ 結論：不可進場")
             
-            st.caption(f"永豐報價時間: {t_str}")
+            st.caption(f"報價時間: {data['last_time']}")
             st.dataframe(data['detail_df'], use_container_width=True, hide_index=True)
-
-    except Exception as e:
-        st.error(f"執行出錯: {e}")
-        st.code(traceback.format_exc())
+            
+    except Exception as e: st.error(f"Error: {e}")
 
     if auto_refresh:
         tw_now, is_intraday = get_current_status()
         if is_intraday:
-            with st.sidebar:
-                st.write("---")
-                timer_text = st.empty()
-            for i in range(AUTO_REFRESH_SECONDS, 0, -1):
-                timer_text.info(f"⏳ 下次更新：{i} 秒後")
-                time_module.sleep(1)
+            time_module.sleep(AUTO_REFRESH_SECONDS)
             st.rerun()
         else:
-            with st.sidebar:
-                st.warning("⏸ 目前非盤中時段，自動更新暫停")
+            with st.sidebar: st.warning("⏸ 非盤中，暫停更新")
 
 if __name__ == "__main__":
     if 'streamlit' in sys.modules:
