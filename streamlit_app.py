@@ -15,13 +15,13 @@ import yfinance as yf
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v5.5.0 (刻度與時間軸修復版)"
+APP_VERSION = "v5.6.0 (縱軸終極修正版)"
 UPDATE_LOG = """
-- v5.4.0: 數據修復。
-- v5.5.0: 視覺顯示調整。
-  1. 【Y軸修復】改用 tickCount=11 取代強制 values，解決刻度文字消失的問題。
-  2. 【時間軸還原】將收盤時間標記改回 14:30，X 軸範圍延伸至 14:30，符合您的使用習慣。
-  3. 【顯示優化】增大字體與線條寬度，提升手機閱讀體驗。
+- v5.5.0: 視覺調整。
+- v5.6.0: 修復縱軸消失問題。
+  1. 【移除衝突設定】修正了雙線圖層疊加時，axis=None 導致主軸也被隱藏的 Bug。
+  2. 【強制刻度】硬性指定 Y 軸必須顯示 0%, 10%...100% 的刻度值。
+  3. 【維持功能】保留 14:30 時間軸與數據透明化 Tooltip。
 """
 
 # ==========================================
@@ -33,7 +33,7 @@ EXCLUDE_PREFIXES = ["00", "91"]
 HISTORY_FILE = "breadth_history_v3.csv"
 AUTO_REFRESH_SECONDS = 180 
 
-st.set_page_config(page_title="盤中權證進場判斷 (v5.5)", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (v5.6)", layout="wide")
 
 # ==========================================
 # 🔐 Secrets
@@ -161,7 +161,6 @@ def plot_breadth_chart():
         
         base_date = df.iloc[0]['Date']
         start_bound = pd.to_datetime(f"{base_date} 09:00:00")
-        # === 修正點：還原 X 軸終點至 14:30 ===
         end_bound = pd.to_datetime(f"{base_date} 14:30:00")
 
         base = alt.Chart(df).encode(
@@ -172,14 +171,19 @@ def plot_breadth_chart():
             )
         )
 
+        # === 關鍵修改：定義共用的 Y 軸設定 ===
+        # 不要在第二條線使用 axis=None，這會導致衝突
+        tick_values = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+        
+        y_axis_config = alt.Axis(
+            format='%',
+            values=tick_values, # 強制指定刻度
+            title=None
+        )
+
         # 1. 廣度 (藍色)
         line_breadth = base.mark_line(color='#007bff', clip=False).encode(
-            y=alt.Y('Breadth_Pct', 
-                    title=None, 
-                    scale=alt.Scale(domain=[0, 1]),
-                    # === 修正點：使用 tickCount=11 自動產生間隔，不強制指定 values ===
-                    axis=alt.Axis(format='%', tickCount=11) 
-            )
+            y=alt.Y('Breadth_Pct', scale=alt.Scale(domain=[0, 1]), axis=y_axis_config)
         )
         
         point_breadth = base.mark_circle(color='#007bff', size=60, clip=False).encode(
@@ -191,8 +195,9 @@ def plot_breadth_chart():
         )
 
         # 2. 大盤 (黃色)
+        # 注意：這裡不指定 axis，它會自動共用上面的軸設定，不會衝突
         line_taiex = base.mark_line(color='#ffc107', strokeDash=[4,4], clip=False).encode(
-            y=alt.Y('Taiex_Scaled', scale=alt.Scale(domain=[0, 1]), axis=None)
+            y=alt.Y('Taiex_Scaled', scale=alt.Scale(domain=[0, 1])) 
         )
         
         point_taiex = base.mark_circle(color='#ffc107', size=60, clip=False).encode(
@@ -210,9 +215,8 @@ def plot_breadth_chart():
         return (line_breadth + point_breadth + line_taiex + point_taiex + rule).properties(
             title=f"走勢對照 (藍:廣度 / 黃:大盤) - {base_date}",
             height=400
-        ).configure_axis(
-            labelFontSize=12,
-            titleFontSize=14
+        ).resolve_scale(
+            y='shared' # 強制宣告 Y 軸共用
         )
     except: return None
 
@@ -405,7 +409,6 @@ def fetch_data():
     
     br_curr = hit_curr / valid_curr if valid_curr > 0 else 0
     
-    # === 修正點：盤後時間標記為 14:30 ===
     record_time = "14:30:00" if not is_intraday else (last_time if last_time and "無" not in str(last_time) else datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S"))
     
     save_breadth_record(d_curr_str, record_time, br_curr, taiex_change, curr_taiex_price, prev_close_price, is_intraday)
@@ -433,7 +436,7 @@ def fetch_data():
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v5.5.0)")
+    st.title("📈 盤中權證進場判斷 (v5.6.0)")
     with st.sidebar:
         auto_refresh = st.checkbox("啟用自動更新 (每3分鐘)", value=False)
         st.markdown(UPDATE_LOG)
