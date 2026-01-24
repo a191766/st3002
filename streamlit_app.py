@@ -14,13 +14,13 @@ import time as time_module
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v5.0.0 (雙線趨勢視覺化版)"
+APP_VERSION = "v5.0.1 (假日修復版)"
 UPDATE_LOG = """
-- v4.9.3: 資安強化。
-- v5.0.0: 新增與大盤的對照走勢。
-  1. 【雙線圖表】同時繪製「廣度(藍線)」與「大盤漲跌幅(黃線)」。
-  2. 【自定義縱軸】實作特殊的 Y 軸刻度 (例如: 50%/0%)，將兩者規一化顯示。
-  3. 【資料擴充】自動記錄當下的大盤漲跌幅至 CSV。
+- v5.0.0: 雙線趨勢圖。
+- v5.0.1: 修復圖表與數據源問題。
+  1. 【Y軸標籤修復】修正浮點數比對誤差，讓自定義刻度 (如 50%/0%) 能正確顯示。
+  2. 【假日數據補救】當永豐 API 在週末回傳 0 時，自動改用 FinMind 歷史收盤價計算大盤漲跌。
+  3. 【邊緣顯示】防止 14:30 收盤點位因圖表邊界而被隱藏。
 """
 
 # ==========================================
@@ -29,10 +29,10 @@ UPDATE_LOG = """
 TOP_N = 300              
 BREADTH_THRESHOLD = 0.65
 EXCLUDE_PREFIXES = ["00", "91"]
-HISTORY_FILE = "breadth_history_v2.csv" # 改名以避免讀到舊格式出錯
-AUTO_REFRESH_SECONDS = 180 # 3分鐘
+HISTORY_FILE = "breadth_history_v2.csv"
+AUTO_REFRESH_SECONDS = 180 
 
-st.set_page_config(page_title="盤中權證進場判斷 (雙線版)", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (修復版)", layout="wide")
 
 # ==========================================
 # 🔐 Secrets 讀取
@@ -123,10 +123,9 @@ def get_cached_stock_history(token, code, start_date):
         return pd.DataFrame()
 
 # ==========================================
-# 廣度記錄與繪圖 (核心修改)
+# 廣度記錄與繪圖
 # ==========================================
 def save_breadth_record(current_date, current_time, breadth_value, taiex_change):
-    # 新增 Taiex_Change 欄位
     new_data = pd.DataFrame([{
         'Date': current_date,
         'Time': current_time,
@@ -163,42 +162,42 @@ def plot_breadth_chart():
         df['Breadth_Pct'] = df['Breadth']
         df['Datetime'] = pd.to_datetime(df['Date'].astype(str) + ' ' + df['Time'].astype(str))
         
-        # === 核心轉換邏輯 ===
-        # 廣度 50% = 大盤 0%
-        # 廣度 10% = 大盤 1% (即 1:0.1)
-        # 公式：轉換後的大盤位置(0~1) = (大盤漲跌幅 * 10) + 0.5
-        # 例如: 大盤 0% -> 0.5 (對齊廣度50%)
-        # 例如: 大盤 1% (0.01) -> 0.1 + 0.5 = 0.6 (對齊廣度60%)
+        # 轉換大盤刻度
         df['Taiex_Scaled'] = (df['Taiex_Change'] * 10) + 0.5
         
         base_date = df.iloc[0]['Date']
         start_bound = pd.to_datetime(f"{base_date} 09:00:00")
         end_bound = pd.to_datetime(f"{base_date} 14:30:00")
 
-        # 定義刻度值 0.0 ~ 1.0
-        tick_values = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+        tick_values = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
         
-        # 定義顯示標籤 (Format: "廣度% / 大盤%")
-        # 廣度: x * 100
-        # 大盤: (x - 0.5) / 10 * 100 = (x - 0.5) * 10
-        # 0.0 -> "0% / -5%"
-        # 0.5 -> "50% / 0%"
-        # 1.0 -> "100% / 5%"
-        
-        def format_label(x):
-            b_pct = int(x * 100)
-            t_pct = int((x - 0.5) * 10 * 100) # 轉成整數%
-            return f"{b_pct}% / {t_pct}%"
+        # === 修復點：使用 format() 避免浮點數比對失敗 ===
+        # datum.value 有時是 0.100000001，直接 == 0.1 會 False
+        # 改用 format(datum.value, '.1f') 強制取一位小數做比對
+        label_expr = """
+        format(datum.value, '.1f') == '0.0' ? '0% / -5%' :
+        format(datum.value, '.1f') == '0.1' ? '10% / -4%' :
+        format(datum.value, '.1f') == '0.2' ? '20% / -3%' :
+        format(datum.value, '.1f') == '0.3' ? '30% / -2%' :
+        format(datum.value, '.1f') == '0.4' ? '40% / -1%' :
+        format(datum.value, '.1f') == '0.5' ? '50% / 0%' :
+        format(datum.value, '.1f') == '0.6' ? '60% / 1%' :
+        format(datum.value, '.1f') == '0.7' ? '70% / 2%' :
+        format(datum.value, '.1f') == '0.8' ? '80% / 3%' :
+        format(datum.value, '.1f') == '0.9' ? '90% / 4%' :
+        '100% / 5%'
+        """
 
-        # Altair 無法直接傳入 Python 函式做 label，需用 JS 表達式或 hardcode 列表
-        # 這裡用 hardcode 列表最穩
-        tick_labels = [format_label(x) for x in tick_values]
+        base = alt.Chart(df).encode(
+            x=alt.X('Datetime', 
+                    title='時間', 
+                    axis=alt.Axis(format='%H:%M'), 
+                    scale=alt.Scale(domain=[start_bound, end_bound])
+            )
+        )
 
-        # 基礎 Chart
-        base = alt.Chart(df).encode(x=alt.X('Datetime', title='時間', axis=alt.Axis(format='%H:%M'), scale=alt.Scale(domain=[start_bound, end_bound])))
-
-        # 1. 廣度線 (藍色)
-        line_breadth = base.mark_line(color='#007bff').encode(
+        # 1. 廣度線
+        line_breadth = base.mark_line(color='#007bff', point=True, clip=False).encode(
             y=alt.Y('Breadth_Pct', 
                     title=None, 
                     scale=alt.Scale(domain=[0, 1]),
@@ -206,7 +205,7 @@ def plot_breadth_chart():
                         values=tick_values,
                         tickCount=11,
                         labelOverlap=False,
-                        labelExpr="datum.value == 0.0 ? '0%/-5%' : datum.value == 0.1 ? '10%/-4%' : datum.value == 0.2 ? '20%/-3%' : datum.value == 0.3 ? '30%/-2%' : datum.value == 0.4 ? '40%/-1%' : datum.value == 0.5 ? '50%/0%' : datum.value == 0.6 ? '60%/1%' : datum.value == 0.7 ? '70%/2%' : datum.value == 0.8 ? '80%/3%' : datum.value == 0.9 ? '90%/4%' : '100%/5%'"
+                        labelExpr=label_expr # 使用修復後的表達式
                     )
             ),
             tooltip=[
@@ -215,16 +214,16 @@ def plot_breadth_chart():
             ]
         )
 
-        # 2. 大盤線 (黃色)
-        line_taiex = base.mark_line(color='#ffc107', strokeDash=[2,2]).encode( # 用虛線或實線皆可，這裡用實線區隔
-            y=alt.Y('Taiex_Scaled', scale=alt.Scale(domain=[0, 1]), axis=None), # 共用軸，不顯示軸線
+        # 2. 大盤線
+        line_taiex = base.mark_line(color='#ffc107', strokeDash=[2,2], point=True, clip=False).encode(
+            y=alt.Y('Taiex_Scaled', scale=alt.Scale(domain=[0, 1]), axis=None),
             tooltip=[
                 alt.Tooltip('Datetime', title='時間', format='%H:%M:%S'), 
                 alt.Tooltip('Taiex_Change', title='大盤漲跌', format='.2%')
             ]
         )
         
-        # 3. 廣度 65% 警戒線 (紅虛線)
+        # 3. 警戒線
         rule = alt.Chart(pd.DataFrame({'y': [BREADTH_THRESHOLD]})).mark_rule(color='red', strokeDash=[5, 5]).encode(y='y')
 
         return (line_breadth + line_taiex + rule).properties(
@@ -232,7 +231,6 @@ def plot_breadth_chart():
             height=400
         )
     except Exception as e:
-        # print(e)
         return None
 
 # ==========================================
@@ -432,37 +430,49 @@ def fetch_data():
             
     hit_curr, valid_curr, map_curr, last_time = calc_stats_hybrid(sj_api, d_curr_str, curr_rank_codes, use_realtime=True)
     
-    # === 計算大盤漲跌幅 (新功能) ===
+    # === 大盤數據修復 (週末補救) ===
     taiex_change = 0
     slope = 0
     try:
-        # 取得大盤歷史 (快取)
         twii_df = get_cached_stock_history(fm_token, "TAIEX", (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"))
         
-        # 找出昨日收盤 (d_prev_str)
+        # 1. 找出昨日收盤
         prev_close_price = 0
         if not twii_df.empty:
             prev_row = twii_df[twii_df['date'] == d_prev_str]
             if not prev_row.empty:
                 prev_close_price = float(prev_row.iloc[0]['close'])
         
-        # 取得今日即時大盤價
+        # 2. 取得今日大盤價
+        # 優先用永豐即時，若為0 (假日/盤前)，改抓 FinMind 歷史日K的今日收盤
         curr_taiex_price = 0
+        
+        # A. 嘗試永豐即時
         if sj_api:
              try:
                  snap = sj_api.snapshots([sj_api.Contracts.Indices.TSE.TSE001])[0]
-                 curr_taiex_price = float(snap.close)
-                 # 拼接用於算 slope
-                 if curr_taiex_price > 0:
-                     new_row = pd.DataFrame([{'date': d_curr_str, 'close': curr_taiex_price}])
-                     twii_df = pd.concat([twii_df, new_row], ignore_index=True)
+                 if snap.close > 0:
+                    curr_taiex_price = float(snap.close)
              except: pass
+        
+        # B. 若失敗，嘗試 FinMind 歷史 (針對週六看週五資料的情況)
+        if curr_taiex_price == 0:
+            curr_row = twii_df[twii_df['date'] == d_curr_str]
+            if not curr_row.empty:
+                curr_taiex_price = float(curr_row.iloc[0]['close'])
+        
+        # C. 拼接用於算 slope
+        if curr_taiex_price > 0:
+            # 如果 twii_df 裡還沒這筆資料才拼 (避免重複)
+            if twii_df.empty or twii_df.iloc[-1]['date'] != d_curr_str:
+                new_row = pd.DataFrame([{'date': d_curr_str, 'close': curr_taiex_price}])
+                twii_df = pd.concat([twii_df, new_row], ignore_index=True)
         
         # 計算 Slope
         twii_df['MA5'] = twii_df['close'].rolling(5).mean()
         slope = twii_df['MA5'].iloc[-1] - twii_df['MA5'].iloc[-2]
         
-        # 計算漲跌幅 (用即時價 - 昨日收盤 / 昨日收盤)
+        # 計算漲跌幅
         if prev_close_price > 0 and curr_taiex_price > 0:
             taiex_change = (curr_taiex_price - prev_close_price) / prev_close_price
             
@@ -471,7 +481,6 @@ def fetch_data():
     br_curr = hit_curr / valid_curr if valid_curr > 0 else 0
     record_time = last_time if last_time and "無" not in str(last_time) else datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
     
-    # 存檔 (包含大盤漲跌)
     save_breadth_record(d_curr_str, record_time, br_curr, taiex_change)
     
     final_details = []
@@ -523,7 +532,7 @@ def fetch_data():
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v5.0.0 雙線版)")
+    st.title("📈 盤中權證進場判斷 (v5.0.1 修復版)")
 
     with st.sidebar:
         st.subheader("設定與狀態")
@@ -556,7 +565,6 @@ def run_streamlit():
             st.caption(f"昨日基準: {data['d_prev']}")
             st.info(f"ℹ️ {data['rank_source_msg']}") 
             
-            # 顯示走勢圖
             chart = plot_breadth_chart()
             if chart:
                 st.altair_chart(chart, use_container_width=True)
