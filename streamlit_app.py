@@ -14,28 +14,28 @@ import time as time_module
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v4.9.3 (資安強化版)"
+APP_VERSION = "v5.0.0 (雙線趨勢視覺化版)"
 UPDATE_LOG = """
-- v4.9.2: 週末識別修正。
-- v4.9.3: 資安升級。
-  1. 【移除明文 Token】將 FinMind Token 移至 st.secrets 管理，避免外洩。
-  2. 【安全檢查】啟動時檢查 Secrets 是否設定完整，若缺漏會跳出紅色警示。
-  3. 保留所有自動更新與圖表功能。
+- v4.9.3: 資安強化。
+- v5.0.0: 新增與大盤的對照走勢。
+  1. 【雙線圖表】同時繪製「廣度(藍線)」與「大盤漲跌幅(黃線)」。
+  2. 【自定義縱軸】實作特殊的 Y 軸刻度 (例如: 50%/0%)，將兩者規一化顯示。
+  3. 【資料擴充】自動記錄當下的大盤漲跌幅至 CSV。
 """
 
 # ==========================================
-# 參數設定
+# 參數與 Token
 # ==========================================
 TOP_N = 300              
 BREADTH_THRESHOLD = 0.65
 EXCLUDE_PREFIXES = ["00", "91"]
-HISTORY_FILE = "breadth_history.csv"
+HISTORY_FILE = "breadth_history_v2.csv" # 改名以避免讀到舊格式出錯
 AUTO_REFRESH_SECONDS = 180 # 3分鐘
 
-st.set_page_config(page_title="盤中權證進場判斷 (資安版)", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (雙線版)", layout="wide")
 
 # ==========================================
-# 🔐 Secrets 讀取與驗證 (核心修改)
+# 🔐 Secrets 讀取
 # ==========================================
 def get_finmind_token():
     try:
@@ -123,13 +123,15 @@ def get_cached_stock_history(token, code, start_date):
         return pd.DataFrame()
 
 # ==========================================
-# 廣度記錄與繪圖
+# 廣度記錄與繪圖 (核心修改)
 # ==========================================
-def save_breadth_record(current_date, current_time, breadth_value):
+def save_breadth_record(current_date, current_time, breadth_value, taiex_change):
+    # 新增 Taiex_Change 欄位
     new_data = pd.DataFrame([{
         'Date': current_date,
         'Time': current_time,
-        'Breadth': breadth_value
+        'Breadth': breadth_value,
+        'Taiex_Change': taiex_change
     }])
     
     if not os.path.exists(HISTORY_FILE):
@@ -161,41 +163,76 @@ def plot_breadth_chart():
         df['Breadth_Pct'] = df['Breadth']
         df['Datetime'] = pd.to_datetime(df['Date'].astype(str) + ' ' + df['Time'].astype(str))
         
+        # === 核心轉換邏輯 ===
+        # 廣度 50% = 大盤 0%
+        # 廣度 10% = 大盤 1% (即 1:0.1)
+        # 公式：轉換後的大盤位置(0~1) = (大盤漲跌幅 * 10) + 0.5
+        # 例如: 大盤 0% -> 0.5 (對齊廣度50%)
+        # 例如: 大盤 1% (0.01) -> 0.1 + 0.5 = 0.6 (對齊廣度60%)
+        df['Taiex_Scaled'] = (df['Taiex_Change'] * 10) + 0.5
+        
         base_date = df.iloc[0]['Date']
         start_bound = pd.to_datetime(f"{base_date} 09:00:00")
         end_bound = pd.to_datetime(f"{base_date} 14:30:00")
 
+        # 定義刻度值 0.0 ~ 1.0
         tick_values = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+        
+        # 定義顯示標籤 (Format: "廣度% / 大盤%")
+        # 廣度: x * 100
+        # 大盤: (x - 0.5) / 10 * 100 = (x - 0.5) * 10
+        # 0.0 -> "0% / -5%"
+        # 0.5 -> "50% / 0%"
+        # 1.0 -> "100% / 5%"
+        
+        def format_label(x):
+            b_pct = int(x * 100)
+            t_pct = int((x - 0.5) * 10 * 100) # 轉成整數%
+            return f"{b_pct}% / {t_pct}%"
 
-        chart = alt.Chart(df).mark_line(point=True).encode(
-            x=alt.X('Datetime', 
-                    title='時間', 
-                    axis=alt.Axis(format='%H:%M'), 
-                    scale=alt.Scale(domain=[start_bound, end_bound])
-            ),
+        # Altair 無法直接傳入 Python 函式做 label，需用 JS 表達式或 hardcode 列表
+        # 這裡用 hardcode 列表最穩
+        tick_labels = [format_label(x) for x in tick_values]
+
+        # 基礎 Chart
+        base = alt.Chart(df).encode(x=alt.X('Datetime', title='時間', axis=alt.Axis(format='%H:%M'), scale=alt.Scale(domain=[start_bound, end_bound])))
+
+        # 1. 廣度線 (藍色)
+        line_breadth = base.mark_line(color='#007bff').encode(
             y=alt.Y('Breadth_Pct', 
                     title=None, 
-                    scale=alt.Scale(domain=[0, 1]), 
+                    scale=alt.Scale(domain=[0, 1]),
                     axis=alt.Axis(
-                        format='%',
-                        values=tick_values,    
-                        tickCount=11,          
-                        labelOverlap=False     
+                        values=tick_values,
+                        tickCount=11,
+                        labelOverlap=False,
+                        labelExpr="datum.value == 0.0 ? '0%/-5%' : datum.value == 0.1 ? '10%/-4%' : datum.value == 0.2 ? '20%/-3%' : datum.value == 0.3 ? '30%/-2%' : datum.value == 0.4 ? '40%/-1%' : datum.value == 0.5 ? '50%/0%' : datum.value == 0.6 ? '60%/1%' : datum.value == 0.7 ? '70%/2%' : datum.value == 0.8 ? '80%/3%' : datum.value == 0.9 ? '90%/4%' : '100%/5%'"
                     )
             ),
             tooltip=[
                 alt.Tooltip('Datetime', title='時間', format='%H:%M:%S'), 
                 alt.Tooltip('Breadth_Pct', title='廣度', format='.1%')
             ]
-        ).properties(
-            title=f"今日廣度走勢 ({base_date})",
-            height=400 
+        )
+
+        # 2. 大盤線 (黃色)
+        line_taiex = base.mark_line(color='#ffc107', strokeDash=[2,2]).encode( # 用虛線或實線皆可，這裡用實線區隔
+            y=alt.Y('Taiex_Scaled', scale=alt.Scale(domain=[0, 1]), axis=None), # 共用軸，不顯示軸線
+            tooltip=[
+                alt.Tooltip('Datetime', title='時間', format='%H:%M:%S'), 
+                alt.Tooltip('Taiex_Change', title='大盤漲跌', format='.2%')
+            ]
         )
         
+        # 3. 廣度 65% 警戒線 (紅虛線)
         rule = alt.Chart(pd.DataFrame({'y': [BREADTH_THRESHOLD]})).mark_rule(color='red', strokeDash=[5, 5]).encode(y='y')
-        
-        return chart + rule
+
+        return (line_breadth + line_taiex + rule).properties(
+            title=f"走勢對照 (藍:廣度 / 黃:大盤) - {base_date}",
+            height=400
+        )
     except Exception as e:
+        # print(e)
         return None
 
 # ==========================================
@@ -256,11 +293,8 @@ def fetch_shioaji_snapshots(sj_api, codes):
         return {}, None
 
 def calc_stats_hybrid(sj_api, target_date, rank_codes, use_realtime=False):
-    # 需要在這裡讀取 Token
     fm_token = get_finmind_token()
-    if not fm_token:
-        # 如果 Token 沒設定，這裡會報錯，外層會捕獲
-        raise ValueError("FinMind Token 未設定")
+    if not fm_token: raise ValueError("FinMind Token 未設定")
 
     hits = 0
     valid = 0
@@ -353,16 +387,14 @@ def calc_stats_hybrid(sj_api, target_date, rank_codes, use_realtime=False):
     return hits, valid, stats_map, last_t
 
 def fetch_data():
-    # 1. 檢查 FinMind Token
     fm_token = get_finmind_token()
     if not fm_token:
-        st.error("🚨 請在 Secrets 中設定 [finmind] token，否則無法抓取資料！")
+        st.error("🚨 請在 Secrets 中設定 [finmind] token")
         return None
 
-    # 2. 檢查永豐 API
     sj_api = get_shioaji_api()
     if sj_api is None:
-        st.error("⚠️ 無法登入永豐 API，請檢查 Secrets 設定。")
+        st.error("⚠️ 無法登入永豐 API")
 
     all_days = get_trading_days_robust(fm_token)
     if len(all_days) < 2: return None
@@ -374,7 +406,7 @@ def fetch_data():
     try:
         prev_rank_codes = get_cached_rank_list(fm_token, d_prev_str, backup_date=all_days[-3])
     except RuntimeError:
-        st.error("⚠️ 無法取得昨日排行資料。")
+        st.error("⚠️ 無法取得昨日排行資料")
         return None
     
     hit_prev, valid_prev, map_prev, _ = calc_stats_hybrid(None, d_prev_str, prev_rank_codes, use_realtime=False)
@@ -400,9 +432,47 @@ def fetch_data():
             
     hit_curr, valid_curr, map_curr, last_time = calc_stats_hybrid(sj_api, d_curr_str, curr_rank_codes, use_realtime=True)
     
+    # === 計算大盤漲跌幅 (新功能) ===
+    taiex_change = 0
+    slope = 0
+    try:
+        # 取得大盤歷史 (快取)
+        twii_df = get_cached_stock_history(fm_token, "TAIEX", (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"))
+        
+        # 找出昨日收盤 (d_prev_str)
+        prev_close_price = 0
+        if not twii_df.empty:
+            prev_row = twii_df[twii_df['date'] == d_prev_str]
+            if not prev_row.empty:
+                prev_close_price = float(prev_row.iloc[0]['close'])
+        
+        # 取得今日即時大盤價
+        curr_taiex_price = 0
+        if sj_api:
+             try:
+                 snap = sj_api.snapshots([sj_api.Contracts.Indices.TSE.TSE001])[0]
+                 curr_taiex_price = float(snap.close)
+                 # 拼接用於算 slope
+                 if curr_taiex_price > 0:
+                     new_row = pd.DataFrame([{'date': d_curr_str, 'close': curr_taiex_price}])
+                     twii_df = pd.concat([twii_df, new_row], ignore_index=True)
+             except: pass
+        
+        # 計算 Slope
+        twii_df['MA5'] = twii_df['close'].rolling(5).mean()
+        slope = twii_df['MA5'].iloc[-1] - twii_df['MA5'].iloc[-2]
+        
+        # 計算漲跌幅 (用即時價 - 昨日收盤 / 昨日收盤)
+        if prev_close_price > 0 and curr_taiex_price > 0:
+            taiex_change = (curr_taiex_price - prev_close_price) / prev_close_price
+            
+    except: pass
+    
     br_curr = hit_curr / valid_curr if valid_curr > 0 else 0
     record_time = last_time if last_time and "無" not in str(last_time) else datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
-    save_breadth_record(d_curr_str, record_time, br_curr)
+    
+    # 存檔 (包含大盤漲跌)
+    save_breadth_record(d_curr_str, record_time, br_curr, taiex_change)
     
     final_details = []
     for i, code in enumerate(curr_rank_codes):
@@ -434,22 +504,6 @@ def fetch_data():
 
     detail_df = pd.DataFrame(final_details)
     
-    slope = 0
-    try:
-        twii_df = get_cached_stock_history(fm_token, "TAIEX", (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"))
-        if is_intraday and sj_api:
-             try:
-                 snap = sj_api.snapshots([sj_api.Contracts.Indices.TSE.TSE001])[0]
-                 twii_p = float(snap.close)
-                 if twii_p > 0:
-                     new_row = pd.DataFrame([{'date': d_curr_str, 'close': twii_p}])
-                     twii_df = pd.concat([twii_df, new_row], ignore_index=True)
-             except: pass
-             
-        twii_df['MA5'] = twii_df['close'].rolling(5).mean()
-        slope = twii_df['MA5'].iloc[-1] - twii_df['MA5'].iloc[-2]
-    except: pass
-    
     br_prev = hit_prev / valid_prev if valid_prev > 0 else 0
 
     return {
@@ -469,32 +523,23 @@ def fetch_data():
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v4.9.3 資安版)")
+    st.title("📈 盤中權證進場判斷 (v5.0.0 雙線版)")
 
-    # 1. 處理自動更新開關
     with st.sidebar:
         st.subheader("設定與狀態")
         auto_refresh = st.checkbox("啟用自動更新 (每3分鐘)", value=False)
         
-        # 檢查 Token 狀態
-        if 'shioaji' in st.secrets:
-            st.success("✅ Shioaji Secrets OK")
+        if 'shioaji' in st.secrets and 'finmind' in st.secrets:
+            st.success("Secrets 設定完整")
         else:
-            st.error("❌ 缺少 [shioaji] Secrets")
-            
-        if 'finmind' in st.secrets:
-            st.success("✅ FinMind Secrets OK")
-        else:
-            st.error("❌ 缺少 [finmind] Secrets")
+            st.error("Secrets 缺漏，請檢查設定")
 
         st.code(f"Version: {APP_VERSION}")
         st.markdown(UPDATE_LOG)
 
-    # 2. 手動更新按鈕
     if st.button("🔄 立即重新整理 (記錄廣度)"):
         pass 
 
-    # 3. 執行主程式
     try:
         data = fetch_data()
             
@@ -536,19 +581,15 @@ def run_streamlit():
         st.error(f"執行出錯: {e}")
         st.code(traceback.format_exc())
 
-    # 4. 處理自動循環邏輯
     if auto_refresh:
         tw_now, is_intraday = get_current_status()
-        
         if is_intraday:
             with st.sidebar:
                 st.write("---")
                 timer_text = st.empty()
-                
             for i in range(AUTO_REFRESH_SECONDS, 0, -1):
                 timer_text.info(f"⏳ 下次更新：{i} 秒後")
                 time_module.sleep(1)
-            
             st.rerun()
         else:
             with st.sidebar:
