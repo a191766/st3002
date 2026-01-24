@@ -15,13 +15,13 @@ import yfinance as yf
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v5.3.0 (數據透明化版)"
+APP_VERSION = "v5.4.0 (圖表完美修復版)"
 UPDATE_LOG = """
-- v5.2.0: 假日修復。
-- v5.3.0: 圖表重構與數據驗證。
-  1. 【簡化縱軸】回歸單純顯示廣度 0%~100%，移除易出錯的雙重標籤。
-  2. 【數據透明】大盤 Tooltip 新增「計算現價」與「基準昨收」，方便驗證漲跌幅來源。
-  3. 【防呆補強】當即時價為 0 時，強制使用 Yahoo Finance 的最後收盤價，避免假日歸零。
+- v5.3.0: 數據透明化。
+- v5.4.0: 解決圖表顯示問題。
+  1. 【Y軸修復】移除過度嚴格的標籤限制，確保 0%~100% 刻度正常顯示。
+  2. 【X軸對齊】將圖表時間軸終點改為 13:30，讓收盤點位剛好落在最右側，消除右側空白。
+  3. 【數據維持】保留 Yahoo 備援與正確的 0.68% 大盤計算邏輯。
 """
 
 # ==========================================
@@ -30,10 +30,10 @@ UPDATE_LOG = """
 TOP_N = 300              
 BREADTH_THRESHOLD = 0.65
 EXCLUDE_PREFIXES = ["00", "91"]
-HISTORY_FILE = "breadth_history_v3.csv" # 改名 v3 以更新欄位結構
+HISTORY_FILE = "breadth_history_v3.csv"
 AUTO_REFRESH_SECONDS = 180 
 
-st.set_page_config(page_title="盤中權證進場判斷 (v5.3)", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (v5.4)", layout="wide")
 
 # ==========================================
 # 🔐 Secrets
@@ -108,20 +108,18 @@ def get_cached_stock_history(token, code, start_date):
     except: return pd.DataFrame()
 
 # ==========================================
-# 廣度記錄與繪圖 (新增價格欄位)
+# 廣度記錄與繪圖 (核心修改)
 # ==========================================
 def save_breadth_record(current_date, current_time, breadth_value, taiex_change, taiex_curr, taiex_prev, is_intraday):
-    # 防呆：如果現價是 0，絕對不存
-    if taiex_curr == 0:
-        return
+    if taiex_curr == 0: return # 防呆
 
     new_data = pd.DataFrame([{
         'Date': current_date,
         'Time': current_time,
         'Breadth': breadth_value,
         'Taiex_Change': taiex_change,
-        'Taiex_Current': taiex_curr,    # 新增：紀錄當下價格
-        'Taiex_Prev_Close': taiex_prev  # 新增：紀錄昨收
+        'Taiex_Current': taiex_curr,
+        'Taiex_Prev_Close': taiex_prev
     }])
     
     if not os.path.exists(HISTORY_FILE):
@@ -158,16 +156,16 @@ def plot_breadth_chart():
         df['Breadth_Pct'] = df['Breadth']
         df['Datetime'] = pd.to_datetime(df['Date'].astype(str) + ' ' + df['Time'].astype(str))
         
-        # 換算大盤位置： (漲跌幅% * 10) + 0.5
-        # 0% -> 0.5 (50%)
-        # 1% -> 0.6 (60%)
+        # 換算大盤位置
         df['Taiex_Scaled'] = (df['Taiex_Change'] * 10) + 0.5
         
         base_date = df.iloc[0]['Date']
         start_bound = pd.to_datetime(f"{base_date} 09:00:00")
-        end_bound = pd.to_datetime(f"{base_date} 14:30:00")
+        
+        # === 修正點 1: X 軸結束點改為 13:30 (收盤)，消除右側空白 ===
+        end_bound = pd.to_datetime(f"{base_date} 13:30:00")
 
-        # 簡單明瞭的 10% 刻度
+        # === 修正點 2: Y 軸刻度設定簡化，確保顯示 ===
         tick_values = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
 
         base = alt.Chart(df).encode(
@@ -181,13 +179,12 @@ def plot_breadth_chart():
         # 1. 廣度 (藍色)
         line_breadth = base.mark_line(color='#007bff', clip=False).encode(
             y=alt.Y('Breadth_Pct', 
-                    title=None, # 不顯示標題，只顯示 %
+                    title=None, 
                     scale=alt.Scale(domain=[0, 1]),
                     axis=alt.Axis(
-                        format='%', 
-                        values=tick_values,
-                        tickCount=11,
-                        labelOverlap=False
+                        format='.0%',       # 顯示 0%, 10%...
+                        values=tick_values  # 指定刻度位置
+                        # 移除 labelOverlap 與 tickCount，避免自動隱藏
                     )
             )
         )
@@ -200,7 +197,7 @@ def plot_breadth_chart():
             ]
         )
 
-        # 2. 大盤 (黃色) - Tooltip 增加詳細價格資訊
+        # 2. 大盤 (黃色)
         line_taiex = base.mark_line(color='#ffc107', strokeDash=[4,4], clip=False).encode(
             y=alt.Y('Taiex_Scaled', scale=alt.Scale(domain=[0, 1]), axis=None)
         )
@@ -250,7 +247,6 @@ def get_trading_days_robust(token):
     if 0 <= tw_now.weekday() <= 4 and tw_now.time() >= time(8, 45):
         if not dates or today_str > dates[-1]: dates.append(today_str)
             
-    # 週末補救
     if tw_now.weekday() > 4:
         days_to_fri = tw_now.weekday() - 4
         last_friday = (tw_now - timedelta(days=days_to_fri)).strftime("%Y-%m-%d")
@@ -358,51 +354,43 @@ def fetch_data():
     rank_source_msg = ""
     if is_intraday:
         curr_rank_codes = prev_rank_codes
-        mode_msg = "🚀 盤中"
-        rank_source_msg = f"名單：{d_prev_str} (昨日)"
+        mode_msg = "🚀 盤中模式"
+        rank_source_msg = f"名單依據：{d_prev_str} (昨日排行)"
     else:
         try: curr_rank_codes = get_cached_rank_list(fm_token, d_curr_str)
         except: curr_rank_codes = []
         if curr_rank_codes:
-            mode_msg = "🐢 盤後"
-            rank_source_msg = f"名單：{d_curr_str} (今日)"
+            mode_msg = "🐢 盤後模式 (資料已更新)"
+            rank_source_msg = f"名單依據：{d_curr_str} (✅ 今日新排行)"
         else:
             curr_rank_codes = prev_rank_codes
-            mode_msg = "⚠️ 盤後"
-            rank_source_msg = f"名單：{d_prev_str} (昨日)"
+            mode_msg = "⚠️ 盤後模式 (資料未更新)"
+            rank_source_msg = f"名單依據：{d_prev_str} (⏳ 沿用昨日排行)"
             
     hit_curr, valid_curr, map_curr, last_time = calc_stats_hybrid(sj_api, d_curr_str, curr_rank_codes, use_realtime=True)
     
-    # === 大盤數據修復 (週末強制修正) ===
     taiex_change = 0; slope = 0
     prev_close_price = 0; curr_taiex_price = 0
     
     try:
         twii_df = get_cached_stock_history(fm_token, "TAIEX", (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"))
-        
-        # 1. 找昨收
         if not twii_df.empty:
             prev_row = twii_df[twii_df['date'] == d_prev_str]
             if not prev_row.empty: prev_close_price = float(prev_row.iloc[0]['close'])
         
-        # 2. 找現價
-        # A. 永豐
         if sj_api:
              try:
                  snap = sj_api.snapshots([sj_api.Contracts.Indices.TSE.TSE001])[0]
                  if snap.close > 0: curr_taiex_price = float(snap.close)
              except: pass
         
-        # B. FinMind 歷史
         if curr_taiex_price == 0:
             curr_row = twii_df[twii_df['date'] == d_curr_str]
             if not curr_row.empty: curr_taiex_price = float(curr_row.iloc[0]['close'])
                 
-        # C. Yahoo (終極備援)
         if curr_taiex_price == 0:
             try:
                 yf_data = yf.Ticker("^TWII").history(period="5d")
-                # 簡單暴力：直接抓最後一筆 Close
                 if not yf_data.empty: curr_taiex_price = float(yf_data.iloc[-1]['Close'])
             except: pass
 
@@ -420,9 +408,10 @@ def fetch_data():
     except: pass
     
     br_curr = hit_curr / valid_curr if valid_curr > 0 else 0
+    
+    # 盤後強制時間校正為 13:30，以符合 X 軸終點
     record_time = "13:30:00" if not is_intraday else (last_time if last_time and "無" not in str(last_time) else datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S"))
     
-    # 將現價與昨收也存入
     save_breadth_record(d_curr_str, record_time, br_curr, taiex_change, curr_taiex_price, prev_close_price, is_intraday)
     
     final_details = []
@@ -448,7 +437,7 @@ def fetch_data():
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v5.3.0)")
+    st.title("📈 盤中權證進場判斷 (v5.4.0)")
     with st.sidebar:
         auto_refresh = st.checkbox("啟用自動更新 (每3分鐘)", value=False)
         st.markdown(UPDATE_LOG)
