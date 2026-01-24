@@ -15,13 +15,13 @@ import yfinance as yf
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v5.6.0 (縱軸終極修正版)"
+APP_VERSION = "v5.7.0 (縱軸刻度強制版)"
 UPDATE_LOG = """
-- v5.5.0: 視覺調整。
-- v5.6.0: 修復縱軸消失問題。
-  1. 【移除衝突設定】修正了雙線圖層疊加時，axis=None 導致主軸也被隱藏的 Bug。
-  2. 【強制刻度】硬性指定 Y 軸必須顯示 0%, 10%...100% 的刻度值。
-  3. 【維持功能】保留 14:30 時間軸與數據透明化 Tooltip。
+- v5.6.0: 修復縱軸消失。
+- v5.7.0: 強制顯示所有刻度。
+  1. 【強制顯示】加入 `labelOverlap=False`，禁止系統自動隱藏「太擠」的標籤。
+  2. 【精準刻度】明確指定 [0, 0.1, ... 1.0] 為刻度值，確保顯示 0%, 10%, 20%...100%。
+  3. 維持雙線走勢圖與數據透明化功能。
 """
 
 # ==========================================
@@ -33,7 +33,7 @@ EXCLUDE_PREFIXES = ["00", "91"]
 HISTORY_FILE = "breadth_history_v3.csv"
 AUTO_REFRESH_SECONDS = 180 
 
-st.set_page_config(page_title="盤中權證進場判斷 (v5.6)", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (v5.7)", layout="wide")
 
 # ==========================================
 # 🔐 Secrets
@@ -108,7 +108,7 @@ def get_cached_stock_history(token, code, start_date):
     except: return pd.DataFrame()
 
 # ==========================================
-# 廣度記錄與繪圖
+# 廣度記錄與繪圖 (核心修改)
 # ==========================================
 def save_breadth_record(current_date, current_time, breadth_value, taiex_change, taiex_curr, taiex_prev, is_intraday):
     if taiex_curr == 0: return 
@@ -133,12 +133,10 @@ def save_breadth_record(current_date, current_time, breadth_value, taiex_change,
                     new_data.to_csv(HISTORY_FILE, index=False)
                 else:
                     if not is_intraday:
-                        # 盤後：覆蓋最後一筆
                         df = df[:-1]
                         df = pd.concat([df, new_data], ignore_index=True)
                         df.to_csv(HISTORY_FILE, index=False)
                     else:
-                        # 盤中：Append
                         last_time = str(df.iloc[-1]['Time'])
                         if last_time != str(current_time):
                             new_data.to_csv(HISTORY_FILE, mode='a', header=False, index=False)
@@ -171,19 +169,24 @@ def plot_breadth_chart():
             )
         )
 
-        # === 關鍵修改：定義共用的 Y 軸設定 ===
-        # 不要在第二條線使用 axis=None，這會導致衝突
+        # === 核心修改：強制 Y 軸刻度 ===
+        # 1. 明確定義 0.0 到 1.0 的刻度值
         tick_values = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
         
         y_axis_config = alt.Axis(
             format='%',
-            values=tick_values, # 強制指定刻度
-            title=None
+            values=tick_values,    # 指定數值
+            tickCount=11,          # 指定數量
+            labelOverlap=False     # [關鍵] 禁止自動隱藏重疊標籤
         )
 
         # 1. 廣度 (藍色)
         line_breadth = base.mark_line(color='#007bff', clip=False).encode(
-            y=alt.Y('Breadth_Pct', scale=alt.Scale(domain=[0, 1]), axis=y_axis_config)
+            y=alt.Y('Breadth_Pct', 
+                    title=None, 
+                    scale=alt.Scale(domain=[0, 1], nice=False), # nice=False 避免自動擴展範圍
+                    axis=y_axis_config
+            )
         )
         
         point_breadth = base.mark_circle(color='#007bff', size=60, clip=False).encode(
@@ -195,7 +198,6 @@ def plot_breadth_chart():
         )
 
         # 2. 大盤 (黃色)
-        # 注意：這裡不指定 axis，它會自動共用上面的軸設定，不會衝突
         line_taiex = base.mark_line(color='#ffc107', strokeDash=[4,4], clip=False).encode(
             y=alt.Y('Taiex_Scaled', scale=alt.Scale(domain=[0, 1])) 
         )
@@ -216,7 +218,7 @@ def plot_breadth_chart():
             title=f"走勢對照 (藍:廣度 / 黃:大盤) - {base_date}",
             height=400
         ).resolve_scale(
-            y='shared' # 強制宣告 Y 軸共用
+            y='shared' 
         )
     except: return None
 
@@ -436,7 +438,7 @@ def fetch_data():
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v5.6.0)")
+    st.title("📈 盤中權證進場判斷 (v5.7.0)")
     with st.sidebar:
         auto_refresh = st.checkbox("啟用自動更新 (每3分鐘)", value=False)
         st.markdown(UPDATE_LOG)
