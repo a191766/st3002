@@ -15,11 +15,14 @@ import yfinance as yf
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v5.8.1 (圖表點位縮小版)"
+APP_VERSION = "v5.9.0 (動態變速更新版)"
 UPDATE_LOG = """
-- v5.8.0: 新增綠色參考線。
-- v5.8.1: 調整圖表視覺。
-  1. 【點位縮小】將廣度(藍點)與大盤(黃點)的大小從 60 調整為 30，使圖表更精緻。
+- v5.8.1: 圖表微調。
+- v5.9.0: 實作分時段動態更新頻率。
+  1. 【開盤衝刺】09:00~10:00 每 1 分鐘更新。
+  2. 【盤中巡航】10:00~12:30 每 3 分鐘更新。
+  3. 【尾盤決戰】12:30~13:30 每 1 分鐘更新。
+  4. 側邊欄即時顯示當前更新頻率設定。
 """
 
 # ==========================================
@@ -30,9 +33,8 @@ BREADTH_THRESHOLD = 0.65 # 紅線
 BREADTH_LOWER_REF = 0.55 # 綠線
 EXCLUDE_PREFIXES = ["00", "91"]
 HISTORY_FILE = "breadth_history_v3.csv"
-AUTO_REFRESH_SECONDS = 180 
 
-st.set_page_config(page_title="盤中權證進場判斷 (v5.8.1)", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (v5.9)", layout="wide")
 
 # ==========================================
 # 🔐 Secrets
@@ -183,7 +185,6 @@ def plot_breadth_chart():
                     axis=y_axis_config
             )
         )
-        # === 修正點：縮小藍點 size 60 -> 30 ===
         point_breadth = base.mark_circle(color='#007bff', size=30, clip=False).encode(
             y='Breadth_Pct',
             tooltip=[alt.Tooltip('Datetime', format='%H:%M'), alt.Tooltip('Breadth_Pct', title='廣度', format='.1%')]
@@ -193,7 +194,6 @@ def plot_breadth_chart():
         line_taiex = base.mark_line(color='#ffc107', strokeDash=[4,4], clip=False).encode(
             y=alt.Y('Taiex_Scaled', scale=alt.Scale(domain=[0, 1])) 
         )
-        # === 修正點：縮小黃點 size 60 -> 30 ===
         point_taiex = base.mark_circle(color='#ffc107', size=30, clip=False).encode(
             y='Taiex_Scaled',
             tooltip=[
@@ -432,13 +432,18 @@ def fetch_data():
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v5.8.1)")
+    st.title("📈 盤中權證進場判斷 (v5.9.0)")
+    
+    # 1. 自動更新開關 (改為勾選後才啟動)
     with st.sidebar:
-        auto_refresh = st.checkbox("啟用自動更新 (每3分鐘)", value=False)
+        st.subheader("設定與狀態")
+        auto_refresh = st.checkbox("啟用自動更新 (動態變速)", value=False)
         st.markdown(UPDATE_LOG)
 
+    # 2. 手動更新
     if st.button("🔄 立即重新整理"): pass 
 
+    # 3. 執行
     try:
         data = fetch_data()
         if data:
@@ -465,10 +470,30 @@ def run_streamlit():
             
     except Exception as e: st.error(f"Error: {e}")
 
+    # 4. 動態循環邏輯
     if auto_refresh:
         tw_now, is_intraday = get_current_status()
+        
         if is_intraday:
-            time_module.sleep(AUTO_REFRESH_SECONDS)
+            # === 核心邏輯：判斷當前時段，決定頻率 ===
+            curr_time = tw_now.time()
+            if time(9, 0) <= curr_time < time(10, 0):
+                refresh_interval = 60  # 1分鐘
+            elif time(10, 0) <= curr_time < time(12, 30):
+                refresh_interval = 180 # 3分鐘
+            elif time(12, 30) <= curr_time < time(13, 30):
+                refresh_interval = 60  # 1分鐘
+            else:
+                refresh_interval = 180 # 08:45~09:00 或其他例外
+
+            with st.sidebar:
+                st.write("---")
+                timer_text = st.empty()
+                
+            for i in range(refresh_interval, 0, -1):
+                timer_text.info(f"⏳ 下次更新：{i} 秒後 (頻率: {refresh_interval}秒/次)")
+                time_module.sleep(1)
+            
             st.rerun()
         else:
             with st.sidebar: st.warning("⏸ 非盤中，暫停更新")
