@@ -11,18 +11,18 @@ import os
 import altair as alt
 import time as time_module
 import yfinance as yf
+import requests
 
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v5.9.0 (動態變速更新版)"
+APP_VERSION = "v8.0.0 (Telegram 通知版)"
 UPDATE_LOG = """
-- v5.8.1: 圖表微調。
-- v5.9.0: 實作分時段動態更新頻率。
-  1. 【開盤衝刺】09:00~10:00 每 1 分鐘更新。
-  2. 【盤中巡航】10:00~12:30 每 3 分鐘更新。
-  3. 【尾盤決戰】12:30~13:30 每 1 分鐘更新。
-  4. 側邊欄即時顯示當前更新頻率設定。
+- v7.0.0: Line Notify (已失效)。
+- v8.0.0: 轉移至 Telegram Bot。
+  1. 【通訊升級】改用 Telegram API，解決 LINE Notify 停用問題。
+  2. 【設定欄位】側邊欄新增 Telegram Token 與 Chat ID 輸入框。
+  3. 【功能維持】保留所有廣度監控、動態變速更新與視覺設定。
 """
 
 # ==========================================
@@ -34,7 +34,7 @@ BREADTH_LOWER_REF = 0.55 # 綠線
 EXCLUDE_PREFIXES = ["00", "91"]
 HISTORY_FILE = "breadth_history_v3.csv"
 
-st.set_page_config(page_title="盤中權證進場判斷 (v5.9)", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (v8.0)", layout="wide")
 
 # ==========================================
 # 🔐 Secrets
@@ -42,6 +42,25 @@ st.set_page_config(page_title="盤中權證進場判斷 (v5.9)", layout="wide")
 def get_finmind_token():
     try: return st.secrets["finmind"]["token"]
     except: return None
+
+# ==========================================
+# 📨 Telegram 通知功能 (取代 LINE)
+# ==========================================
+def send_telegram_notify(token, chat_id, msg):
+    if not token or not chat_id: return False
+    
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": msg,
+        "parse_mode": "HTML" # 支援簡單排版
+    }
+    try:
+        r = requests.post(url, json=payload)
+        return r.status_code == 200
+    except Exception as e:
+        print(f"Telegram Error: {e}")
+        return False
 
 # ==========================================
 # API 初始化
@@ -177,7 +196,7 @@ def plot_breadth_chart():
             labelOverlap=False
         )
 
-        # 1. 廣度 (藍)
+        # 1. 廣度 (藍) - 細線
         line_breadth = base.mark_line(color='#007bff', clip=False).encode(
             y=alt.Y('Breadth_Pct', 
                     title=None, 
@@ -190,7 +209,7 @@ def plot_breadth_chart():
             tooltip=[alt.Tooltip('Datetime', format='%H:%M'), alt.Tooltip('Breadth_Pct', title='廣度', format='.1%')]
         )
 
-        # 2. 大盤 (黃)
+        # 2. 大盤 (黃) - 細線
         line_taiex = base.mark_line(color='#ffc107', strokeDash=[4,4], clip=False).encode(
             y=alt.Y('Taiex_Scaled', scale=alt.Scale(domain=[0, 1])) 
         )
@@ -432,21 +451,54 @@ def fetch_data():
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v5.9.0)")
+    st.title("📈 盤中權證進場判斷 (v8.0.0)")
     
-    # 1. 自動更新開關 (改為勾選後才啟動)
+    if 'last_alert_status' not in st.session_state:
+        st.session_state['last_alert_status'] = 'normal'
+
     with st.sidebar:
-        st.subheader("設定與狀態")
+        st.subheader("Telegram 通知設定")
         auto_refresh = st.checkbox("啟用自動更新 (動態變速)", value=False)
+        
+        # 讀取 Secrets
+        tg_secrets = st.secrets.get("telegram", {})
+        
+        # 使用者手動輸入，或使用 Secrets 預設值
+        tg_token = st.text_input("Bot Token", value=tg_secrets.get("token", ""), type="password")
+        tg_chat_id = st.text_input("Chat ID", value=tg_secrets.get("chat_id", ""))
+        
+        if tg_token and tg_chat_id:
+            st.success("Telegram 設定已就緒")
+        else:
+            st.info("請輸入 Token 與 Chat ID 以啟用通知")
+
         st.markdown(UPDATE_LOG)
 
-    # 2. 手動更新
     if st.button("🔄 立即重新整理"): pass 
 
-    # 3. 執行
     try:
         data = fetch_data()
         if data:
+            curr_breadth = data['br_curr']
+            
+            # === Telegram 通知邏輯 ===
+            if tg_token and tg_chat_id:
+                current_status = 'normal'
+                msg = ""
+                
+                if curr_breadth >= BREADTH_THRESHOLD:
+                    current_status = 'overheated'
+                    msg = f"🔥 <b>【廣度過熱警報】</b>\n目前廣度: {curr_breadth:.1%}\n已突破 65% 紅線！\n時間: {data['last_time']}"
+                elif curr_breadth <= BREADTH_LOWER_REF:
+                    current_status = 'oversold'
+                    msg = f"❄️ <b>【廣度冰點警報】</b>\n目前廣度: {curr_breadth:.1%}\n已跌破 55% 綠線！\n時間: {data['last_time']}"
+                
+                if current_status != st.session_state['last_alert_status']:
+                    if current_status != 'normal':
+                        if send_telegram_notify(tg_token, tg_chat_id, msg):
+                            st.toast(f"Telegram 通知已發送", icon="🚀")
+                    st.session_state['last_alert_status'] = current_status
+
             cond1 = (data['br_curr'] >= BREADTH_THRESHOLD) and (data['br_prev'] >= BREADTH_THRESHOLD)
             cond2 = data['slope'] > 0
             
@@ -470,21 +522,19 @@ def run_streamlit():
             
     except Exception as e: st.error(f"Error: {e}")
 
-    # 4. 動態循環邏輯
     if auto_refresh:
         tw_now, is_intraday = get_current_status()
         
         if is_intraday:
-            # === 核心邏輯：判斷當前時段，決定頻率 ===
             curr_time = tw_now.time()
             if time(9, 0) <= curr_time < time(10, 0):
-                refresh_interval = 60  # 1分鐘
+                refresh_interval = 60
             elif time(10, 0) <= curr_time < time(12, 30):
-                refresh_interval = 180 # 3分鐘
+                refresh_interval = 180
             elif time(12, 30) <= curr_time < time(13, 30):
-                refresh_interval = 60  # 1分鐘
+                refresh_interval = 60
             else:
-                refresh_interval = 180 # 08:45~09:00 或其他例外
+                refresh_interval = 180
 
             with st.sidebar:
                 st.write("---")
