@@ -15,25 +15,26 @@ import yfinance as yf
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v5.7.0 (縱軸刻度強制版)"
+APP_VERSION = "v5.8.0 (新增綠色參考線)"
 UPDATE_LOG = """
-- v5.6.0: 修復縱軸消失。
-- v5.7.0: 強制顯示所有刻度。
-  1. 【強制顯示】加入 `labelOverlap=False`，禁止系統自動隱藏「太擠」的標籤。
-  2. 【精準刻度】明確指定 [0, 0.1, ... 1.0] 為刻度值，確保顯示 0%, 10%, 20%...100%。
-  3. 維持雙線走勢圖與數據透明化功能。
+- v5.7.0: 縱軸刻度強制顯示。
+- v5.8.0: 圖表參考線擴充。
+  1. 【新增參考線】在廣度 55% 處新增一條「綠色虛線」，輔助判斷水位。
+  2. 原本 65% 的紅色虛線維持不變。
+  3. 維持所有 Y 軸刻度與數據修正功能。
 """
 
 # ==========================================
 # 參數與 Token
 # ==========================================
 TOP_N = 300              
-BREADTH_THRESHOLD = 0.65
+BREADTH_THRESHOLD = 0.65 # 紅線
+BREADTH_LOWER_REF = 0.55 # 綠線 (新增)
 EXCLUDE_PREFIXES = ["00", "91"]
 HISTORY_FILE = "breadth_history_v3.csv"
 AUTO_REFRESH_SECONDS = 180 
 
-st.set_page_config(page_title="盤中權證進場判斷 (v5.7)", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (v5.8)", layout="wide")
 
 # ==========================================
 # 🔐 Secrets
@@ -108,7 +109,7 @@ def get_cached_stock_history(token, code, start_date):
     except: return pd.DataFrame()
 
 # ==========================================
-# 廣度記錄與繪圖 (核心修改)
+# 廣度記錄與繪圖
 # ==========================================
 def save_breadth_record(current_date, current_time, breadth_value, taiex_change, taiex_curr, taiex_prev, is_intraday):
     if taiex_curr == 0: return 
@@ -153,8 +154,6 @@ def plot_breadth_chart():
         
         df['Breadth_Pct'] = df['Breadth']
         df['Datetime'] = pd.to_datetime(df['Date'].astype(str) + ' ' + df['Time'].astype(str))
-        
-        # 換算大盤位置
         df['Taiex_Scaled'] = (df['Taiex_Change'] * 10) + 0.5
         
         base_date = df.iloc[0]['Date']
@@ -169,39 +168,32 @@ def plot_breadth_chart():
             )
         )
 
-        # === 核心修改：強制 Y 軸刻度 ===
-        # 1. 明確定義 0.0 到 1.0 的刻度值
         tick_values = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
         
         y_axis_config = alt.Axis(
             format='%',
-            values=tick_values,    # 指定數值
-            tickCount=11,          # 指定數量
-            labelOverlap=False     # [關鍵] 禁止自動隱藏重疊標籤
+            values=tick_values,
+            tickCount=11,
+            labelOverlap=False
         )
 
-        # 1. 廣度 (藍色)
+        # 1. 廣度 (藍)
         line_breadth = base.mark_line(color='#007bff', clip=False).encode(
             y=alt.Y('Breadth_Pct', 
                     title=None, 
-                    scale=alt.Scale(domain=[0, 1], nice=False), # nice=False 避免自動擴展範圍
+                    scale=alt.Scale(domain=[0, 1], nice=False),
                     axis=y_axis_config
             )
         )
-        
         point_breadth = base.mark_circle(color='#007bff', size=60, clip=False).encode(
             y='Breadth_Pct',
-            tooltip=[
-                alt.Tooltip('Datetime', format='%H:%M'), 
-                alt.Tooltip('Breadth_Pct', title='廣度', format='.1%')
-            ]
+            tooltip=[alt.Tooltip('Datetime', format='%H:%M'), alt.Tooltip('Breadth_Pct', title='廣度', format='.1%')]
         )
 
-        # 2. 大盤 (黃色)
+        # 2. 大盤 (黃)
         line_taiex = base.mark_line(color='#ffc107', strokeDash=[4,4], clip=False).encode(
             y=alt.Y('Taiex_Scaled', scale=alt.Scale(domain=[0, 1])) 
         )
-        
         point_taiex = base.mark_circle(color='#ffc107', size=60, clip=False).encode(
             y='Taiex_Scaled',
             tooltip=[
@@ -212,9 +204,13 @@ def plot_breadth_chart():
             ]
         )
         
-        rule = alt.Chart(pd.DataFrame({'y': [BREADTH_THRESHOLD]})).mark_rule(color='red', strokeDash=[5, 5]).encode(y='y')
+        # 3. 參考線 (紅 & 綠)
+        # 紅線 (65%)
+        rule_red = alt.Chart(pd.DataFrame({'y': [BREADTH_THRESHOLD]})).mark_rule(color='red', strokeDash=[5, 5]).encode(y='y')
+        # 綠線 (55%) - 新增
+        rule_green = alt.Chart(pd.DataFrame({'y': [BREADTH_LOWER_REF]})).mark_rule(color='green', strokeDash=[5, 5]).encode(y='y')
 
-        return (line_breadth + point_breadth + line_taiex + point_taiex + rule).properties(
+        return (line_breadth + point_breadth + line_taiex + point_taiex + rule_red + rule_green).properties(
             title=f"走勢對照 (藍:廣度 / 黃:大盤) - {base_date}",
             height=400
         ).resolve_scale(
@@ -438,7 +434,7 @@ def fetch_data():
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v5.7.0)")
+    st.title("📈 盤中權證進場判斷 (v5.8.0)")
     with st.sidebar:
         auto_refresh = st.checkbox("啟用自動更新 (每3分鐘)", value=False)
         st.markdown(UPDATE_LOG)
