@@ -16,14 +16,12 @@ import requests
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v8.1.0 (急速變動警報版)"
+APP_VERSION = "v8.1.1 (緊急修復版)"
 UPDATE_LOG = """
-- v8.0.0: Telegram 通知。
-- v8.1.0: 新增短線動能監控。
-  1. 【急速變動警報】自動比對「當下」與「3分鐘前」的廣度。
-  2. 若 3 分鐘內變化幅度 ≥ 2%，立即發送 Telegram 通知。
-  3. 格式範例：09:10廣度50%，09:13廣度55%，上漲5%。
-  4. 即使在正常水位區，只要波動夠大也會通知。
+- v8.1.0: 急速變動警報。
+- v8.1.1: 修復 Unpack Error。
+  1. 修正 `check_rapid_change` 在資料不足時回傳格式錯誤的問題。
+  2. 確保在剛啟動（無歷史檔）時也能正常運作，不會報錯。
 """
 
 # ==========================================
@@ -36,7 +34,7 @@ RAPID_CHANGE_THRESHOLD = 0.02 # 急速變動門檻 (2%)
 EXCLUDE_PREFIXES = ["00", "91"]
 HISTORY_FILE = "breadth_history_v3.csv"
 
-st.set_page_config(page_title="盤中權證進場判斷 (v8.1)", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (v8.1.1)", layout="wide")
 
 # ==========================================
 # 🔐 Secrets
@@ -60,39 +58,31 @@ def send_telegram_notify(token, chat_id, msg):
         return False
 
 # ==========================================
-# ⚡ 急速變動檢查邏輯 (新增)
+# ⚡ 急速變動檢查邏輯 (修正版)
 # ==========================================
 def check_rapid_change(current_row):
     """
     檢查是否有 3 分鐘內的劇烈波動
     """
-    if not os.path.exists(HISTORY_FILE): return None
+    # [修正] 這裡必須回傳兩個 None，對應外面的 rapid_msg, alert_id
+    if not os.path.exists(HISTORY_FILE): return None, None 
     
     try:
         df = pd.read_csv(HISTORY_FILE)
-        if len(df) < 2: return None
+        # [修正] 這裡也必須回傳兩個 None
+        if len(df) < 2: return None, None 
         
-        # 組合當下的時間物件
         curr_dt_str = f"{current_row['Date']} {current_row['Time']}"
         curr_dt = datetime.strptime(curr_dt_str, "%Y-%m-%d %H:%M:%S")
         curr_val = float(current_row['Breadth'])
         
-        # 尋找「3分鐘前」的紀錄
-        # 容許誤差：因為網路延遲，時間差可能在 170秒 ~ 190秒 之間 (3分鐘=180秒)
-        # 我們往前找最近的一筆符合條件的資料
-        
         target_row = None
-        
-        # 從倒數第 2 筆開始往前找 (倒數第 1 筆是自己)
         for i in range(2, min(10, len(df) + 1)): 
             row = df.iloc[-i]
             row_dt_str = f"{row['Date']} {row['Time']}"
             row_dt = datetime.strptime(row_dt_str, "%Y-%m-%d %H:%M:%S")
-            
-            # 計算時間差 (秒)
             diff_seconds = (curr_dt - row_dt).total_seconds()
             
-            # 只要時間差在 2分50秒 ~ 3分10秒 之間，就認定它是「3分鐘前」的那筆
             if 170 <= diff_seconds <= 190:
                 target_row = row
                 break
@@ -101,16 +91,12 @@ def check_rapid_change(current_row):
             past_val = float(target_row['Breadth'])
             diff = curr_val - past_val
             
-            # 判斷是否超過門檻 (2%)
             if abs(diff) >= RAPID_CHANGE_THRESHOLD:
                 direction = "上漲" if diff > 0 else "下跌"
-                p_time = target_row['Time'][:5] # 取 HH:MM
+                p_time = target_row['Time'][:5] 
                 c_time = current_row['Time'][:5]
                 
-                # 格式：9:10廣度50%，9:13廣度55%，上漲5%
                 msg = f"⚡ <b>【廣度急變警報】</b>\n{p_time}廣度{past_val:.0%}，{c_time}廣度{curr_val:.0%}，{direction}{abs(diff):.0%}"
-                
-                # 回傳訊息與該次紀錄的時間(作為唯一ID防止重複發送)
                 return msg, curr_dt_str
                 
     except Exception as e:
@@ -252,7 +238,7 @@ def plot_breadth_chart():
             labelOverlap=False
         )
 
-        # 1. 廣度 (藍) - 細線
+        # 1. 廣度 (藍)
         line_breadth = base.mark_line(color='#007bff', clip=False).encode(
             y=alt.Y('Breadth_Pct', 
                     title=None, 
@@ -265,7 +251,7 @@ def plot_breadth_chart():
             tooltip=[alt.Tooltip('Datetime', format='%H:%M'), alt.Tooltip('Breadth_Pct', title='廣度', format='.1%')]
         )
 
-        # 2. 大盤 (黃) - 細線
+        # 2. 大盤 (黃)
         line_taiex = base.mark_line(color='#ffc107', strokeDash=[4,4], clip=False).encode(
             y=alt.Y('Taiex_Scaled', scale=alt.Scale(domain=[0, 1])) 
         )
@@ -501,19 +487,18 @@ def fetch_data():
         "hit_prev": hit_prev, "valid_prev": valid_prev,
         "slope": slope, "detail_df": pd.DataFrame(final_details),
         "mode_msg": mode_msg, "rank_source_msg": rank_source_msg, "last_time": last_time,
-        "raw_record": {'Date': d_curr_str, 'Time': record_time, 'Breadth': br_curr} # 傳出 raw data 供檢查
+        "raw_record": {'Date': d_curr_str, 'Time': record_time, 'Breadth': br_curr}
     }
 
 # ==========================================
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v8.1.0)")
+    st.title("📈 盤中權證進場判斷 (v8.1.1)")
     
-    # Session State (防洗版)
     if 'last_alert_status' not in st.session_state:
         st.session_state['last_alert_status'] = 'normal'
-    if 'last_rapid_alert_time' not in st.session_state: # 新增：急速變動的防洗版 (記時間)
+    if 'last_rapid_alert_time' not in st.session_state:
         st.session_state['last_rapid_alert_time'] = ""
 
     with st.sidebar:
@@ -540,7 +525,6 @@ def run_streamlit():
             
             # === Telegram 通知邏輯 ===
             if tg_token and tg_chat_id:
-                # 1. 水位警報 (Level Alert)
                 current_status = 'normal'
                 level_msg = ""
                 
@@ -557,12 +541,10 @@ def run_streamlit():
                             st.toast(f"水位警報已發送", icon="📢")
                     st.session_state['last_alert_status'] = current_status
 
-                # 2. 急速變動警報 (Rapid Change Alert) - 新增
-                # 傳入當下的 raw_record (包含 Date, Time, Breadth)
+                # 急速變動警報 (v8.1.1 修正版：確保回傳兩個值)
                 rapid_msg, alert_id = check_rapid_change(data['raw_record'])
                 
                 if rapid_msg:
-                    # 檢查這則警報是否已經發送過 (用時間戳記當 ID)
                     if alert_id != st.session_state['last_rapid_alert_time']:
                         if send_telegram_notify(tg_token, tg_chat_id, rapid_msg):
                             st.toast(f"急速變動警報已發送", icon="⚡")
