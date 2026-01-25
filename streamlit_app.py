@@ -15,13 +15,11 @@ import yfinance as yf
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v5.8.0 (新增綠色參考線)"
+APP_VERSION = "v5.8.1 (圖表點位縮小版)"
 UPDATE_LOG = """
-- v5.7.0: 縱軸刻度強制顯示。
-- v5.8.0: 圖表參考線擴充。
-  1. 【新增參考線】在廣度 55% 處新增一條「綠色虛線」，輔助判斷水位。
-  2. 原本 65% 的紅色虛線維持不變。
-  3. 維持所有 Y 軸刻度與數據修正功能。
+- v5.8.0: 新增綠色參考線。
+- v5.8.1: 調整圖表視覺。
+  1. 【點位縮小】將廣度(藍點)與大盤(黃點)的大小從 60 調整為 30，使圖表更精緻。
 """
 
 # ==========================================
@@ -29,12 +27,12 @@ UPDATE_LOG = """
 # ==========================================
 TOP_N = 300              
 BREADTH_THRESHOLD = 0.65 # 紅線
-BREADTH_LOWER_REF = 0.55 # 綠線 (新增)
+BREADTH_LOWER_REF = 0.55 # 綠線
 EXCLUDE_PREFIXES = ["00", "91"]
 HISTORY_FILE = "breadth_history_v3.csv"
 AUTO_REFRESH_SECONDS = 180 
 
-st.set_page_config(page_title="盤中權證進場判斷 (v5.8)", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (v5.8.1)", layout="wide")
 
 # ==========================================
 # 🔐 Secrets
@@ -185,7 +183,8 @@ def plot_breadth_chart():
                     axis=y_axis_config
             )
         )
-        point_breadth = base.mark_circle(color='#007bff', size=60, clip=False).encode(
+        # === 修正點：縮小藍點 size 60 -> 30 ===
+        point_breadth = base.mark_circle(color='#007bff', size=30, clip=False).encode(
             y='Breadth_Pct',
             tooltip=[alt.Tooltip('Datetime', format='%H:%M'), alt.Tooltip('Breadth_Pct', title='廣度', format='.1%')]
         )
@@ -194,7 +193,8 @@ def plot_breadth_chart():
         line_taiex = base.mark_line(color='#ffc107', strokeDash=[4,4], clip=False).encode(
             y=alt.Y('Taiex_Scaled', scale=alt.Scale(domain=[0, 1])) 
         )
-        point_taiex = base.mark_circle(color='#ffc107', size=60, clip=False).encode(
+        # === 修正點：縮小黃點 size 60 -> 30 ===
+        point_taiex = base.mark_circle(color='#ffc107', size=30, clip=False).encode(
             y='Taiex_Scaled',
             tooltip=[
                 alt.Tooltip('Datetime', format='%H:%M'), 
@@ -204,10 +204,8 @@ def plot_breadth_chart():
             ]
         )
         
-        # 3. 參考線 (紅 & 綠)
-        # 紅線 (65%)
+        # 3. 參考線
         rule_red = alt.Chart(pd.DataFrame({'y': [BREADTH_THRESHOLD]})).mark_rule(color='red', strokeDash=[5, 5]).encode(y='y')
-        # 綠線 (55%) - 新增
         rule_green = alt.Chart(pd.DataFrame({'y': [BREADTH_LOWER_REF]})).mark_rule(color='green', strokeDash=[5, 5]).encode(y='y')
 
         return (line_breadth + point_breadth + line_taiex + point_taiex + rule_red + rule_green).properties(
@@ -434,7 +432,7 @@ def fetch_data():
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v5.8.0)")
+    st.title("📈 盤中權證進場判斷 (v5.8.1)")
     with st.sidebar:
         auto_refresh = st.checkbox("啟用自動更新 (每3分鐘)", value=False)
         st.markdown(UPDATE_LOG)
