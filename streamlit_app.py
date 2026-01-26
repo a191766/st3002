@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
@@ -500,4 +501,41 @@ def run_app():
                     st.session_state['last_stt'] = stt
                 rap_msg, rid = check_rapid(data['raw'])
                 if rap_msg and rid != st.session_state['last_rap']:
-                    send_tg(tg_tok, tg_id, rap_msg); st.session_state['
+                    send_tg(tg_tok, tg_id, rap_msg); st.session_state[''last_stt'] = stt
+                rap_msg, rid = check_rapid(data['raw'])
+                if rap_msg and rid != st.session_state['last_rap']:
+                    send_tg(tg_tok, tg_id, rap_msg); st.session_state['last_rap'] = rid
+
+            st.subheader(f"📅 {data['d']}")
+            st.caption(f"昨日基準: {data['d_prev']}")
+            st.info(f"{data['src']} | 更新: {data['t']}")
+            chart = plot_chart()
+            if chart: st.altair_chart(chart, use_container_width=True)
+            
+            c1,c2,c3 = st.columns(3)
+            c1.metric("今日廣度", f"{br:.1%}", f"{data['h']}/{data['v']}")
+            c1.caption(f"昨日廣度: {data['br_p']:.1%} ({data['h_p']}/{data['v_p']})")
+            
+            c2.metric("大盤漲跌", f"{data['tc']:.2%}")
+            sl = data['slope']; icon = "📈 正" if sl > 0 else "📉 負"
+            c3.metric("大盤MA5斜率", f"{sl:.2f}", icon)
+            
+            st.dataframe(data['df'], use_container_width=True, hide_index=True)
+        else: st.warning("⚠️ 無資料")
+    except Exception as e: st.error(f"Error: {e}")
+
+    if auto:
+        now = datetime.now(timezone(timedelta(hours=8)))
+        is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
+        if is_intra:
+            sec = 120
+            with st.sidebar:
+                t = st.empty()
+                for i in range(sec, 0, -1):
+                    t.info(f"⏳ {i}s")
+                    time_module.sleep(1)
+            st.rerun()
+        else: st.sidebar.warning("⏸ 休市")
+
+if __name__ == "__main__":
+    if 'streamlit' in sys.modules: run_app()
