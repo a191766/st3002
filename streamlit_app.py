@@ -5,12 +5,16 @@ import numpy as np
 from FinMind.data import DataLoader
 from datetime import datetime, timedelta, timezone, time
 import shioaji as sj
-import os, sys, requests
+import os
+import sys
+import requests
 import altair as alt
 import time as time_module
 
-# --- 設定區 ---
-APP_VER = "v8.2.5 (極速瘦身版)"
+# ==========================================
+# 設定區 v8.3.0
+# ==========================================
+APP_VER = "v8.3.0 (強韌容錯版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -20,7 +24,9 @@ HIST_FILE = "breadth_history_v3.csv"
 
 st.set_page_config(page_title="盤中權證進場判斷", layout="wide")
 
-# --- 核心函式 ---
+# ==========================================
+# 基礎函式
+# ==========================================
 def get_finmind_token():
     try: return st.secrets["finmind"]["token"]
     except: return None
@@ -56,14 +62,18 @@ def check_rapid(row):
     except: pass
     return None, None
 
+# 改為即使失敗也回傳 None，不報錯
 @st.cache_resource(ttl=3600) 
 def get_api():
     api = sj.Shioaji(simulation=False)
-    try: api.login(api_key=st.secrets["shioaji"]["api_key"], secret_key=st.secrets["shioaji"]["secret_key"])
+    try: 
+        api.login(api_key=st.secrets["shioaji"]["api_key"], secret_key=st.secrets["shioaji"]["secret_key"])
+        return api
     except: return None
-    return api
 
-# --- 資料處理 ---
+# ==========================================
+# 資料處理
+# ==========================================
 def get_col(df, names):
     cols = {c.lower(): c for c in df.columns}
     for n in names:
@@ -95,7 +105,8 @@ def get_ranks(token, d_str, bak_d=None):
     if df['ID'] is None or df['Money'] is None: return []
     
     df['ID'] = df['ID'].astype(str)
-    df = df[df['ID'].str.len()==4 & df['ID'].str.isdigit()]
+    df = df[df['ID'].str.len()==4]
+    df = df[df['ID'].str.isdigit()]
     for p in EXCL_PFX: df = df[~df['ID'].str.startswith(p)]
     return df.sort_values('Money', ascending=False).head(TOP_N)['ID'].tolist()
 
@@ -113,8 +124,11 @@ def save_rec(d, t, b, tc, t_cur, t_prev, intra):
         try:
             df = pd.read_csv(HIST_FILE)
             if not df.empty and str(df.iloc[-1]['Date'])==str(d):
-                if not intra: df = df[:-1]; pd.concat([df,row], ignore_index=True).to_csv(HIST_FILE, index=False)
-                elif str(df.iloc[-1]['Time'])!=str(t): row.to_csv(HIST_FILE, mode='a', header=False, index=False)
+                if not intra:
+                    df = df[:-1]
+                    pd.concat([df,row], ignore_index=True).to_csv(HIST_FILE, index=False)
+                elif str(df.iloc[-1]['Time'])!=str(t):
+                    row.to_csv(HIST_FILE, mode='a', header=False, index=False)
             else: row.to_csv(HIST_FILE, index=False)
         except: row.to_csv(HIST_FILE, index=False)
 
@@ -126,43 +140,69 @@ def plot_chart():
         df['DT'] = pd.to_datetime(df['Date'].astype(str)+' '+df['Time'].astype(str))
         df['T_S'] = (df['Taiex_Change']*10)+0.5
         base_d = df.iloc[0]['Date']
-        base = alt.Chart(df).encode(x=alt.X('DT', title='時間', axis=alt.Axis(format='%H:%M'), scale=alt.Scale(domain=[pd.to_datetime(f"{base_d} 09:00:00"), pd.to_datetime(f"{base_d} 14:30:00")])))
+        
+        # 強制指定圖表範圍 09:00 - 14:30
+        start_t = pd.to_datetime(f"{base_d} 09:00:00")
+        end_t = pd.to_datetime(f"{base_d} 14:30:00")
+        
+        base = alt.Chart(df).encode(x=alt.X('DT', title='時間', axis=alt.Axis(format='%H:%M'), scale=alt.Scale(domain=[start_t, end_t])))
         y_ax = alt.Axis(format='%', values=[i/10 for i in range(11)], tickCount=11, labelOverlap=False)
+        
         l_b = base.mark_line(color='#007bff').encode(y=alt.Y('Breadth', title=None, scale=alt.Scale(domain=[0,1], nice=False), axis=y_ax))
         p_b = base.mark_circle(color='#007bff', size=30).encode(y='Breadth', tooltip=['DT', alt.Tooltip('Breadth', format='.1%')])
         l_t = base.mark_line(color='#ffc107', strokeDash=[4,4]).encode(y=alt.Y('T_S', scale=alt.Scale(domain=[0,1])))
         p_t = base.mark_circle(color='#ffc107', size=30).encode(y='T_S', tooltip=['DT', alt.Tooltip('Taiex_Change', format='.2%')])
+        
         rule_r = alt.Chart(pd.DataFrame({'y':[BREADTH_THR]})).mark_rule(color='red', strokeDash=[5,5]).encode(y='y')
         rule_g = alt.Chart(pd.DataFrame({'y':[BREADTH_LOW]})).mark_rule(color='green', strokeDash=[5,5]).encode(y='y')
+        
         return (l_b+p_b+l_t+p_t+rule_r+rule_g).properties(height=400, title=f"走勢對照 - {base_d}").resolve_scale(y='shared')
     except: return None
 
 def fetch_all():
-    ft = get_finmind_token(); sj_api = get_api()
-    if not ft or not sj_api: return None
+    ft = get_finmind_token()
+    if not ft: return "FinMind Token Error" # 這是最基本的，不能少
+    
+    # 嘗試取得 Shioaji API，如果失敗(None)，程式不會停，只是沒即時報價
+    sj_api = get_api() 
+    
     days = get_days(ft)
-    if len(days)<2: return None
+    if len(days)<2: return "日期資料不足 (FinMind 連線問題?)"
+    
     d_cur, d_pre = days[-1], days[-2]
     now = datetime.now(timezone(timedelta(hours=8)))
     is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
     
+    # 取得名單
     codes_pre = get_ranks(ft, d_pre, days[-3])
-    if not codes_pre: return None
-    codes_cur = get_ranks(ft, d_cur) if not is_intra else []
+    if not codes_pre: return "無法取得排行 (FinMind 資料缺漏)"
+    
+    codes_cur = []
+    if not is_intra: codes_cur = get_ranks(ft, d_cur)
     codes = codes_cur if codes_cur else codes_pre
     
+    # 取得即時報價 (容錯核心：sj_api 為 None 也沒關係)
     pmap = {}
-    last_t = "無即時資料"
+    last_t = "無即時資料 (API未連線)"
+    
     if sj_api:
         try:
-            snaps = sj_api.snapshots([sj_api.Contracts.Stocks[c] for c in codes if c in sj_api.Contracts.Stocks])
-            ts_obj = datetime.now()
-            for s in snaps:
-                if s.close>0: pmap[s.code]=float(s.close); ts_obj=datetime.fromtimestamp(s.ts/1e9)
-            last_t = ts_obj.strftime("%H:%M:%S")
-        except: pass
+            contracts = []
+            for c in codes:
+                if c in sj_api.Contracts.Stocks: contracts.append(sj_api.Contracts.Stocks[c])
+            if contracts:
+                snaps = sj_api.snapshots(contracts)
+                ts_obj = datetime.now()
+                for s in snaps:
+                    if s.close > 0: 
+                        pmap[s.code] = float(s.close)
+                        ts_obj = datetime.fromtimestamp(s.ts/1e9)
+                last_t = ts_obj.strftime("%H:%M:%S")
+        except: last_t = "API 讀取錯誤"
 
-    hits, valid, dtls = 0, 0, []
+    # 計算廣度
+    hits, valid = 0, 0
+    dtls = []
     s_dt = (datetime.now()-timedelta(days=30)).strftime("%Y-%m-%d")
     
     for c in codes:
@@ -170,44 +210,78 @@ def fetch_all():
         df = get_hist(ft, c, s_dt)
         stt, ma5 = "無資料", 0
         if not df.empty:
-            if is_intra and cur_p>0:
-                df = pd.concat([df[df['date']<d_cur], pd.DataFrame([{'date':d_cur,'close':cur_p}])], ignore_index=True)
-            if len(df)>=5:
+            # 只有在有即時報價時，才把今天塞進去算
+            if is_intra and cur_p > 0:
+                new_row = pd.DataFrame([{'date':d_cur, 'close':cur_p}])
+                # 簡單去重：如果歷史資料裡已經有今天，就別重複塞
+                if df.iloc[-1]['date'] != d_cur:
+                    df = pd.concat([df, new_row], ignore_index=True)
+                else:
+                    # 如果歷史資料已有今天(盤後)，更新最後一筆
+                    df.iloc[-1, df.columns.get_loc('close')] = cur_p
+
+            if len(df) >= 5:
                 df['MA5'] = df['close'].rolling(5).mean()
-                ma5 = df.iloc[-1]['MA5']; fin_p = float(df.iloc[-1]['close'])
+                ma5 = df.iloc[-1]['MA5']
+                fin_p = float(df.iloc[-1]['close'])
                 if fin_p > ma5: hits+=1; stt="✅"
                 else: stt="📉"
                 valid+=1
         dtls.append({"代號":c, "現價":cur_p, "MA5":round(ma5,2), "狀態":stt})
 
     br = hits/valid if valid>0 else 0
+    
+    # 大盤資料 (容錯機制)
     t_cur, t_pre = 0, 0
     try:
         tw = get_hist(ft, "TAIEX", s_dt)
-        if not tw.empty: t_pre = float(tw[tw['date']==d_pre].iloc[0]['close']) if not tw[tw['date']==d_pre].empty else 0
-        if sj_api:
-            s = sj_api.snapshots([sj_api.Contracts.Indices.TSE.TSE001])[0]
-            if s.close>0: t_cur = float(s.close)
-        if t_cur==0 and not tw.empty:
+        if not tw.empty: 
+            t_pre = float(tw[tw['date']==d_pre].iloc[0]['close']) if not tw[tw['date']==d_pre].empty else 0
+        
+        if sj_api: # 優先用 API
+            try:
+                s = sj_api.snapshots([sj_api.Contracts.Indices.TSE.TSE001])[0]
+                if s.close>0: t_cur = float(s.close)
+            except: pass
+            
+        if t_cur == 0 and not tw.empty: # API 沒抓到，用 FinMind 補
             r = tw[tw['date']==d_cur]
             if not r.empty: t_cur = float(r.iloc[0]['close'])
     except: pass
     
     t_chg = (t_cur-t_pre)/t_pre if t_pre>0 else 0
-    rec_t = last_t if is_intra and "無" not in str(last_t) else ("14:30:00" if not is_intra else datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S"))
+    
+    # 決定記錄時間：如果是盤中且有連線，用 API 時間；否則用現在時間或 14:30
+    if is_intra:
+        rec_t = last_t if "無" not in str(last_t) else datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
+    else:
+        rec_t = "14:30:00"
+        
     save_rec(d_cur, rec_t, br, t_chg, t_cur, t_pre, is_intra)
     
-    return {"d":d_cur, "br":br, "h":hits, "v":valid, "df":pd.DataFrame(dtls), "t":last_t, "tc":t_chg, "raw":{'Date':d_cur,'Time':rec_t,'Breadth':br}, "src":f"名單:{d_cur if codes_cur else d_pre}"}
+    return {
+        "d":d_cur, "br":br, "h":hits, "v":valid, "df":pd.DataFrame(dtls), 
+        "t":last_t, "tc":t_chg, "raw":{'Date':d_cur,'Time':rec_t,'Breadth':br}, 
+        "src":f"名單:{d_cur if codes_cur else d_pre}",
+        "sj_ok": True if sj_api else False # 回傳 API 狀態
+    }
 
-# --- 主程式 ---
+# ==========================================
+# 主程式
+# ==========================================
 def run_app():
-    st.title(f"📈 盤中權證進場判斷 {APP_VER}")
+    st.title(f"📈 {APP_VER}")
     if 'last_stt' not in st.session_state: st.session_state['last_stt'] = 'normal'
     if 'last_rap' not in st.session_state: st.session_state['last_rap'] = ""
 
     with st.sidebar:
         st.subheader("設定")
         auto = st.checkbox("自動更新", value=False)
+        
+        # 狀態燈號
+        fin_ok = "🟢" if get_finmind_token() else "🔴"
+        st.caption(f"FinMind Token: {fin_ok}")
+        
         tg_tok = st.text_input("TG Token", value=st.secrets.get("telegram",{}).get("token",""), type="password")
         tg_id = st.text_input("Chat ID", value=st.secrets.get("telegram",{}).get("chat_id",""))
         if tg_tok and tg_id: st.success("TG Ready")
@@ -216,7 +290,14 @@ def run_app():
 
     try:
         data = fetch_all()
-        if data:
+        # 如果 data 是字串，代表是錯誤訊息
+        if isinstance(data, str):
+            st.error(f"❌ 錯誤: {data}")
+        elif data:
+            # 顯示連線狀態
+            sj_status = "🟢 連線中" if data['sj_ok'] else "🔴 未連線 (使用歷史數據)"
+            st.sidebar.caption(f"永豐 API: {sj_status}")
+            
             br = data['br']
             if tg_tok and tg_id:
                 stt = 'normal'
@@ -234,16 +315,20 @@ def run_app():
                     st.session_state['last_rap'] = rid
 
             st.subheader(f"📅 {data['d']}")
-            st.caption(data['src'])
+            st.info(f"{data['src']} | {data['t']}")
+            
             chart = plot_chart()
             if chart: st.altair_chart(chart, use_container_width=True)
+            
             c1,c2,c3 = st.columns(3)
             c1.metric("今日廣度", f"{br:.1%}", f"{data['h']}/{data['v']}")
             c2.metric("大盤漲跌", f"{data['tc']:.2%}")
             c3.metric("狀態", "🔥" if br>=0.65 else ("❄️" if br<=0.55 else "---"))
-            st.caption(f"Update: {data['t']}")
+            
             st.dataframe(data['df'], use_container_width=True, hide_index=True)
-        else: st.warning("⚠️ 無資料或非交易日")
+        else:
+            st.warning("⚠️ 無資料 (未知錯誤)")
+            
     except Exception as e: st.error(f"Error: {e}")
 
     if auto:
