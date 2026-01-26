@@ -11,9 +11,9 @@ import yfinance as yf
 import time as time_module
 
 # ==========================================
-# 設定區 v8.8.0 (智能分流版)
+# 設定區 v8.9.0 (雙規校正版)
 # ==========================================
-APP_VER = "v8.8.0 (智能分流版)"
+APP_VER = "v8.9.0 (上櫃代碼修正版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -73,7 +73,7 @@ def get_api():
         return None, str(e)
 
 # ==========================================
-# 資料處理 (FinMind)
+# 資料處理
 # ==========================================
 def get_col(df, names):
     cols = {c.lower(): c for c in df.columns}
@@ -125,51 +125,57 @@ def get_hist(token, code, start):
     try: return api.taiwan_stock_daily(stock_id=code, start_date=start)
     except: return pd.DataFrame()
 
-# [新增] 嘗試抓取 FinMind 今日資料 (通常是盤後才有)
-def get_prices_fm_today(token, today_str):
-    api = DataLoader(); api.login_by_token(token)
-    try:
-        # stock_id="" 代表抓全市場
-        df = api.taiwan_stock_daily(stock_id="", start_date=today_str)
-        if df.empty: return {}
-        # 轉成 Dict: {'2330': 1770.0, ...}
-        df['ID'] = get_col(df, ['stock_id','code'])
-        df['Price'] = get_col(df, ['close','Close'])
-        return dict(zip(df['ID'].astype(str), df['Price']))
-    except: return {}
-
-# [優化] Yahoo 分批抓取 (Batching) - 解決漏抓關鍵
-def get_prices_yf(codes):
+# [關鍵修正] Yahoo 雙規抓取 (TSE + OTC)
+def get_prices_yf_smart(codes):
     if not codes: return {}
     results = {}
-    chunk_size = 50 # 每次只抓 50 檔，避免被 Yahoo 封鎖
     
-    # 分批迴圈
+    # 1. 第一輪：先當作上市股 (.TW)
+    # 分批抓取，避免 Request URL too long
+    chunk_size = 50
+    failed_codes = [] # 記錄第一輪失敗的代號
+    
     for i in range(0, len(codes), chunk_size):
         chunk = codes[i:i+chunk_size]
         tickers = [f"{c}.TW" for c in chunk]
         try:
-            # threads=True 加速, progress=False 不顯示進度條
             data = yf.download(tickers, period="1d", progress=False, threads=True)
-            
-            # 處理回傳格式 (Yahoo有時回傳 Series 有時 DataFrame)
-            if 'Close' in data:
-                closes = data['Close']
-                if not closes.empty:
-                    # 取最後一筆
-                    last_row = closes.iloc[-1]
-                    # 轉 dict
-                    for t in tickers:
-                        clean_code = t.replace(".TW", "")
+            if 'Close' in data and not data['Close'].empty:
+                last_row = data['Close'].iloc[-1]
+                for t in tickers:
+                    clean_code = t.replace(".TW", "")
+                    try:
+                        val = last_row[t]
+                        if not np.isnan(val) and val > 0:
+                            results[clean_code] = val
+                        else:
+                            failed_codes.append(clean_code)
+                    except: failed_codes.append(clean_code)
+            else:
+                failed_codes.extend(chunk)
+        except:
+            failed_codes.extend(chunk)
+    
+    # 2. 第二輪：針對失敗的，改當上櫃股 (.TWO) 再抓一次
+    if failed_codes:
+        # 去除重複
+        failed_codes = list(set(failed_codes))
+        for i in range(0, len(failed_codes), chunk_size):
+            chunk = failed_codes[i:i+chunk_size]
+            tickers_two = [f"{c}.TWO" for c in chunk]
+            try:
+                data = yf.download(tickers_two, period="1d", progress=False, threads=True)
+                if 'Close' in data and not data['Close'].empty:
+                    last_row = data['Close'].iloc[-1]
+                    for t in tickers_two:
+                        clean_code = t.replace(".TWO", "")
                         try:
                             val = last_row[t]
                             if not np.isnan(val) and val > 0:
                                 results[clean_code] = val
                         except: pass
-        except: pass
-        # 稍微休息一下，禮貌爬蟲
-        time_module.sleep(0.5)
-        
+            except: pass
+            
     return results
 
 def save_rec(d, t, b, tc, t_cur, t_prev, intra):
@@ -241,57 +247,41 @@ def fetch_all():
     msg_src = f"名單:{d_cur if codes_cur else d_pre}"
     
     pmap = {}
-    data_source_list = [] # 記錄來源分布
+    data_source = "歷史"
     last_t = "無即時資料"
     api_status_code = 0 
     
-    # 1. 永豐 API (優先)
-    if is_intra and sj_api:
-        try:
-            contracts = [sj_api.Contracts.Stocks[c] for c in final_codes if c in sj_api.Contracts.Stocks]
-            if contracts:
-                snaps = sj_api.snapshots(contracts)
-                ts_obj = datetime.now()
-                count_sj = 0
-                for s in snaps:
-                    if s.close > 0: 
-                        pmap[s.code] = float(s.close)
-                        ts_obj = datetime.fromtimestamp(s.ts/1e9)
-                        count_sj += 1
-                
-                if count_sj > 0:
-                    last_t = ts_obj.strftime("%H:%M:%S")
-                    data_source_list.append(f"永豐API:{count_sj}")
-                    api_status_code = 2
+    if is_intra:
+        # 1. 永豐 API
+        if sj_api:
+            try:
+                contracts = [sj_api.Contracts.Stocks[c] for c in final_codes if c in sj_api.Contracts.Stocks]
+                if contracts:
+                    snaps = sj_api.snapshots(contracts)
+                    ts_obj = datetime.now()
+                    count_sj = 0
+                    for s in snaps:
+                        if s.close > 0: 
+                            pmap[s.code] = float(s.close)
+                            ts_obj = datetime.fromtimestamp(s.ts/1e9)
+                            count_sj += 1
+                    
+                    if count_sj > 0:
+                        last_t = ts_obj.strftime("%H:%M:%S")
+                        data_source = "永豐API"
+                        api_status_code = 2
+                    else: api_status_code = 1
                 else: api_status_code = 1
-            else: api_status_code = 1
-        except: api_status_code = 1 
-    
-    # 2. Yahoo 備援 (補位)
-    missing_codes = [c for c in final_codes if c not in pmap]
-    if missing_codes:
-        yf_map = get_prices_yf(missing_codes)
-        if yf_map:
-            pmap.update(yf_map)
-            data_source_list.append(f"Yahoo:{len(yf_map)}")
-            if last_t == "無即時資料":
+            except: api_status_code = 1 
+        
+        # 2. Yahoo 雙規備援 (TSE + OTC)
+        missing_codes = [c for c in final_codes if c not in pmap]
+        if missing_codes:
+            yf_map = get_prices_yf_smart(missing_codes) # 使用新的智慧抓取
+            if yf_map:
+                pmap.update(yf_map)
+                data_source = "Yahoo備援(雙規)"
                 last_t = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
-
-    # 3. FinMind 盤後備援 (最後一道防線，嘗試抓今日收盤)
-    missing_codes_2 = [c for c in final_codes if c not in pmap]
-    if missing_codes_2:
-        # 這裡嘗試抓 d_cur (今天) 的資料
-        fm_map = get_prices_fm_today(ft, d_cur)
-        if fm_map:
-            count_fm = 0
-            for c in missing_codes_2:
-                if c in fm_map and fm_map[c] > 0:
-                    pmap[c] = fm_map[c]
-                    count_fm += 1
-            if count_fm > 0:
-                data_source_list.append(f"FinMind:{count_fm}")
-
-    src_display = ", ".join(data_source_list) if data_source_list else "無"
 
     s_dt = (datetime.now()-timedelta(days=40)).strftime("%Y-%m-%d")
     h_c, v_c, h_p, v_p = 0, 0, 0, 0
@@ -337,7 +327,7 @@ def fetch_all():
             else:
                 if curr_p == 0: 
                     c_stt = "⚠️無報價"
-                    note += "來源全漏 "
+                    note += "Yahoo抓不到 "
                 if len(df_cur) < 5: 
                     c_stt = "⚠️無MA5"
                     note += "歷史過短 "
@@ -361,27 +351,24 @@ def fetch_all():
         if not tw.empty:
             t_pre = float(tw[tw['date']==d_pre].iloc[0]['close']) if not tw[tw['date']==d_pre].empty else 0
             
-            # 大盤也嘗試多重來源
-            if "永豐API" in src_display:
+            if data_source == "永豐API":
                 try: t_cur = float(sj_api.snapshots([sj_api.Contracts.Indices.TSE.TSE001])[0].close)
                 except: pass
             
-            if t_cur == 0: # 嘗試 Yahoo
+            if t_cur == 0: # Yahoo Backup
                 try: 
                     yf_tw = yf.download("^TWII", period="1d", progress=False)['Close']
                     if not yf_tw.empty: t_cur = float(yf_tw.iloc[-1])
                 except: pass
             
-            if t_cur == 0: # 嘗試 FinMind 歷史
+            if t_cur == 0: 
                 r = tw[tw['date']==d_cur]
                 if not r.empty: t_cur = float(r.iloc[0]['close'])
-            
             if t_cur > 0:
                 if tw.iloc[-1]['date'] != d_cur:
                     tw = pd.concat([tw, pd.DataFrame([{'date':d_cur, 'close':t_cur}])], ignore_index=True)
                 else:
                     tw.iloc[-1, tw.columns.get_loc('close')] = t_cur
-            
             if len(tw) >= 6:
                 tw['MA5'] = tw['close'].rolling(5).mean()
                 slope = tw.iloc[-1]['MA5'] - tw.iloc[-2]['MA5']
@@ -395,7 +382,7 @@ def fetch_all():
         "d":d_cur, "d_prev": d_pre,
         "br":br_c, "br_p":br_p, "h":h_c, "v":v_c, "h_p":h_p, "v_p":v_p,
         "df":pd.DataFrame(dtls), 
-        "t":last_t, "tc":t_chg, "slope":slope, "src_display": src_display,
+        "t":last_t, "tc":t_chg, "slope":slope, "src_type": data_source,
         "raw":{'Date':d_cur,'Time':rec_t,'Breadth':br_c}, "src":msg_src,
         "api_status": api_status_code, "sj_err": sj_err
     }
@@ -427,7 +414,7 @@ def run_app():
         data = fetch_all()
         if isinstance(data, str): st.error(f"❌ {data}")
         elif data:
-            st.sidebar.info(f"來源: {data['src_display']}")
+            st.sidebar.info(f"報價來源: {data['src_type']}")
             status_code = data['api_status']
             if status_code == 2: st.sidebar.success("🟢 永豐連線正常")
             elif status_code == 1: st.sidebar.warning("🟠 連線成功但無報價 (忙線中)")
