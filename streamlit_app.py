@@ -9,11 +9,12 @@ import os, sys, requests
 import altair as alt
 import yfinance as yf
 import time as time_module
+import random
 
 # ==========================================
-# 設定區 v9.1.0 (流量管制優化版)
+# 設定區 v9.3.0 (全時段補價版)
 # ==========================================
-APP_VER = "v9.1.0 (流量管制版)"
+APP_VER = "v9.3.0 (全時段補價版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -91,11 +92,14 @@ def get_days(token):
         if not df.empty: dates = sorted(df['date'].unique().tolist())
     except: pass
     
+    # 強制校正日期
     now = datetime.now(timezone(timedelta(hours=8)))
     today_str = now.strftime("%Y-%m-%d")
+    # 只要是平日且開盤後，今天就是交易日，不管資料庫有沒有
     if 0 <= now.weekday() <= 4 and now.time() >= time(8,45):
         if not dates or today_str > dates[-1]:
             dates.append(today_str)
+            
     return dates
 
 @st.cache_data(ttl=86400)
@@ -132,7 +136,7 @@ def get_prices_yf_robust(codes):
     unknown_codes = []
     chunk_size = 50
     
-    # 1. TSE
+    # 1. TSE (.TW)
     for i in range(0, len(codes), chunk_size):
         chunk = codes[i:i+chunk_size]
         tickers = [f"{c}.TW" for c in chunk]
@@ -150,7 +154,7 @@ def get_prices_yf_robust(codes):
             else: unknown_codes.extend(chunk)
         except: unknown_codes.extend(chunk)
     
-    # 2. OTC
+    # 2. OTC (.TWO) - 補抓上櫃
     if unknown_codes:
         unknown_codes = list(set(unknown_codes))
         for i in range(0, len(unknown_codes), chunk_size):
@@ -231,7 +235,11 @@ def fetch_all():
     
     d_cur, d_pre = days[-1], days[-2]
     now = datetime.now(timezone(timedelta(hours=8)))
+    # is_intra 僅用於判斷是否「盤中」，不影響「是否要抓報價」
     is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
+    
+    # [修正] 只要是平日開盤後 (08:45~)，都允許抓即時資料填補空窗，直到 FinMind 資料庫更新
+    allow_live_fetch = (0<=now.weekday()<=4) and (now.time() >= time(8,45))
     
     codes_cur = get_ranks(ft, d_cur)
     codes_pre = get_ranks(ft, d_pre)
@@ -242,30 +250,28 @@ def fetch_all():
     data_source = "歷史"
     last_t = "無即時資料"
     api_status_code = 0 
-    sj_usage_info = "無資料" # 用量資訊
+    sj_usage_info = "無資料"
     
-    if is_intra:
-        # 1. 永豐 API (分批抓取模式)
+    # [修正] 只要允許抓取，就執行雙軌策略
+    if allow_live_fetch:
+        # 1. 永豐 API (分批+慢速)
         if sj_api:
             try:
-                # [新增] 抓取用量資訊
                 try:
                     usage = sj_api.usage()
                     if usage: sj_usage_info = str(usage)
                 except: sj_usage_info = "無法取得"
 
-                # 準備合約
                 contracts = []
                 for c in final_codes:
                     if c in sj_api.Contracts.Stocks: contracts.append(sj_api.Contracts.Stocks[c])
                 
-                # [關鍵修正] 分批抓取 (Batch Snapshots)
-                # 每次抓 80 檔，避免觸發 50次/5秒 限制 (如果是算總量) 或是封包過大
-                chunk_size = 80 
+                chunk_size = 20 # 慢速策略
                 count_sj = 0
                 ts_obj = datetime.now()
                 
                 if contracts:
+                    # 盤後不需要顯示進度條，默默跑就好
                     for i in range(0, len(contracts), chunk_size):
                         chunk = contracts[i:i+chunk_size]
                         try:
@@ -275,8 +281,7 @@ def fetch_all():
                                     pmap[s.code] = float(s.close)
                                     ts_obj = datetime.fromtimestamp(s.ts/1e9)
                                     count_sj += 1
-                            # [關鍵] 休息一下，避免被鎖
-                            time_module.sleep(0.5) 
+                            time_module.sleep(1.0) # 休息 1 秒
                         except: pass
                     
                     if count_sj > 0:
@@ -287,7 +292,7 @@ def fetch_all():
                 else: api_status_code = 1
             except: api_status_code = 1 
         
-        # 2. Yahoo 備援
+        # 2. Yahoo 雙規備援 (補位)
         if not pmap:
             pmap = get_prices_yf_robust(final_codes)
             if pmap:
@@ -315,16 +320,20 @@ def fetch_all():
         # 今日
         curr_p = pmap.get(c, 0)
         c_ma5, c_stt, note = 0, "-", ""
+        
         if not df.empty:
             df_cur = df.copy()
-            if is_intra and curr_p > 0:
+            # [修正] 只要有抓到 pmap (不論盤中盤後)，就塞入計算
+            if curr_p > 0:
                 if df_cur.iloc[-1]['date'] != d_cur:
                     df_cur = pd.concat([df_cur, pd.DataFrame([{'date': d_cur, 'close': curr_p}])], ignore_index=True)
                 else:
                     df_cur.iloc[-1, df_cur.columns.get_loc('close')] = curr_p
+            # 若沒抓到 pmap，但已經是盤後且 FinMind 有資料
             elif not is_intra:
                 row = df_cur[df_cur['date'] == d_cur]
                 if not row.empty: curr_p = float(row.iloc[0]['close'])
+            
             if curr_p > 0 and len(df_cur) >= 5:
                 df_cur['MA5'] = df_cur['close'].rolling(5).mean()
                 c_ma5 = df_cur.iloc[-1]['MA5']
@@ -414,7 +423,6 @@ def run_app():
         if isinstance(data, str): st.error(f"❌ {data}")
         elif data:
             st.sidebar.info(f"報價來源: {data['src_type']}")
-            # 顯示 API 用量
             st.sidebar.caption(f"永豐API額度: {data.get('sj_usage', '未知')}")
             
             status_code = data['api_status']
