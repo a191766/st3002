@@ -16,12 +16,13 @@ import requests
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v8.1.1 (緊急修復版)"
+APP_VERSION = "v8.2.0 (自動重連修復版)"
 UPDATE_LOG = """
-- v8.1.0: 急速變動警報。
 - v8.1.1: 修復 Unpack Error。
-  1. 修正 `check_rapid_change` 在資料不足時回傳格式錯誤的問題。
-  2. 確保在剛啟動（無歷史檔）時也能正常運作，不會報錯。
+- v8.2.0: 解決 API 連線逾時問題。
+  1. 【API 快取優化】為 Shioaji API 加入 `ttl=3600` (1小時) 設定。
+  2. 避免因週末或長時間閒置導致連線中斷(Session Timeout)而抓不到資料。
+  3. 確保每次盤中交易時，連線都是新鮮有效的。
 """
 
 # ==========================================
@@ -34,7 +35,7 @@ RAPID_CHANGE_THRESHOLD = 0.02 # 急速變動門檻 (2%)
 EXCLUDE_PREFIXES = ["00", "91"]
 HISTORY_FILE = "breadth_history_v3.csv"
 
-st.set_page_config(page_title="盤中權證進場判斷 (v8.1.1)", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (v8.2.0)", layout="wide")
 
 # ==========================================
 # 🔐 Secrets
@@ -58,18 +59,12 @@ def send_telegram_notify(token, chat_id, msg):
         return False
 
 # ==========================================
-# ⚡ 急速變動檢查邏輯 (修正版)
+# ⚡ 急速變動檢查邏輯
 # ==========================================
 def check_rapid_change(current_row):
-    """
-    檢查是否有 3 分鐘內的劇烈波動
-    """
-    # [修正] 這裡必須回傳兩個 None，對應外面的 rapid_msg, alert_id
     if not os.path.exists(HISTORY_FILE): return None, None 
-    
     try:
         df = pd.read_csv(HISTORY_FILE)
-        # [修正] 這裡也必須回傳兩個 None
         if len(df) < 2: return None, None 
         
         curr_dt_str = f"{current_row['Date']} {current_row['Time']}"
@@ -95,25 +90,26 @@ def check_rapid_change(current_row):
                 direction = "上漲" if diff > 0 else "下跌"
                 p_time = target_row['Time'][:5] 
                 c_time = current_row['Time'][:5]
-                
                 msg = f"⚡ <b>【廣度急變警報】</b>\n{p_time}廣度{past_val:.0%}，{c_time}廣度{curr_val:.0%}，{direction}{abs(diff):.0%}"
                 return msg, curr_dt_str
-                
     except Exception as e:
         print(f"Rapid Check Error: {e}")
-        
     return None, None
 
 # ==========================================
-# API 初始化
+# API 初始化 (關鍵修正區)
 # ==========================================
-@st.cache_resource
+# [修正] 加入 ttl=3600 (秒)，設定快取有效期為 1 小時
+# 這樣可以強迫程式每小時重新登入一次，避免連線過期
+@st.cache_resource(ttl=3600) 
 def get_shioaji_api():
     api = sj.Shioaji(simulation=False)
     try:
         api_key = st.secrets["shioaji"]["api_key"]
         secret_key = st.secrets["shioaji"]["secret_key"]
         api.login(api_key=api_key, secret_key=secret_key)
+        # 簡單測試連線是否成功
+        # api.list_accounts() 
     except: return None
     return api
 
@@ -230,51 +226,31 @@ def plot_breadth_chart():
         )
 
         tick_values = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-        
-        y_axis_config = alt.Axis(
-            format='%',
-            values=tick_values,
-            tickCount=11,
-            labelOverlap=False
-        )
+        y_axis_config = alt.Axis(format='%', values=tick_values, tickCount=11, labelOverlap=False)
 
-        # 1. 廣度 (藍)
         line_breadth = base.mark_line(color='#007bff', clip=False).encode(
-            y=alt.Y('Breadth_Pct', 
-                    title=None, 
-                    scale=alt.Scale(domain=[0, 1], nice=False),
-                    axis=y_axis_config
-            )
+            y=alt.Y('Breadth_Pct', title=None, scale=alt.Scale(domain=[0, 1], nice=False), axis=y_axis_config)
         )
         point_breadth = base.mark_circle(color='#007bff', size=30, clip=False).encode(
-            y='Breadth_Pct',
-            tooltip=[alt.Tooltip('Datetime', format='%H:%M'), alt.Tooltip('Breadth_Pct', title='廣度', format='.1%')]
+            y='Breadth_Pct', tooltip=[alt.Tooltip('Datetime', format='%H:%M'), alt.Tooltip('Breadth_Pct', title='廣度', format='.1%')]
         )
 
-        # 2. 大盤 (黃)
         line_taiex = base.mark_line(color='#ffc107', strokeDash=[4,4], clip=False).encode(
             y=alt.Y('Taiex_Scaled', scale=alt.Scale(domain=[0, 1])) 
         )
         point_taiex = base.mark_circle(color='#ffc107', size=30, clip=False).encode(
-            y='Taiex_Scaled',
-            tooltip=[
-                alt.Tooltip('Datetime', format='%H:%M'), 
-                alt.Tooltip('Taiex_Change', title='大盤漲跌', format='.2%'),
-                alt.Tooltip('Taiex_Current', title='計算現價', format='.2f'),
-                alt.Tooltip('Taiex_Prev_Close', title='基準昨收', format='.2f')
+            y='Taiex_Scaled', tooltip=[
+                alt.Tooltip('Datetime', format='%H:%M'), alt.Tooltip('Taiex_Change', title='大盤漲跌', format='.2%'),
+                alt.Tooltip('Taiex_Current', title='計算現價', format='.2f'), alt.Tooltip('Taiex_Prev_Close', title='基準昨收', format='.2f')
             ]
         )
         
-        # 3. 參考線
         rule_red = alt.Chart(pd.DataFrame({'y': [BREADTH_THRESHOLD]})).mark_rule(color='red', strokeDash=[5, 5]).encode(y='y')
         rule_green = alt.Chart(pd.DataFrame({'y': [BREADTH_LOWER_REF]})).mark_rule(color='green', strokeDash=[5, 5]).encode(y='y')
 
         return (line_breadth + point_breadth + line_taiex + point_taiex + rule_red + rule_green).properties(
-            title=f"走勢對照 (藍:廣度 / 黃:大盤) - {base_date}",
-            height=400
-        ).resolve_scale(
-            y='shared' 
-        )
+            title=f"走勢對照 (藍:廣度 / 黃:大盤) - {base_date}", height=400
+        ).resolve_scale(y='shared')
     except: return None
 
 # ==========================================
@@ -291,7 +267,6 @@ def get_current_status():
 def get_trading_days_robust(token):
     dates = get_cached_trading_days(token)
     tw_now, _ = get_current_status()
-    
     if not dates:
         check_day = tw_now
         while len(dates) < 5:
@@ -299,16 +274,13 @@ def get_trading_days_robust(token):
                 dates.append(check_day.strftime("%Y-%m-%d"))
             check_day -= timedelta(days=1)
         dates = sorted(dates)
-
     today_str = tw_now.strftime("%Y-%m-%d")
     if 0 <= tw_now.weekday() <= 4 and tw_now.time() >= time(8, 45):
         if not dates or today_str > dates[-1]: dates.append(today_str)
-            
     if tw_now.weekday() > 4:
         days_to_fri = tw_now.weekday() - 4
         last_friday = (tw_now - timedelta(days=days_to_fri)).strftime("%Y-%m-%d")
         if not dates or last_friday > dates[-1]: dates.append(last_friday)
-            
     return dates
 
 def fetch_shioaji_snapshots(sj_api, codes):
@@ -444,28 +416,22 @@ def fetch_data():
         if curr_taiex_price == 0:
             curr_row = twii_df[twii_df['date'] == d_curr_str]
             if not curr_row.empty: curr_taiex_price = float(curr_row.iloc[0]['close'])
-                
         if curr_taiex_price == 0:
             try:
                 yf_data = yf.Ticker("^TWII").history(period="5d")
                 if not yf_data.empty: curr_taiex_price = float(yf_data.iloc[-1]['Close'])
             except: pass
-
         if curr_taiex_price > 0:
             if twii_df.empty or twii_df.iloc[-1]['date'] != d_curr_str:
                 new_row = pd.DataFrame([{'date': d_curr_str, 'close': curr_taiex_price}])
                 twii_df = pd.concat([twii_df, new_row], ignore_index=True)
-        
         twii_df['MA5'] = twii_df['close'].rolling(5).mean()
         slope = twii_df['MA5'].iloc[-1] - twii_df['MA5'].iloc[-2]
-        
         if prev_close_price > 0 and curr_taiex_price > 0:
             taiex_change = (curr_taiex_price - prev_close_price) / prev_close_price
-            
     except: pass
     
     br_curr = hit_curr / valid_curr if valid_curr > 0 else 0
-    
     record_time = "14:30:00" if not is_intraday else (last_time if last_time and "無" not in str(last_time) else datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S"))
     
     save_breadth_record(d_curr_str, record_time, br_curr, taiex_change, curr_taiex_price, prev_close_price, is_intraday)
@@ -494,26 +460,20 @@ def fetch_data():
 # UI
 # ==========================================
 def run_streamlit():
-    st.title("📈 盤中權證進場判斷 (v8.1.1)")
+    st.title("📈 盤中權證進場判斷 (v8.2.0)")
     
-    if 'last_alert_status' not in st.session_state:
-        st.session_state['last_alert_status'] = 'normal'
-    if 'last_rapid_alert_time' not in st.session_state:
-        st.session_state['last_rapid_alert_time'] = ""
+    if 'last_alert_status' not in st.session_state: st.session_state['last_alert_status'] = 'normal'
+    if 'last_rapid_alert_time' not in st.session_state: st.session_state['last_rapid_alert_time'] = ""
 
     with st.sidebar:
         st.subheader("Telegram 通知設定")
         auto_refresh = st.checkbox("啟用自動更新 (動態變速)", value=False)
-        
         tg_secrets = st.secrets.get("telegram", {})
         tg_token = st.text_input("Bot Token", value=tg_secrets.get("token", ""), type="password")
         tg_chat_id = st.text_input("Chat ID", value=tg_secrets.get("chat_id", ""))
         
-        if tg_token and tg_chat_id:
-            st.success("Telegram 設定已就緒")
-        else:
-            st.info("請輸入 Token 與 Chat ID 以啟用通知")
-
+        if tg_token and tg_chat_id: st.success("Telegram 設定已就緒")
+        else: st.info("請輸入 Token 與 Chat ID 以啟用通知")
         st.markdown(UPDATE_LOG)
 
     if st.button("🔄 立即重新整理"): pass 
@@ -521,86 +481,4 @@ def run_streamlit():
     try:
         data = fetch_data()
         if data:
-            curr_breadth = data['br_curr']
-            
-            # === Telegram 通知邏輯 ===
-            if tg_token and tg_chat_id:
-                current_status = 'normal'
-                level_msg = ""
-                
-                if curr_breadth >= BREADTH_THRESHOLD:
-                    current_status = 'overheated'
-                    level_msg = f"🔥 <b>【廣度過熱警報】</b>\n目前廣度: {curr_breadth:.1%}\n已突破 65% 紅線！\n時間: {data['last_time']}"
-                elif curr_breadth <= BREADTH_LOWER_REF:
-                    current_status = 'oversold'
-                    level_msg = f"❄️ <b>【廣度冰點警報】</b>\n目前廣度: {curr_breadth:.1%}\n已跌破 55% 綠線！\n時間: {data['last_time']}"
-                
-                if current_status != st.session_state['last_alert_status']:
-                    if current_status != 'normal':
-                        if send_telegram_notify(tg_token, tg_chat_id, level_msg):
-                            st.toast(f"水位警報已發送", icon="📢")
-                    st.session_state['last_alert_status'] = current_status
-
-                # 急速變動警報 (v8.1.1 修正版：確保回傳兩個值)
-                rapid_msg, alert_id = check_rapid_change(data['raw_record'])
-                
-                if rapid_msg:
-                    if alert_id != st.session_state['last_rapid_alert_time']:
-                        if send_telegram_notify(tg_token, tg_chat_id, rapid_msg):
-                            st.toast(f"急速變動警報已發送", icon="⚡")
-                            st.session_state['last_rapid_alert_time'] = alert_id
-
-            cond1 = (data['br_curr'] >= BREADTH_THRESHOLD) and (data['br_prev'] >= BREADTH_THRESHOLD)
-            cond2 = data['slope'] > 0
-            
-            st.subheader(f"📅 基準日：{data['d_curr']}")
-            st.caption(f"昨日基準: {data['d_prev']}")
-            st.info(f"ℹ️ {data['rank_source_msg']}") 
-            
-            chart = plot_breadth_chart()
-            if chart: st.altair_chart(chart, use_container_width=True)
-            
-            c1, c2, c3 = st.columns(3)
-            c1.metric("今日廣度", f"{data['br_curr']:.1%}", f"{data['hit_curr']}/{data['valid_curr']}")
-            c2.metric("昨日廣度", f"{data['br_prev']:.1%}", f"{data['hit_prev']}/{data['valid_prev']}")
-            c3.metric("大盤MA5斜率", f"{data['slope']:.2f}", "正 ✓" if cond2 else "非正 ✗")
-
-            if cond1 and cond2: st.success("✅ 結論：可進場")
-            else: st.error("⛔ 結論：不可進場")
-            
-            st.caption(f"報價時間: {data['last_time']}")
-            st.dataframe(data['detail_df'], use_container_width=True, hide_index=True)
-            
-    except Exception as e: st.error(f"Error: {e}")
-
-    if auto_refresh:
-        tw_now, is_intraday = get_current_status()
-        
-        if is_intraday:
-            curr_time = tw_now.time()
-            if time(9, 0) <= curr_time < time(10, 0):
-                refresh_interval = 60
-            elif time(10, 0) <= curr_time < time(12, 30):
-                refresh_interval = 180
-            elif time(12, 30) <= curr_time < time(13, 30):
-                refresh_interval = 60
-            else:
-                refresh_interval = 180
-
-            with st.sidebar:
-                st.write("---")
-                timer_text = st.empty()
-                
-            for i in range(refresh_interval, 0, -1):
-                timer_text.info(f"⏳ 下次更新：{i} 秒後 (頻率: {refresh_interval}秒/次)")
-                time_module.sleep(1)
-            
-            st.rerun()
-        else:
-            with st.sidebar: st.warning("⏸ 非盤中，暫停更新")
-
-if __name__ == "__main__":
-    if 'streamlit' in sys.modules:
-        run_streamlit()
-    else:
-        input("按 Enter 結束...")
+            curr_breadth = data['br_
