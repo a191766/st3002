@@ -12,13 +12,14 @@ import time as time_module
 import random
 
 # ==========================================
-# 設定區 v9.6.0 (市場分類版)
+# 設定區 v9.7.0 (規則調整版)
 # ==========================================
-APP_VER = "v9.6.0 (市場分類+興櫃識別)"
+APP_VER = "v9.7.0 (規則調整版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
-RAPID_THR = 0.02 
+# [修改] 通知閾值改為 3%
+RAPID_THR = 0.03 
 EXCL_PFX = ["00", "91"]
 HIST_FILE = "breadth_history_v3.csv"
 
@@ -47,16 +48,25 @@ def check_rapid(row):
         curr_dt = datetime.strptime(f"{row['Date']} {row['Time']}", "%Y-%m-%d %H:%M")
         curr_v = float(row['Breadth'])
         target = None
-        for i in range(2, min(10, len(df)+1)):
+        
+        # 往回找符合時間差的紀錄
+        for i in range(2, min(15, len(df)+1)): # 稍微增加搜尋範圍
             r = df.iloc[-i]
             try: r_t = r['Time'] if len(str(r['Time']))==5 else r['Time'][:5]
             except: continue
+            
             r_dt = datetime.strptime(f"{r['Date']} {r_t}", "%Y-%m-%d %H:%M")
-            if 170 <= (curr_dt - r_dt).total_seconds() <= 190:
+            seconds_diff = (curr_dt - r_dt).total_seconds()
+            
+            # [修改] 判定時間差是否約為 4 分鐘 (240秒)
+            # 設定範圍 230 ~ 250 秒
+            if 230 <= seconds_diff <= 250:
                 target = r; break
+                
         if target is not None:
             prev_v = float(target['Breadth'])
             diff = curr_v - prev_v
+            # RAPID_THR 已改為 0.03
             if abs(diff) >= RAPID_THR:
                 d_str = "上漲" if diff>0 else "下跌"
                 msg = f"⚡ <b>【廣度急變】</b>\n{target['Time'][:5]}廣度{prev_v:.0%}，{row['Time']}廣度{curr_v:.0%}，{d_str}{abs(diff):.0%}"
@@ -99,15 +109,12 @@ def get_days(token):
             dates.append(today_str)
     return dates
 
-# [新增] 取得股票基本資料 (為了分辨 上市/上櫃/興櫃)
 @st.cache_data(ttl=86400)
 def get_stock_info_map(token):
     api = DataLoader(); api.login_by_token(token)
     try:
         df = api.taiwan_stock_info()
         if df.empty: return {}
-        # 建立 ID -> 市場別 的對照表
-        # type: twse(上市), tpex(上櫃), emerging(興櫃)
         df['stock_id'] = df['stock_id'].astype(str)
         return dict(zip(df['stock_id'], df['type']))
     except: return {}
@@ -245,7 +252,6 @@ def fetch_all():
     days = get_days(ft)
     if len(days)<2: return "日期資料不足"
     
-    # 1. 取得基本資料對照表 (為了分辨上市/上櫃/興櫃)
     info_map = get_stock_info_map(ft)
     
     d_cur, d_pre = days[-1], days[-2]
@@ -318,11 +324,9 @@ def fetch_all():
     
     for c in final_codes:
         df = get_hist(ft, c, s_dt)
-        # 取得市場別
         m_type = info_map.get(c, "未知")
         m_display = {"twse":"上市", "tpex":"上櫃", "emerging":"興櫃"}.get(m_type, "未知")
         
-        # 昨日
         p_price, p_ma5, p_stt = 0, 0, "-"
         if not df.empty:
             df_pre = df[df['date'] <= d_pre].copy()
@@ -334,7 +338,7 @@ def fetch_all():
                     if p_price > p_ma5: h_p += 1; p_stt="✅"
                     else: p_stt="📉"
                     v_p += 1
-        # 今日
+        
         curr_p = pmap.get(c, 0)
         c_ma5, c_stt, note = 0, "-", ""
         
@@ -358,7 +362,6 @@ def fetch_all():
             else:
                 if curr_p == 0: 
                     c_stt = "⚠️無報價"
-                    # [新增] 興櫃特別提示
                     if m_type == "emerging" and "Yahoo" in data_source:
                         note += "Yahoo不支援興櫃 "
                     else:
@@ -495,7 +498,8 @@ def run_app():
         now = datetime.now(timezone(timedelta(hours=8)))
         is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
         if is_intra:
-            sec = 60 if (time(9,0)<=now.time()<time(10,0) or time(12,30)<=now.time()<time(13,30)) else 180
+            # [修改] 統一固定 120 秒
+            sec = 120
             with st.sidebar:
                 t = st.empty()
                 for i in range(sec, 0, -1):
