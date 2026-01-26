@@ -11,9 +11,9 @@ import yfinance as yf
 import time as time_module
 
 # ==========================================
-# 設定區 v8.7.0 (狀態同步優化版)
+# 設定區 v8.7.1 (圖表修復版)
 # ==========================================
-APP_VER = "v8.7.0 (狀態同步優化版)"
+APP_VER = "v8.7.1 (圖表修復版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -43,12 +43,12 @@ def check_rapid(row):
     try:
         df = pd.read_csv(HIST_FILE)
         if len(df) < 2: return None, None
-        curr_dt = datetime.strptime(f"{row['Date']} {row['Time']}", "%Y-%m-%d %H:%M:%S")
+        curr_dt = datetime.strptime(f"{row['Date']} {row['Time']}", "%Y-%m-%d %H:%M")
         curr_v = float(row['Breadth'])
         target = None
         for i in range(2, min(10, len(df)+1)):
             r = df.iloc[-i]
-            r_dt = datetime.strptime(f"{r['Date']} {r['Time']}", "%Y-%m-%d %H:%M:%S")
+            r_dt = datetime.strptime(f"{r['Date']} {r['Time']}", "%Y-%m-%d %H:%M")
             if 170 <= (curr_dt - r_dt).total_seconds() <= 190:
                 target = r; break
         if target is not None:
@@ -56,7 +56,7 @@ def check_rapid(row):
             diff = curr_v - prev_v
             if abs(diff) >= RAPID_THR:
                 d_str = "上漲" if diff>0 else "下跌"
-                msg = f"⚡ <b>【廣度急變】</b>\n{target['Time'][:5]}廣度{prev_v:.0%}，{row['Time'][:5]}廣度{curr_v:.0%}，{d_str}{abs(diff):.0%}"
+                msg = f"⚡ <b>【廣度急變】</b>\n{target['Time']}廣度{prev_v:.0%}，{row['Time']}廣度{curr_v:.0%}，{d_str}{abs(diff):.0%}"
                 return msg, str(curr_dt)
     except: pass
     return None, None
@@ -134,20 +134,30 @@ def get_prices_yf(codes):
 
 def save_rec(d, t, b, tc, t_cur, t_prev, intra):
     if t_cur == 0: return 
-    row = pd.DataFrame([{'Date':d,'Time':t,'Breadth':b,'Taiex_Change':tc,'Taiex_Current':t_cur,'Taiex_Prev_Close':t_prev}])
+    # [修復] 時間只取到「分」，忽略秒數，避免同一分鐘重複存檔導致圖表變形
+    t_short = t[:5] 
+    
+    row = pd.DataFrame([{'Date':d,'Time':t_short,'Breadth':b,'Taiex_Change':tc,'Taiex_Current':t_cur,'Taiex_Prev_Close':t_prev}])
     if not os.path.exists(HIST_FILE): 
         row.to_csv(HIST_FILE, index=False); return
     try:
         df = pd.read_csv(HIST_FILE)
         if df.empty: row.to_csv(HIST_FILE, index=False); return
+        
         df['Date'] = df['Date'].astype(str)
-        if str(df.iloc[-1]['Date']) != str(d): 
+        df['Time'] = df['Time'].astype(str)
+        
+        last_d = str(df.iloc[-1]['Date'])
+        last_t = str(df.iloc[-1]['Time'])
+        
+        if last_d != str(d): 
             pd.concat([df, row], ignore_index=True).to_csv(HIST_FILE, index=False)
         else:
             if not intra: 
                 df = df[df['Date'] != str(d)]
                 pd.concat([df, row], ignore_index=True).to_csv(HIST_FILE, index=False)
-            elif str(df.iloc[-1]['Time']) != str(t): 
+            # [修復] 只有當「分」不同時才 Append，解決 Yahoo 模式下資料過密的問題
+            elif last_t != str(t_short): 
                 row.to_csv(HIST_FILE, mode='a', header=False, index=False)
     except: row.to_csv(HIST_FILE, index=False)
 
@@ -158,17 +168,23 @@ def plot_chart():
         if df.empty: return None
         df['DT'] = pd.to_datetime(df['Date'].astype(str)+' '+df['Time'].astype(str))
         df['T_S'] = (df['Taiex_Change']*10)+0.5
+        
         base_d = df.iloc[-1]['Date']
         chart_data = df[df['Date'] == base_d].copy()
         if chart_data.empty: return None
+
+        start_t = pd.to_datetime(f"{base_d} 09:00:00")
+        end_t = pd.to_datetime(f"{base_d} 14:30:00")
         
-        base = alt.Chart(chart_data).encode(x=alt.X('DT', title='時間', axis=alt.Axis(format='%H:%M'), scale=alt.Scale(domain=[pd.to_datetime(f"{base_d} 09:00:00"), pd.to_datetime(f"{base_d} 14:30:00")])))
+        base = alt.Chart(chart_data).encode(x=alt.X('DT', title='時間', axis=alt.Axis(format='%H:%M'), scale=alt.Scale(domain=[start_t, end_t])))
         y_ax = alt.Axis(format='%', values=[i/10 for i in range(11)], tickCount=11, labelOverlap=False)
         
         l_b = base.mark_line(color='#007bff').encode(y=alt.Y('Breadth', title=None, scale=alt.Scale(domain=[0,1], nice=False), axis=y_ax))
-        p_b = base.mark_circle(color='#007bff', size=30).encode(y='Breadth', tooltip=['DT', alt.Tooltip('Breadth', format='.1%')])
+        # [修復] 縮小點的大小 size=30 -> size=15
+        p_b = base.mark_circle(color='#007bff', size=15).encode(y='Breadth', tooltip=['DT', alt.Tooltip('Breadth', format='.1%')])
         l_t = base.mark_line(color='#ffc107', strokeDash=[4,4]).encode(y=alt.Y('T_S', scale=alt.Scale(domain=[0,1])))
-        p_t = base.mark_circle(color='#ffc107', size=30).encode(y='T_S', tooltip=['DT', alt.Tooltip('Taiex_Change', format='.2%')])
+        p_t = base.mark_circle(color='#ffc107', size=15).encode(y='T_S', tooltip=['DT', alt.Tooltip('Taiex_Change', format='.2%')])
+        
         rule_r = alt.Chart(pd.DataFrame({'y':[BREADTH_THR]})).mark_rule(color='red', strokeDash=[5,5]).encode(y='y')
         rule_g = alt.Chart(pd.DataFrame({'y':[BREADTH_LOW]})).mark_rule(color='green', strokeDash=[5,5]).encode(y='y')
         
@@ -195,7 +211,6 @@ def fetch_all():
     pmap = {}
     data_source = "歷史"
     last_t = "無即時資料"
-    # 連線狀態標記：0=未連線, 1=登入成功但無資料, 2=運作正常
     api_status_code = 0 
     
     if is_intra:
@@ -210,16 +225,16 @@ def fetch_all():
                             pmap[s.code] = float(s.close)
                             ts_obj = datetime.fromtimestamp(s.ts/1e9)
                     
-                    if pmap: # 真的有抓到資料
+                    if pmap: 
                         last_t = ts_obj.strftime("%H:%M:%S")
                         data_source = "永豐API"
                         api_status_code = 2
-                    else: # 登入成功但沒資料
+                    else: 
                         api_status_code = 1
                 else:
                     api_status_code = 1
             except: 
-                api_status_code = 1 # 發生錯誤
+                api_status_code = 1 
         
         if not pmap:
             pmap = get_prices_yf(final_codes)
@@ -341,7 +356,6 @@ def run_app():
         elif data:
             st.sidebar.info(f"報價來源: {data['src_type']}")
             
-            # 依據實際數據狀況顯示狀態
             status_code = data['api_status']
             if status_code == 2:
                 st.sidebar.success("🟢 永豐連線正常")
