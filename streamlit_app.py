@@ -5,23 +5,23 @@ import numpy as np
 from FinMind.data import DataLoader
 from datetime import datetime, timedelta, timezone, time
 import shioaji as sj
-import os, sys, requests
+import os, sys, requests, json
 import altair as alt
 import yfinance as yf
 import time as time_module
 import random
 
 # ==========================================
-# 設定區 v9.7.0 (規則調整版)
+# 設定區 v9.8.0 (永久記憶版)
 # ==========================================
-APP_VER = "v9.7.0 (規則調整版)"
+APP_VER = "v9.8.0 (硬碟存檔+永久記憶)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
-# [修改] 通知閾值改為 3%
 RAPID_THR = 0.03 
 EXCL_PFX = ["00", "91"]
 HIST_FILE = "breadth_history_v3.csv"
+RANK_FILE = "ranking_cache.json" # [新增] 名單存檔路徑
 
 st.set_page_config(page_title="盤中權證進場判斷", layout="wide")
 
@@ -49,8 +49,7 @@ def check_rapid(row):
         curr_v = float(row['Breadth'])
         target = None
         
-        # 往回找符合時間差的紀錄
-        for i in range(2, min(15, len(df)+1)): # 稍微增加搜尋範圍
+        for i in range(2, min(15, len(df)+1)):
             r = df.iloc[-i]
             try: r_t = r['Time'] if len(str(r['Time']))==5 else r['Time'][:5]
             except: continue
@@ -58,15 +57,13 @@ def check_rapid(row):
             r_dt = datetime.strptime(f"{r['Date']} {r_t}", "%Y-%m-%d %H:%M")
             seconds_diff = (curr_dt - r_dt).total_seconds()
             
-            # [修改] 判定時間差是否約為 4 分鐘 (240秒)
-            # 設定範圍 230 ~ 250 秒
+            # 4分鐘 (230~250秒)
             if 230 <= seconds_diff <= 250:
                 target = r; break
                 
         if target is not None:
             prev_v = float(target['Breadth'])
             diff = curr_v - prev_v
-            # RAPID_THR 已改為 0.03
             if abs(diff) >= RAPID_THR:
                 d_str = "上漲" if diff>0 else "下跌"
                 msg = f"⚡ <b>【廣度急變】</b>\n{target['Time'][:5]}廣度{prev_v:.0%}，{row['Time']}廣度{curr_v:.0%}，{d_str}{abs(diff):.0%}"
@@ -119,28 +116,45 @@ def get_stock_info_map(token):
         return dict(zip(df['stock_id'], df['type']))
     except: return {}
 
-@st.cache_data(ttl=86400, show_spinner=False) 
-def get_ranks_smart(token, d_str):
+# [核心功能] 永久記憶名單讀取/寫入
+def get_persistent_ranks(token, d_str):
+    # 1. 先檢查硬碟有沒有檔案
+    if os.path.exists(RANK_FILE):
+        try:
+            with open(RANK_FILE, 'r') as f:
+                data = json.load(f)
+                # 如果檔案裡的日期 == 我們要的日期，且名單不為空
+                if data.get("date") == d_str and data.get("ranks"):
+                    return data["ranks"], True # True 代表是從硬碟讀的
+        except: pass
+
+    # 2. 硬碟沒有，才去問 FinMind
     api = DataLoader(); api.login_by_token(token)
     df = pd.DataFrame()
     try: df = api.taiwan_stock_daily(stock_id="", start_date=d_str)
     except: pass
     
-    if df.empty:
-        now_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
-        if d_str == now_str:
-            raise ValueError("Data Not Ready") 
-        return []
+    if df.empty: return [], False
 
     df['ID'] = get_col(df, ['stock_id','code'])
     df['Money'] = get_col(df, ['Trading_money','turnover'])
-    if df['ID'] is None or df['Money'] is None: return []
+    if df['ID'] is None or df['Money'] is None: return [], False
     
     df['ID'] = df['ID'].astype(str)
     df = df[df['ID'].str.len()==4]
     df = df[df['ID'].str.isdigit()]
     for p in EXCL_PFX: df = df[~df['ID'].str.startswith(p)]
-    return df.sort_values('Money', ascending=False).head(TOP_N)['ID'].tolist()
+    
+    ranks = df.sort_values('Money', ascending=False).head(TOP_N)['ID'].tolist()
+    
+    # 3. 抓到了！寫入硬碟存檔
+    if ranks:
+        try:
+            with open(RANK_FILE, 'w') as f:
+                json.dump({"date": d_str, "ranks": ranks}, f)
+        except: pass
+        
+    return ranks, False
 
 @st.cache_data(ttl=3600)
 def get_hist(token, code, start):
@@ -259,18 +273,28 @@ def fetch_all():
     is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
     allow_live_fetch = (0<=now.weekday()<=4) and (now.time() >= time(8,45))
     
-    target_date_for_ranks = d_pre 
+    # [核心修改] 決定使用哪個日期的名單 & 讀取硬碟快取
+    target_date_for_ranks = d_pre
+    
+    # 早上: 強制用昨天
     if now.time() < time(14, 0):
         target_date_for_ranks = d_pre
+        final_codes, from_disk = get_persistent_ranks(ft, target_date_for_ranks)
+        msg_src = f"名單:{target_date_for_ranks}(歷史)"
+    # 下午: 嘗試用今天
     else:
-        try:
-            test_ranks = get_ranks_smart(ft, d_cur)
-            if test_ranks: target_date_for_ranks = d_cur
-        except: target_date_for_ranks = d_pre
+        # 先嘗試拿今天的
+        codes_today, from_disk_today = get_persistent_ranks(ft, d_cur)
+        if codes_today:
+            target_date_for_ranks = d_cur
+            final_codes = codes_today
+            msg_src = f"名單:{d_cur} {'(硬碟)' if from_disk_today else '(新抓)'}"
+        else:
+            # 今天還沒出來，拿昨天的
+            target_date_for_ranks = d_pre
+            final_codes, _ = get_persistent_ranks(ft, d_pre)
+            msg_src = f"名單:{d_pre}(今天未出)"
 
-    final_codes = get_ranks_smart(ft, target_date_for_ranks)
-    msg_src = f"名單:{target_date_for_ranks}"
-    
     pmap = {}
     data_source = "歷史"
     last_t = "無即時資料"
@@ -436,6 +460,8 @@ def run_app():
         st.write("---")
         if st.button("⚡ 強制清除快取 (重抓名單)", type="primary"):
             st.cache_data.clear()
+            # 同時刪除硬碟快取，強制重來
+            if os.path.exists(RANK_FILE): os.remove(RANK_FILE)
             st.toast("快取已清除，正在重新抓取名單...", icon="🚀")
             time_module.sleep(1)
             st.rerun()
@@ -474,39 +500,4 @@ def run_app():
                     st.session_state['last_stt'] = stt
                 rap_msg, rid = check_rapid(data['raw'])
                 if rap_msg and rid != st.session_state['last_rap']:
-                    send_tg(tg_tok, tg_id, rap_msg); st.session_state['last_rap'] = rid
-
-            st.subheader(f"📅 {data['d']}")
-            st.caption(f"昨日基準: {data['d_prev']}")
-            st.info(f"{data['src']} | 更新: {data['t']}")
-            chart = plot_chart()
-            if chart: st.altair_chart(chart, use_container_width=True)
-            
-            c1,c2,c3 = st.columns(3)
-            c1.metric("今日廣度", f"{br:.1%}", f"{data['h']}/{data['v']}")
-            c1.caption(f"昨日廣度: {data['br_p']:.1%} ({data['h_p']}/{data['v_p']})")
-            
-            c2.metric("大盤漲跌", f"{data['tc']:.2%}")
-            sl = data['slope']; icon = "📈 正" if sl > 0 else "📉 負"
-            c3.metric("大盤MA5斜率", f"{sl:.2f}", icon)
-            
-            st.dataframe(data['df'], use_container_width=True, hide_index=True)
-        else: st.warning("⚠️ 無資料")
-    except Exception as e: st.error(f"Error: {e}")
-
-    if auto:
-        now = datetime.now(timezone(timedelta(hours=8)))
-        is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
-        if is_intra:
-            # [修改] 統一固定 120 秒
-            sec = 120
-            with st.sidebar:
-                t = st.empty()
-                for i in range(sec, 0, -1):
-                    t.info(f"⏳ {i}s")
-                    time_module.sleep(1)
-            st.rerun()
-        else: st.sidebar.warning("⏸ 休市")
-
-if __name__ == "__main__":
-    if 'streamlit' in sys.modules: run_app()
+                    send_tg(tg_tok, tg_id, rap_msg); st.session_state['
