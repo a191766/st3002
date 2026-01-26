@@ -5,16 +5,14 @@ import numpy as np
 from FinMind.data import DataLoader
 from datetime import datetime, timedelta, timezone, time
 import shioaji as sj
-import os
-import sys
-import requests
+import os, sys, requests
 import altair as alt
-import time as time_module
+import yfinance as yf # 關鍵備援
 
 # ==========================================
-# 設定區 v8.5.0 (功能全補齊版)
+# 設定區 v8.6.0 (日期邏輯修正+Yahoo備援)
 # ==========================================
-APP_VER = "v8.5.0 (完整功能回歸版)"
+APP_VER = "v8.6.0 (邏輯修正+Yahoo備援)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -80,13 +78,24 @@ def get_col(df, names):
         if n.lower() in cols: return df[cols[n.lower()]]
     return None
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=600) # 縮短 cache 時間以免日期卡住
 def get_days(token):
     api = DataLoader(); api.login_by_token(token)
+    dates = []
     try:
         df = api.taiwan_stock_daily(stock_id="0050", start_date=(datetime.now()-timedelta(days=20)).strftime("%Y-%m-%d"))
-        return sorted(df['date'].unique().tolist()) if not df.empty else []
-    except: return []
+        if not df.empty: dates = sorted(df['date'].unique().tolist())
+    except: pass
+    
+    # [關鍵修正] 強制補上「今天」，解決週一症候群
+    now = datetime.now(timezone(timedelta(hours=8)))
+    today_str = now.strftime("%Y-%m-%d")
+    # 如果是平日且已開盤，且今天不在名單內 -> 手動加入
+    if 0 <= now.weekday() <= 4 and now.time() >= time(8,45):
+        if not dates or today_str > dates[-1]:
+            dates.append(today_str)
+            
+    return dates
 
 @st.cache_data(ttl=86400)
 def get_ranks(token, d_str, bak_d=None):
@@ -115,6 +124,19 @@ def get_hist(token, code, start):
     try: return api.taiwan_stock_daily(stock_id=code, start_date=start)
     except: return pd.DataFrame()
 
+# [新增] Yahoo Finance 備援取價
+def get_prices_yf(codes):
+    try:
+        tickers = [f"{c}.TW" for c in codes]
+        # 下載 1 天資料
+        data = yf.download(tickers, period="1d", progress=False)['Close']
+        if data.empty: return {}
+        # 取最後一筆報價
+        last_prices = data.iloc[-1].to_dict()
+        # 轉換 Key 格式 "2330.TW" -> "2330"
+        return {k.replace(".TW", ""): v for k, v in last_prices.items() if not np.isnan(v)}
+    except: return {}
+
 def save_rec(d, t, b, tc, t_cur, t_prev, intra):
     if t_cur == 0: return 
     row = pd.DataFrame([{'Date':d,'Time':t,'Breadth':b,'Taiex_Change':tc,'Taiex_Current':t_cur,'Taiex_Prev_Close':t_prev}])
@@ -123,14 +145,20 @@ def save_rec(d, t, b, tc, t_cur, t_prev, intra):
     try:
         df = pd.read_csv(HIST_FILE)
         if df.empty: row.to_csv(HIST_FILE, index=False); return
-        last_d, last_t = str(df.iloc[-1]['Date']), str(df.iloc[-1]['Time'])
-        if last_d != str(d):
+        
+        # 確保格式一致
+        df['Date'] = df['Date'].astype(str)
+        
+        last_d = str(df.iloc[-1]['Date'])
+        last_t = str(df.iloc[-1]['Time'])
+        
+        if last_d != str(d): # 新的一天
             pd.concat([df, row], ignore_index=True).to_csv(HIST_FILE, index=False)
         else:
-            if not intra:
+            if not intra: # 盤後覆蓋
                 df = df[df['Date'] != str(d)]
                 pd.concat([df, row], ignore_index=True).to_csv(HIST_FILE, index=False)
-            elif last_t != str(t):
+            elif last_t != str(t): # 盤中新增
                 row.to_csv(HIST_FILE, mode='a', header=False, index=False)
     except: row.to_csv(HIST_FILE, index=False)
 
@@ -146,13 +174,17 @@ def plot_chart():
         chart_data = df[df['Date'] == base_d].copy()
         if chart_data.empty: return None
 
-        base = alt.Chart(chart_data).encode(x=alt.X('DT', title='時間', axis=alt.Axis(format='%H:%M'), scale=alt.Scale(domain=[pd.to_datetime(f"{base_d} 09:00:00"), pd.to_datetime(f"{base_d} 14:30:00")])))
+        start_t = pd.to_datetime(f"{base_d} 09:00:00")
+        end_t = pd.to_datetime(f"{base_d} 14:30:00")
+        
+        base = alt.Chart(chart_data).encode(x=alt.X('DT', title='時間', axis=alt.Axis(format='%H:%M'), scale=alt.Scale(domain=[start_t, end_t])))
         y_ax = alt.Axis(format='%', values=[i/10 for i in range(11)], tickCount=11, labelOverlap=False)
         
         l_b = base.mark_line(color='#007bff').encode(y=alt.Y('Breadth', title=None, scale=alt.Scale(domain=[0,1], nice=False), axis=y_ax))
         p_b = base.mark_circle(color='#007bff', size=30).encode(y='Breadth', tooltip=['DT', alt.Tooltip('Breadth', format='.1%')])
         l_t = base.mark_line(color='#ffc107', strokeDash=[4,4]).encode(y=alt.Y('T_S', scale=alt.Scale(domain=[0,1])))
         p_t = base.mark_circle(color='#ffc107', size=30).encode(y='T_S', tooltip=['DT', alt.Tooltip('Taiex_Change', format='.2%')])
+        
         rule_r = alt.Chart(pd.DataFrame({'y':[BREADTH_THR]})).mark_rule(color='red', strokeDash=[5,5]).encode(y='y')
         rule_g = alt.Chart(pd.DataFrame({'y':[BREADTH_LOW]})).mark_rule(color='green', strokeDash=[5,5]).encode(y='y')
         
@@ -171,25 +203,42 @@ def fetch_all():
     now = datetime.now(timezone(timedelta(hours=8)))
     is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
     
-    # 取得名單
+    # 名單：若 d_cur 沒資料(因為FinMind還沒更)，就用 d_pre 的名單
+    # 這解決了「去抓1/22名單」的問題，因為我們會強制抓 d_pre (1/23)
     codes_cur = get_ranks(ft, d_cur)
     codes_pre = get_ranks(ft, d_pre)
     final_codes = codes_cur if codes_cur else codes_pre
     msg_src = f"名單:{d_cur if codes_cur else d_pre}"
     
-    # API 報價
+    # --- 報價獲取 (雙軌制) ---
     pmap = {}
-    last_t = "無即時資料 (API未連線)"
-    if sj_api and is_intra:
-        try:
-            contracts = [sj_api.Contracts.Stocks[c] for c in final_codes if c in sj_api.Contracts.Stocks]
-            if contracts:
-                snaps = sj_api.snapshots(contracts)
-                ts_obj = datetime.now()
-                for s in snaps:
-                    if s.close > 0: pmap[s.code] = float(s.close); ts_obj = datetime.fromtimestamp(s.ts/1e9)
-                last_t = ts_obj.strftime("%H:%M:%S")
-        except: last_t = "API 讀取錯誤"
+    data_source = "歷史"
+    last_t = "無即時資料"
+    
+    if is_intra:
+        # 1. 優先嘗試 Shioaji
+        if sj_api:
+            try:
+                contracts = [sj_api.Contracts.Stocks[c] for c in final_codes if c in sj_api.Contracts.Stocks]
+                if contracts:
+                    snaps = sj_api.snapshots(contracts)
+                    ts_obj = datetime.now()
+                    for s in snaps:
+                        if s.close > 0: 
+                            pmap[s.code] = float(s.close)
+                            ts_obj = datetime.fromtimestamp(s.ts/1e9)
+                    last_t = ts_obj.strftime("%H:%M:%S")
+                    data_source = "永豐API"
+            except: pass
+        
+        # 2. 如果永豐掛了(pmap為空)，啟動 Yahoo 備援
+        if not pmap:
+            # 為了速度，只抓前 100 檔做代表，或者全抓(稍微慢一點)
+            # 這裡全抓以求精準
+            pmap = get_prices_yf(final_codes)
+            if pmap:
+                data_source = "Yahoo備援"
+                last_t = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
 
     # 資料準備
     s_dt = (datetime.now()-timedelta(days=40)).strftime("%Y-%m-%d")
@@ -200,11 +249,12 @@ def fetch_all():
         df = get_hist(ft, c, s_dt)
         if df.empty: continue
         
-        # 1. 處理昨日數據
+        # 1. 昨日 (d_pre)
         df_pre = df[df['date'] <= d_pre].copy()
         p_price, p_ma5, p_stt = 0, 0, "-"
         if len(df_pre) >= 5:
             df_pre['MA5'] = df_pre['close'].rolling(5).mean()
+            # 確保抓到 d_pre 那一天的資料
             if df_pre.iloc[-1]['date'] == d_pre:
                 p_price = float(df_pre.iloc[-1]['close'])
                 p_ma5 = float(df_pre.iloc[-1]['MA5'])
@@ -212,18 +262,16 @@ def fetch_all():
                 else: p_stt="📉"
                 v_p += 1
         
-        # 2. 處理今日數據
+        # 2. 今日 (d_cur)
         df_cur = df.copy()
         curr_p = pmap.get(c, 0)
         
-        # 如果是盤中且有報價，塞入/更新最後一筆
         if is_intra and curr_p > 0:
             if df_cur.iloc[-1]['date'] != d_cur:
                 df_cur = pd.concat([df_cur, pd.DataFrame([{'date': d_cur, 'close': curr_p}])], ignore_index=True)
             else:
                 df_cur.iloc[-1, df_cur.columns.get_loc('close')] = curr_p
         elif not is_intra:
-            # 盤後：直接用歷史資料的最後一筆 (如果是今天)
             row = df_cur[df_cur['date'] == d_cur]
             if not row.empty: curr_p = float(row.iloc[0]['close'])
         
@@ -244,33 +292,36 @@ def fetch_all():
     br_c = h_c/v_c if v_c>0 else 0
     br_p = h_p/v_p if v_p>0 else 0
     
-    # 大盤 (斜率回歸)
+    # 大盤
     t_cur, t_pre, slope = 0, 0, 0
     try:
         tw = get_hist(ft, "TAIEX", s_dt)
         if not tw.empty:
             t_pre = float(tw[tw['date']==d_pre].iloc[0]['close']) if not tw[tw['date']==d_pre].empty else 0
             
-            # 決定今日大盤價
-            if sj_api and is_intra:
+            # 今日大盤
+            if data_source == "永豐API":
                 try: t_cur = float(sj_api.snapshots([sj_api.Contracts.Indices.TSE.TSE001])[0].close)
                 except: pass
-            if t_cur == 0: 
+            elif data_source == "Yahoo備援":
+                try: 
+                    yf_tw = yf.download("^TWII", period="1d", progress=False)['Close']
+                    if not yf_tw.empty: t_cur = float(yf_tw.iloc[-1])
+                except: pass
+            
+            if t_cur == 0: # 盤後
                 r = tw[tw['date']==d_cur]
                 if not r.empty: t_cur = float(r.iloc[0]['close'])
             
-            # 計算斜率：先把今日價塞入/更新
             if t_cur > 0:
                 if tw.iloc[-1]['date'] != d_cur:
                     tw = pd.concat([tw, pd.DataFrame([{'date':d_cur, 'close':t_cur}])], ignore_index=True)
                 else:
                     tw.iloc[-1, tw.columns.get_loc('close')] = t_cur
             
-            # 算 MA5 斜率
             if len(tw) >= 6:
                 tw['MA5'] = tw['close'].rolling(5).mean()
                 slope = tw.iloc[-1]['MA5'] - tw.iloc[-2]['MA5']
-            
     except: pass
     
     t_chg = (t_cur-t_pre)/t_pre if t_pre>0 else 0
@@ -280,9 +331,10 @@ def fetch_all():
     save_rec(d_cur, rec_t, br_c, t_chg, t_cur, t_pre, is_intra)
     
     return {
-        "d":d_cur, "br":br_c, "br_p":br_p, "h":h_c, "v":v_c, "df":pd.DataFrame(dtls), 
-        "t":last_t, "tc":t_chg, "slope":slope, # 回傳斜率
-        "raw":{'Date':d_cur,'Time':rec_t,'Breadth':br_c}, "src":msg_src, "sj_ok": True if sj_api else False
+        "d":d_cur, "d_prev": d_pre,
+        "br":br_c, "br_p":br_p, "h":h_c, "v":v_c, "df":pd.DataFrame(dtls), 
+        "t":last_t, "tc":t_chg, "slope":slope, "src_type": data_source,
+        "raw":{'Date':d_cur,'Time':rec_t,'Breadth':br_c}, "src":msg_src
     }
 
 # ==========================================
@@ -308,8 +360,7 @@ def run_app():
         data = fetch_all()
         if isinstance(data, str): st.error(f"❌ {data}")
         elif data:
-            sj_status = "🟢 連線中" if data['sj_ok'] else "🔴 未連線 (歷史數據)"
-            st.sidebar.caption(f"永豐 API: {sj_status}")
+            st.sidebar.info(f"報價來源: {data['src_type']}")
             
             br = data['br']
             if tg_tok and tg_id:
@@ -325,16 +376,18 @@ def run_app():
                     send_tg(tg_tok, tg_id, rap_msg); st.session_state['last_rap'] = rid
 
             st.subheader(f"📅 {data['d']}")
-            st.info(f"{data['src']} | {data['t']}")
+            st.caption(f"昨日基準: {data['d_prev']}")
+            st.info(f"{data['src']} | 更新: {data['t']}")
+            
             chart = plot_chart()
             if chart: st.altair_chart(chart, use_container_width=True)
             
             c1,c2,c3 = st.columns(3)
             c1.metric("今日廣度", f"{br:.1%}", f"{data['h']}/{data['v']}")
             c1.caption(f"昨日廣度: {data['br_p']:.1%}")
+            
             c2.metric("大盤漲跌", f"{data['tc']:.2%}")
             
-            # 斜率顯示
             slope_val = data['slope']
             slope_icon = "📈 正" if slope_val > 0 else "📉 負"
             c3.metric("大盤MA5斜率", f"{slope_val:.2f}", slope_icon)
