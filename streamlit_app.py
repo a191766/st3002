@@ -12,9 +12,9 @@ import time as time_module
 import random
 
 # ==========================================
-# 設定區 v9.5.0 (智能鎖定版)
+# 設定區 v9.6.0 (市場分類版)
 # ==========================================
-APP_VER = "v9.5.0 (智能鎖定版)"
+APP_VER = "v9.6.0 (市場分類+興櫃識別)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -97,11 +97,21 @@ def get_days(token):
     if 0 <= now.weekday() <= 4 and now.time() >= time(8,45):
         if not dates or today_str > dates[-1]:
             dates.append(today_str)
-            
     return dates
 
-# [核心修改] 智慧快取函式
-# 設定 ttl=86400 (24小時)，意即「只要成功抓到一次，今天就不會再抓」
+# [新增] 取得股票基本資料 (為了分辨 上市/上櫃/興櫃)
+@st.cache_data(ttl=86400)
+def get_stock_info_map(token):
+    api = DataLoader(); api.login_by_token(token)
+    try:
+        df = api.taiwan_stock_info()
+        if df.empty: return {}
+        # 建立 ID -> 市場別 的對照表
+        # type: twse(上市), tpex(上櫃), emerging(興櫃)
+        df['stock_id'] = df['stock_id'].astype(str)
+        return dict(zip(df['stock_id'], df['type']))
+    except: return {}
+
 @st.cache_data(ttl=86400, show_spinner=False) 
 def get_ranks_smart(token, d_str):
     api = DataLoader(); api.login_by_token(token)
@@ -109,12 +119,10 @@ def get_ranks_smart(token, d_str):
     try: df = api.taiwan_stock_daily(stock_id="", start_date=d_str)
     except: pass
     
-    # [關鍵邏輯] 如果是抓「今天」但結果是空的 -> 故意報錯中斷！
-    # 這樣 Streamlit 就「不會」快取這個空結果，下次刷新會再重跑一次
     if df.empty:
         now_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
         if d_str == now_str:
-            raise ValueError("Data Not Ready") # 拋出異常，阻斷快取
+            raise ValueError("Data Not Ready") 
         return []
 
     df['ID'] = get_col(df, ['stock_id','code'])
@@ -237,30 +245,23 @@ def fetch_all():
     days = get_days(ft)
     if len(days)<2: return "日期資料不足"
     
+    # 1. 取得基本資料對照表 (為了分辨上市/上櫃/興櫃)
+    info_map = get_stock_info_map(ft)
+    
     d_cur, d_pre = days[-1], days[-2]
     now = datetime.now(timezone(timedelta(hours=8)))
     is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
     allow_live_fetch = (0<=now.weekday()<=4) and (now.time() >= time(8,45))
     
-    # [核心修改] 決定要用哪一天的名單
-    target_date_for_ranks = d_pre # 預設用昨天
-    
-    # 規則 1: 早上 14:00 前，強制用昨天 (d_pre)。完全不試探今天。
+    target_date_for_ranks = d_pre 
     if now.time() < time(14, 0):
         target_date_for_ranks = d_pre
-    # 規則 2: 下午 14:00 後，嘗試用今天 (d_cur)
     else:
         try:
-            # 嘗試抓今天，如果抓不到會報錯 (ValueError)，跳到 except
-            # 如果抓到了，就會被快取住，下次直接拿
             test_ranks = get_ranks_smart(ft, d_cur)
-            if test_ranks:
-                target_date_for_ranks = d_cur
-        except:
-            # 抓不到 (FinMind還沒給)，退回去用昨天，且「不快取」這次的失敗
-            target_date_for_ranks = d_pre
+            if test_ranks: target_date_for_ranks = d_cur
+        except: target_date_for_ranks = d_pre
 
-    # 執行最終抓取 (因為上面已經確認過或選擇過日期，這裡會直接命中快取)
     final_codes = get_ranks_smart(ft, target_date_for_ranks)
     msg_src = f"名單:{target_date_for_ranks}"
     
@@ -273,9 +274,7 @@ def fetch_all():
     if allow_live_fetch:
         if sj_api:
             try:
-                try:
-                    usage = sj_api.usage()
-                    if usage: sj_usage_info = str(usage)
+                try: usage = sj_api.usage(); sj_usage_info = str(usage) if usage else "無法取得"
                 except: sj_usage_info = "無法取得"
 
                 contracts = []
@@ -319,6 +318,10 @@ def fetch_all():
     
     for c in final_codes:
         df = get_hist(ft, c, s_dt)
+        # 取得市場別
+        m_type = info_map.get(c, "未知")
+        m_display = {"twse":"上市", "tpex":"上櫃", "emerging":"興櫃"}.get(m_type, "未知")
+        
         # 昨日
         p_price, p_ma5, p_stt = 0, 0, "-"
         if not df.empty:
@@ -353,13 +356,19 @@ def fetch_all():
                 else: c_stt="📉"
                 v_c += 1
             else:
-                if curr_p == 0: c_stt = "⚠️無報價"; note += "抓取失敗 "
+                if curr_p == 0: 
+                    c_stt = "⚠️無報價"
+                    # [新增] 興櫃特別提示
+                    if m_type == "emerging" and "Yahoo" in data_source:
+                        note += "Yahoo不支援興櫃 "
+                    else:
+                        note += "抓取失敗 "
                 if len(df_cur) < 5: c_stt = "⚠️無MA5"; note += "歷史過短 "
         else:
             c_stt = "⚠️無歷史"; note = "FinMind缺資料"
 
         dtls.append({
-            "代號":c, 
+            "代號":c, "市場": m_display,
             "昨收":p_price, "昨MA5":round(p_ma5,2), "昨狀態":p_stt,
             "現價":curr_p, "今MA5":round(c_ma5,2), "今狀態":c_stt,
             "備註": note
@@ -422,7 +431,6 @@ def run_app():
         if tg_tok and tg_id: st.success("TG Ready")
         
         st.write("---")
-        # [關鍵] 強制清除快取按鈕
         if st.button("⚡ 強制清除快取 (重抓名單)", type="primary"):
             st.cache_data.clear()
             st.toast("快取已清除，正在重新抓取名單...", icon="🚀")
