@@ -12,9 +12,9 @@ import altair as alt
 import time as time_module
 
 # ==========================================
-# 設定區 v8.4.0 (功能完全復原版)
+# 設定區 v8.5.0 (功能全補齊版)
 # ==========================================
-APP_VER = "v8.4.0 (功能復原版)"
+APP_VER = "v8.5.0 (完整功能回歸版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -84,7 +84,6 @@ def get_col(df, names):
 def get_days(token):
     api = DataLoader(); api.login_by_token(token)
     try:
-        # 抓取最近 20 天的交易日，確保有足夠的日期可以回推
         df = api.taiwan_stock_daily(stock_id="0050", start_date=(datetime.now()-timedelta(days=20)).strftime("%Y-%m-%d"))
         return sorted(df['date'].unique().tolist()) if not df.empty else []
     except: return []
@@ -93,16 +92,11 @@ def get_days(token):
 def get_ranks(token, d_str, bak_d=None):
     api = DataLoader(); api.login_by_token(token)
     df = pd.DataFrame()
-    
-    # 1. 嘗試抓指定日期 (d_str)
     try: df = api.taiwan_stock_daily(stock_id="", start_date=d_str)
     except: pass
-    
-    # 2. 如果指定日期沒資料 (例如FinMind還沒更新)，才用備份日期 (bak_d)
     if df.empty and bak_d:
         try: df = api.taiwan_stock_daily(stock_id="", start_date=bak_d)
         except: pass
-        
     if df.empty: return []
     
     df['ID'] = get_col(df, ['stock_id','code'])
@@ -113,7 +107,6 @@ def get_ranks(token, d_str, bak_d=None):
     df = df[df['ID'].str.len()==4]
     df = df[df['ID'].str.isdigit()]
     for p in EXCL_PFX: df = df[~df['ID'].str.startswith(p)]
-    
     return df.sort_values('Money', ascending=False).head(TOP_N)['ID'].tolist()
 
 @st.cache_data(ttl=21600)
@@ -125,38 +118,21 @@ def get_hist(token, code, start):
 def save_rec(d, t, b, tc, t_cur, t_prev, intra):
     if t_cur == 0: return 
     row = pd.DataFrame([{'Date':d,'Time':t,'Breadth':b,'Taiex_Change':tc,'Taiex_Current':t_cur,'Taiex_Prev_Close':t_prev}])
-    
-    # 確保檔案存在
     if not os.path.exists(HIST_FILE): 
-        row.to_csv(HIST_FILE, index=False)
-        return
-
+        row.to_csv(HIST_FILE, index=False); return
     try:
         df = pd.read_csv(HIST_FILE)
-        if df.empty:
-            row.to_csv(HIST_FILE, index=False)
-            return
-
-        last_date = str(df.iloc[-1]['Date'])
-        last_time = str(df.iloc[-1]['Time'])
-        
-        # 如果是新的一天 -> Append
-        if last_date != str(d):
-            df = pd.concat([df, row], ignore_index=True)
-            df.to_csv(HIST_FILE, index=False)
+        if df.empty: row.to_csv(HIST_FILE, index=False); return
+        last_d, last_t = str(df.iloc[-1]['Date']), str(df.iloc[-1]['Time'])
+        if last_d != str(d):
+            pd.concat([df, row], ignore_index=True).to_csv(HIST_FILE, index=False)
         else:
-            # 同一天
             if not intra:
-                # 盤後模式：覆蓋當天最後一筆 (更新成收盤價)
-                # 移除當天所有資料，只留最新這筆收盤
                 df = df[df['Date'] != str(d)]
-                df = pd.concat([df, row], ignore_index=True)
-                df.to_csv(HIST_FILE, index=False)
-            elif last_time != str(t):
-                # 盤中模式：時間不同就 Append
+                pd.concat([df, row], ignore_index=True).to_csv(HIST_FILE, index=False)
+            elif last_t != str(t):
                 row.to_csv(HIST_FILE, mode='a', header=False, index=False)
-    except: 
-        row.to_csv(HIST_FILE, index=False)
+    except: row.to_csv(HIST_FILE, index=False)
 
 def plot_chart():
     if not os.path.exists(HIST_FILE): return None
@@ -166,221 +142,147 @@ def plot_chart():
         df['DT'] = pd.to_datetime(df['Date'].astype(str)+' '+df['Time'].astype(str))
         df['T_S'] = (df['Taiex_Change']*10)+0.5
         
-        base_d = df.iloc[-1]['Date'] # 取最新日期的圖表
+        base_d = df.iloc[-1]['Date']
         chart_data = df[df['Date'] == base_d].copy()
-        
         if chart_data.empty: return None
 
-        start_t = pd.to_datetime(f"{base_d} 09:00:00")
-        end_t = pd.to_datetime(f"{base_d} 14:30:00")
-        
-        base = alt.Chart(chart_data).encode(x=alt.X('DT', title='時間', axis=alt.Axis(format='%H:%M'), scale=alt.Scale(domain=[start_t, end_t])))
+        base = alt.Chart(chart_data).encode(x=alt.X('DT', title='時間', axis=alt.Axis(format='%H:%M'), scale=alt.Scale(domain=[pd.to_datetime(f"{base_d} 09:00:00"), pd.to_datetime(f"{base_d} 14:30:00")])))
         y_ax = alt.Axis(format='%', values=[i/10 for i in range(11)], tickCount=11, labelOverlap=False)
         
         l_b = base.mark_line(color='#007bff').encode(y=alt.Y('Breadth', title=None, scale=alt.Scale(domain=[0,1], nice=False), axis=y_ax))
         p_b = base.mark_circle(color='#007bff', size=30).encode(y='Breadth', tooltip=['DT', alt.Tooltip('Breadth', format='.1%')])
         l_t = base.mark_line(color='#ffc107', strokeDash=[4,4]).encode(y=alt.Y('T_S', scale=alt.Scale(domain=[0,1])))
         p_t = base.mark_circle(color='#ffc107', size=30).encode(y='T_S', tooltip=['DT', alt.Tooltip('Taiex_Change', format='.2%')])
-        
         rule_r = alt.Chart(pd.DataFrame({'y':[BREADTH_THR]})).mark_rule(color='red', strokeDash=[5,5]).encode(y='y')
         rule_g = alt.Chart(pd.DataFrame({'y':[BREADTH_LOW]})).mark_rule(color='green', strokeDash=[5,5]).encode(y='y')
         
         return (l_b+p_b+l_t+p_t+rule_r+rule_g).properties(height=400, title=f"走勢對照 - {base_d}").resolve_scale(y='shared')
     except: return None
 
-def calc_breadth(df_hist, codes, target_date, price_map=None, is_intra=False):
-    """
-    通用廣度計算函式：可算今日，也可算昨日
-    """
-    hits, valid = 0, 0
-    # 為了效能，一次篩選出相關代號的歷史資料
-    if df_hist.empty: return 0, 0
-    
-    for code in codes:
-        # 取得該股歷史資料
-        df = df_hist[df_hist['stock_id'] == code].copy()
-        if df.empty: continue
-        
-        curr_p = 0
-        ma5 = 0
-        
-        # 判斷是用 API 報價 還是 歷史收盤價
-        if is_intra and price_map and code in price_map:
-            # 盤中模式：用即時價
-            curr_p = price_map[code]
-            # 把即時價塞入歷史資料算 MA5
-            if curr_p > 0:
-                new_row = pd.DataFrame([{'date': target_date, 'close': curr_p}])
-                # 確保不重複
-                if df.iloc[-1]['date'] != target_date:
-                    df = pd.concat([df, new_row], ignore_index=True)
-        else:
-            # 盤後/昨日模式：用該日期的收盤價
-            # 找出 target_date 當天的資料
-            row = df[df['date'] == target_date]
-            if not row.empty:
-                curr_p = float(row.iloc[0]['close'])
-            else:
-                continue # 沒那天資料就跳過
-
-        # 計算 MA5
-        if len(df) >= 5:
-            # 確保 MA5 是算到 target_date 當天
-            # 如果是算昨日廣度，資料只會切到昨日，所以取最後一筆即可
-            df['MA5'] = df['close'].rolling(5).mean()
-            # 找到 target_date 對應的 MA5
-            target_row = df[df['date'] == target_date]
-            if not target_row.empty:
-                ma5 = float(target_row.iloc[0]['MA5'])
-                if curr_p > ma5: hits += 1
-                valid += 1
-    
-    return hits, valid
-
 def fetch_all():
     ft = get_finmind_token()
     if not ft: return "FinMind Token Error"
     
     sj_api = get_api() 
-    
     days = get_days(ft)
     if len(days)<2: return "日期資料不足"
     
     d_cur, d_pre = days[-1], days[-2]
     now = datetime.now(timezone(timedelta(hours=8)))
-    # 判斷是否為盤中 (週一~週五 08:45~13:30)
     is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
     
-    # 取得名單 (優先抓今日，抓不到抓昨日)
+    # 取得名單
     codes_cur = get_ranks(ft, d_cur)
     codes_pre = get_ranks(ft, d_pre)
-    
-    # 如果今天是盤中，優先用今日名單；如果是盤後或假日，還是優先用今日(最新)名單
-    # 只有當今日名單完全抓不到時，才用昨日名單
     final_codes = codes_cur if codes_cur else codes_pre
     msg_src = f"名單:{d_cur if codes_cur else d_pre}"
     
-    # 取得即時報價 (如果 API 連線成功)
+    # API 報價
     pmap = {}
     last_t = "無即時資料 (API未連線)"
-    
     if sj_api and is_intra:
         try:
-            contracts = []
-            for c in final_codes:
-                if c in sj_api.Contracts.Stocks: contracts.append(sj_api.Contracts.Stocks[c])
+            contracts = [sj_api.Contracts.Stocks[c] for c in final_codes if c in sj_api.Contracts.Stocks]
             if contracts:
                 snaps = sj_api.snapshots(contracts)
                 ts_obj = datetime.now()
                 for s in snaps:
-                    if s.close > 0: 
-                        pmap[s.code] = float(s.close)
-                        ts_obj = datetime.fromtimestamp(s.ts/1e9)
+                    if s.close > 0: pmap[s.code] = float(s.close); ts_obj = datetime.fromtimestamp(s.ts/1e9)
                 last_t = ts_obj.strftime("%H:%M:%S")
         except: last_t = "API 讀取錯誤"
 
-    # 準備歷史資料 (一次撈取所有成分股，減少迴圈內 I/O)
-    # 這裡做個優化：因為要算昨日跟今日，所以一次把資料傳進去
+    # 資料準備
     s_dt = (datetime.now()-timedelta(days=40)).strftime("%Y-%m-%d")
-    
-    # === 關鍵：回復「昨日廣度」計算 ===
-    # 為了計算昨天的，我們需要昨天的名單 (通常跟今天差不多，暫用 final_codes)
-    # 下載歷史資料 (比較花時間，但必要)
-    # 為了避免太慢，我們只針對前 300 檔跑迴圈 get_hist (有 Cache 頂著)
-    
-    # 1. 算今日廣度
-    hits_cur, valid_cur = 0, 0
-    # 2. 算昨日廣度
-    hits_pre, valid_pre = 0, 0
-    
+    h_c, v_c, h_p, v_p = 0, 0, 0, 0
     dtls = []
     
-    for code in final_codes:
-        df = get_hist(ft, code, s_dt)
+    for c in final_codes:
+        df = get_hist(ft, c, s_dt)
         if df.empty: continue
         
-        # --- 算昨日 (d_pre) ---
-        # 篩選出 <= d_pre 的資料
+        # 1. 處理昨日數據
         df_pre = df[df['date'] <= d_pre].copy()
+        p_price, p_ma5, p_stt = 0, 0, "-"
         if len(df_pre) >= 5:
             df_pre['MA5'] = df_pre['close'].rolling(5).mean()
-            last_row = df_pre.iloc[-1]
-            if last_row['date'] == d_pre: # 確保有昨天的資料
-                if last_row['close'] > last_row['MA5']: hits_pre += 1
-                valid_pre += 1
+            if df_pre.iloc[-1]['date'] == d_pre:
+                p_price = float(df_pre.iloc[-1]['close'])
+                p_ma5 = float(df_pre.iloc[-1]['MA5'])
+                if p_price > p_ma5: h_p += 1; p_stt="✅"
+                else: p_stt="📉"
+                v_p += 1
         
-        # --- 算今日 (d_cur) ---
-        # 準備資料：包含歷史 + (如果是盤中) 即時價
+        # 2. 處理今日數據
         df_cur = df.copy()
-        curr_p = 0
+        curr_p = pmap.get(c, 0)
         
-        if is_intra and code in pmap:
-            curr_p = pmap[code]
-            if curr_p > 0:
-                # 檢查最後一筆是不是今天
-                if df_cur.iloc[-1]['date'] != d_cur:
-                    new_row = pd.DataFrame([{'date': d_cur, 'close': curr_p}])
-                    df_cur = pd.concat([df_cur, new_row], ignore_index=True)
-                else:
-                    # 更新今天收盤價
-                    df_cur.iloc[-1, df_cur.columns.get_loc('close')] = curr_p
-        else:
-            # 盤後/API斷線：直接用 FinMind 裡的 d_cur 資料
+        # 如果是盤中且有報價，塞入/更新最後一筆
+        if is_intra and curr_p > 0:
+            if df_cur.iloc[-1]['date'] != d_cur:
+                df_cur = pd.concat([df_cur, pd.DataFrame([{'date': d_cur, 'close': curr_p}])], ignore_index=True)
+            else:
+                df_cur.iloc[-1, df_cur.columns.get_loc('close')] = curr_p
+        elif not is_intra:
+            # 盤後：直接用歷史資料的最後一筆 (如果是今天)
             row = df_cur[df_cur['date'] == d_cur]
-            if not row.empty:
-                curr_p = float(row.iloc[0]['close'])
+            if not row.empty: curr_p = float(row.iloc[0]['close'])
         
-        stt, ma5 = "無資料", 0
+        c_ma5, c_stt = 0, "-"
         if curr_p > 0 and len(df_cur) >= 5:
             df_cur['MA5'] = df_cur['close'].rolling(5).mean()
-            ma5 = df_cur.iloc[-1]['MA5']
-            if curr_p > ma5: 
-                hits_cur += 1
-                stt = "✅"
-            else: 
-                stt = "📉"
-            valid_cur += 1
+            c_ma5 = df_cur.iloc[-1]['MA5']
+            if curr_p > c_ma5: h_c += 1; c_stt="✅"
+            else: c_stt="📉"
+            v_c += 1
             
-        dtls.append({"代號":code, "現價":curr_p, "MA5":round(ma5,2), "狀態":stt})
+        dtls.append({
+            "代號":c, 
+            "昨收":p_price, "昨MA5":round(p_ma5,2), "昨狀態":p_stt,
+            "現價":curr_p, "今MA5":round(c_ma5,2), "今狀態":c_stt
+        })
 
-    br_cur = hits_cur/valid_cur if valid_cur>0 else 0
-    br_pre = hits_pre/valid_pre if valid_pre>0 else 0 # 找回昨日廣度
+    br_c = h_c/v_c if v_c>0 else 0
+    br_p = h_p/v_p if v_p>0 else 0
     
-    # 大盤資料
-    t_cur, t_pre = 0, 0
+    # 大盤 (斜率回歸)
+    t_cur, t_pre, slope = 0, 0, 0
     try:
         tw = get_hist(ft, "TAIEX", s_dt)
-        if not tw.empty: 
+        if not tw.empty:
             t_pre = float(tw[tw['date']==d_pre].iloc[0]['close']) if not tw[tw['date']==d_pre].empty else 0
-        
-        if sj_api and is_intra: 
-            try:
-                s = sj_api.snapshots([sj_api.Contracts.Indices.TSE.TSE001])[0]
-                if s.close>0: t_cur = float(s.close)
-            except: pass
             
-        if t_cur == 0 and not tw.empty: 
-            r = tw[tw['date']==d_cur]
-            if not r.empty: t_cur = float(r.iloc[0]['close'])
+            # 決定今日大盤價
+            if sj_api and is_intra:
+                try: t_cur = float(sj_api.snapshots([sj_api.Contracts.Indices.TSE.TSE001])[0].close)
+                except: pass
+            if t_cur == 0: 
+                r = tw[tw['date']==d_cur]
+                if not r.empty: t_cur = float(r.iloc[0]['close'])
+            
+            # 計算斜率：先把今日價塞入/更新
+            if t_cur > 0:
+                if tw.iloc[-1]['date'] != d_cur:
+                    tw = pd.concat([tw, pd.DataFrame([{'date':d_cur, 'close':t_cur}])], ignore_index=True)
+                else:
+                    tw.iloc[-1, tw.columns.get_loc('close')] = t_cur
+            
+            # 算 MA5 斜率
+            if len(tw) >= 6:
+                tw['MA5'] = tw['close'].rolling(5).mean()
+                slope = tw.iloc[-1]['MA5'] - tw.iloc[-2]['MA5']
+            
     except: pass
     
     t_chg = (t_cur-t_pre)/t_pre if t_pre>0 else 0
     
-    # 決定記錄時間
-    if is_intra:
-        rec_t = last_t if "無" not in str(last_t) else datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
-    else:
-        rec_t = "14:30:00"
-        
-    save_rec(d_cur, rec_t, br_cur, t_chg, t_cur, t_pre, is_intra)
+    # 存檔
+    rec_t = last_t if is_intra and "無" not in str(last_t) else ("14:30:00" if not is_intra else datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S"))
+    save_rec(d_cur, rec_t, br_c, t_chg, t_cur, t_pre, is_intra)
     
     return {
-        "d":d_cur, "br":br_cur, "br_prev": br_pre, # 傳回昨日廣度
-        "h":hits_cur, "v":valid_cur, "h_p": hits_pre, "v_p": valid_pre,
-        "df":pd.DataFrame(dtls), 
-        "t":last_t, "tc":t_chg, "raw":{'Date':d_cur,'Time':rec_t,'Breadth':br_cur}, 
-        "src":msg_src,
-        "sj_ok": True if sj_api else False
+        "d":d_cur, "br":br_c, "br_p":br_p, "h":h_c, "v":v_c, "df":pd.DataFrame(dtls), 
+        "t":last_t, "tc":t_chg, "slope":slope, # 回傳斜率
+        "raw":{'Date':d_cur,'Time':rec_t,'Breadth':br_c}, "src":msg_src, "sj_ok": True if sj_api else False
     }
 
 # ==========================================
@@ -394,10 +296,8 @@ def run_app():
     with st.sidebar:
         st.subheader("設定")
         auto = st.checkbox("自動更新", value=False)
-        
         fin_ok = "🟢" if get_finmind_token() else "🔴"
         st.caption(f"FinMind Token: {fin_ok}")
-        
         tg_tok = st.text_input("TG Token", value=st.secrets.get("telegram",{}).get("token",""), type="password")
         tg_id = st.text_input("Chat ID", value=st.secrets.get("telegram",{}).get("chat_id",""))
         if tg_tok and tg_id: st.success("TG Ready")
@@ -406,10 +306,9 @@ def run_app():
 
     try:
         data = fetch_all()
-        if isinstance(data, str):
-            st.error(f"❌ 錯誤: {data}")
+        if isinstance(data, str): st.error(f"❌ {data}")
         elif data:
-            sj_status = "🟢 連線中" if data['sj_ok'] else "🔴 未連線 (使用歷史數據)"
+            sj_status = "🟢 連線中" if data['sj_ok'] else "🔴 未連線 (歷史數據)"
             st.sidebar.caption(f"永豐 API: {sj_status}")
             
             br = data['br']
@@ -417,36 +316,31 @@ def run_app():
                 stt = 'normal'
                 if br >= BREADTH_THR: stt = 'hot'
                 elif br <= BREADTH_LOW: stt = 'cold'
-                
                 if stt != st.session_state['last_stt']:
-                    if stt == 'hot': send_tg(tg_tok, tg_id, f"🔥 過熱: {br:.1%}")
-                    elif stt == 'cold': send_tg(tg_tok, tg_id, f"❄️ 冰點: {br:.1%}")
+                    msg = f"🔥 過熱: {br:.1%}" if stt=='hot' else (f"❄️ 冰點: {br:.1%}" if stt=='cold' else "")
+                    if msg: send_tg(tg_tok, tg_id, msg)
                     st.session_state['last_stt'] = stt
-                
                 rap_msg, rid = check_rapid(data['raw'])
                 if rap_msg and rid != st.session_state['last_rap']:
-                    send_tg(tg_tok, tg_id, rap_msg)
-                    st.session_state['last_rap'] = rid
+                    send_tg(tg_tok, tg_id, rap_msg); st.session_state['last_rap'] = rid
 
             st.subheader(f"📅 {data['d']}")
             st.info(f"{data['src']} | {data['t']}")
-            
             chart = plot_chart()
             if chart: st.altair_chart(chart, use_container_width=True)
             
             c1,c2,c3 = st.columns(3)
-            # 顯示今日廣度 + 昨日廣度
             c1.metric("今日廣度", f"{br:.1%}", f"{data['h']}/{data['v']}")
-            # 這裡把昨日廣度補回去
-            c1.caption(f"昨日廣度: {data['br_prev']:.1%}")
-            
+            c1.caption(f"昨日廣度: {data['br_p']:.1%}")
             c2.metric("大盤漲跌", f"{data['tc']:.2%}")
-            c3.metric("狀態", "🔥" if br>=0.65 else ("❄️" if br<=0.55 else "---"))
+            
+            # 斜率顯示
+            slope_val = data['slope']
+            slope_icon = "📈 正" if slope_val > 0 else "📉 負"
+            c3.metric("大盤MA5斜率", f"{slope_val:.2f}", slope_icon)
             
             st.dataframe(data['df'], use_container_width=True, hide_index=True)
-        else:
-            st.warning("⚠️ 無資料 (未知錯誤)")
-            
+        else: st.warning("⚠️ 無資料")
     except Exception as e: st.error(f"Error: {e}")
 
     if auto:
