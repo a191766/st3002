@@ -128,7 +128,7 @@ def get_hist(token, code, start):
 def get_prices_yf(codes):
     try:
         tickers = [f"{c}.TW" for c in codes]
-        # threads=True 加速下載
+        # threads=True 加速下載，希望能少漏一點
         data = yf.download(tickers, period="1d", progress=False, threads=True)['Close']
         if data.empty: return {}
         last_prices = data.iloc[-1].to_dict()
@@ -239,7 +239,7 @@ def fetch_all():
     
     for c in final_codes:
         df = get_hist(ft, c, s_dt)
-        # 注意：不再因為 df.empty 就 continue，我們要記錄下來是誰沒資料
+        # [修改] 就算 df.empty (FinMind沒資料) 也要跑下去，才能記錄錯誤
         
         # --- 昨日 (d_pre) ---
         p_price, p_ma5, p_stt = 0, 0, "-"
@@ -276,6 +276,7 @@ def fetch_all():
                 else: c_stt="📉"
                 v_c += 1
             else:
+                # [新增] 錯誤原因診斷
                 if curr_p == 0: 
                     c_stt = "⚠️無報價"
                     note += "Yahoo漏抓 "
