@@ -12,9 +12,9 @@ import time as time_module
 import random
 
 # ==========================================
-# 設定區 v9.3.0 (全時段補價版)
+# 設定區 v9.5.0 (智能鎖定版)
 # ==========================================
-APP_VER = "v9.3.0 (全時段補價版)"
+APP_VER = "v9.5.0 (智能鎖定版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -92,27 +92,31 @@ def get_days(token):
         if not df.empty: dates = sorted(df['date'].unique().tolist())
     except: pass
     
-    # 強制校正日期
     now = datetime.now(timezone(timedelta(hours=8)))
     today_str = now.strftime("%Y-%m-%d")
-    # 只要是平日且開盤後，今天就是交易日，不管資料庫有沒有
     if 0 <= now.weekday() <= 4 and now.time() >= time(8,45):
         if not dates or today_str > dates[-1]:
             dates.append(today_str)
             
     return dates
 
-@st.cache_data(ttl=86400)
-def get_ranks(token, d_str, bak_d=None):
+# [核心修改] 智慧快取函式
+# 設定 ttl=86400 (24小時)，意即「只要成功抓到一次，今天就不會再抓」
+@st.cache_data(ttl=86400, show_spinner=False) 
+def get_ranks_smart(token, d_str):
     api = DataLoader(); api.login_by_token(token)
     df = pd.DataFrame()
     try: df = api.taiwan_stock_daily(stock_id="", start_date=d_str)
     except: pass
-    if df.empty and bak_d:
-        try: df = api.taiwan_stock_daily(stock_id="", start_date=bak_d)
-        except: pass
-    if df.empty: return []
     
+    # [關鍵邏輯] 如果是抓「今天」但結果是空的 -> 故意報錯中斷！
+    # 這樣 Streamlit 就「不會」快取這個空結果，下次刷新會再重跑一次
+    if df.empty:
+        now_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        if d_str == now_str:
+            raise ValueError("Data Not Ready") # 拋出異常，阻斷快取
+        return []
+
     df['ID'] = get_col(df, ['stock_id','code'])
     df['Money'] = get_col(df, ['Trading_money','turnover'])
     if df['ID'] is None or df['Money'] is None: return []
@@ -123,20 +127,20 @@ def get_ranks(token, d_str, bak_d=None):
     for p in EXCL_PFX: df = df[~df['ID'].str.startswith(p)]
     return df.sort_values('Money', ascending=False).head(TOP_N)['ID'].tolist()
 
-@st.cache_data(ttl=21600)
+@st.cache_data(ttl=3600)
 def get_hist(token, code, start):
     api = DataLoader(); api.login_by_token(token)
     try: return api.taiwan_stock_daily(stock_id=code, start_date=start)
     except: return pd.DataFrame()
 
-# Yahoo 雙規抓取 (TSE + OTC)
+# Yahoo 雙規抓取
 def get_prices_yf_robust(codes):
     if not codes: return {}
     results = {}
     unknown_codes = []
     chunk_size = 50
     
-    # 1. TSE (.TW)
+    # 1. TSE
     for i in range(0, len(codes), chunk_size):
         chunk = codes[i:i+chunk_size]
         tickers = [f"{c}.TW" for c in chunk]
@@ -154,7 +158,7 @@ def get_prices_yf_robust(codes):
             else: unknown_codes.extend(chunk)
         except: unknown_codes.extend(chunk)
     
-    # 2. OTC (.TWO) - 補抓上櫃
+    # 2. OTC
     if unknown_codes:
         unknown_codes = list(set(unknown_codes))
         for i in range(0, len(unknown_codes), chunk_size):
@@ -235,16 +239,30 @@ def fetch_all():
     
     d_cur, d_pre = days[-1], days[-2]
     now = datetime.now(timezone(timedelta(hours=8)))
-    # is_intra 僅用於判斷是否「盤中」，不影響「是否要抓報價」
     is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
-    
-    # [修正] 只要是平日開盤後 (08:45~)，都允許抓即時資料填補空窗，直到 FinMind 資料庫更新
     allow_live_fetch = (0<=now.weekday()<=4) and (now.time() >= time(8,45))
     
-    codes_cur = get_ranks(ft, d_cur)
-    codes_pre = get_ranks(ft, d_pre)
-    final_codes = codes_cur if codes_cur else codes_pre
-    msg_src = f"名單:{d_cur if codes_cur else d_pre}"
+    # [核心修改] 決定要用哪一天的名單
+    target_date_for_ranks = d_pre # 預設用昨天
+    
+    # 規則 1: 早上 14:00 前，強制用昨天 (d_pre)。完全不試探今天。
+    if now.time() < time(14, 0):
+        target_date_for_ranks = d_pre
+    # 規則 2: 下午 14:00 後，嘗試用今天 (d_cur)
+    else:
+        try:
+            # 嘗試抓今天，如果抓不到會報錯 (ValueError)，跳到 except
+            # 如果抓到了，就會被快取住，下次直接拿
+            test_ranks = get_ranks_smart(ft, d_cur)
+            if test_ranks:
+                target_date_for_ranks = d_cur
+        except:
+            # 抓不到 (FinMind還沒給)，退回去用昨天，且「不快取」這次的失敗
+            target_date_for_ranks = d_pre
+
+    # 執行最終抓取 (因為上面已經確認過或選擇過日期，這裡會直接命中快取)
+    final_codes = get_ranks_smart(ft, target_date_for_ranks)
+    msg_src = f"名單:{target_date_for_ranks}"
     
     pmap = {}
     data_source = "歷史"
@@ -252,9 +270,7 @@ def fetch_all():
     api_status_code = 0 
     sj_usage_info = "無資料"
     
-    # [修正] 只要允許抓取，就執行雙軌策略
     if allow_live_fetch:
-        # 1. 永豐 API (分批+慢速)
         if sj_api:
             try:
                 try:
@@ -266,12 +282,11 @@ def fetch_all():
                 for c in final_codes:
                     if c in sj_api.Contracts.Stocks: contracts.append(sj_api.Contracts.Stocks[c])
                 
-                chunk_size = 20 # 慢速策略
+                chunk_size = 20
                 count_sj = 0
                 ts_obj = datetime.now()
                 
                 if contracts:
-                    # 盤後不需要顯示進度條，默默跑就好
                     for i in range(0, len(contracts), chunk_size):
                         chunk = contracts[i:i+chunk_size]
                         try:
@@ -281,7 +296,7 @@ def fetch_all():
                                     pmap[s.code] = float(s.close)
                                     ts_obj = datetime.fromtimestamp(s.ts/1e9)
                                     count_sj += 1
-                            time_module.sleep(1.0) # 休息 1 秒
+                            time_module.sleep(1.0)
                         except: pass
                     
                     if count_sj > 0:
@@ -292,7 +307,6 @@ def fetch_all():
                 else: api_status_code = 1
             except: api_status_code = 1 
         
-        # 2. Yahoo 雙規備援 (補位)
         if not pmap:
             pmap = get_prices_yf_robust(final_codes)
             if pmap:
@@ -323,13 +337,11 @@ def fetch_all():
         
         if not df.empty:
             df_cur = df.copy()
-            # [修正] 只要有抓到 pmap (不論盤中盤後)，就塞入計算
             if curr_p > 0:
                 if df_cur.iloc[-1]['date'] != d_cur:
                     df_cur = pd.concat([df_cur, pd.DataFrame([{'date': d_cur, 'close': curr_p}])], ignore_index=True)
                 else:
                     df_cur.iloc[-1, df_cur.columns.get_loc('close')] = curr_p
-            # 若沒抓到 pmap，但已經是盤後且 FinMind 有資料
             elif not is_intra:
                 row = df_cur[df_cur['date'] == d_cur]
                 if not row.empty: curr_p = float(row.iloc[0]['close'])
@@ -408,8 +420,16 @@ def run_app():
         tg_tok = st.text_input("TG Token", value=st.secrets.get("telegram",{}).get("token",""), type="password")
         tg_id = st.text_input("Chat ID", value=st.secrets.get("telegram",{}).get("chat_id",""))
         if tg_tok and tg_id: st.success("TG Ready")
+        
         st.write("---")
-        if st.button("🗑️ 重置圖表資料", type="primary"):
+        # [關鍵] 強制清除快取按鈕
+        if st.button("⚡ 強制清除快取 (重抓名單)", type="primary"):
+            st.cache_data.clear()
+            st.toast("快取已清除，正在重新抓取名單...", icon="🚀")
+            time_module.sleep(1)
+            st.rerun()
+            
+        if st.button("🗑️ 重置圖表資料"):
             if os.path.exists(HIST_FILE):
                 os.remove(HIST_FILE)
                 st.toast("歷史資料已刪除，請重新整理", icon="🗑️")
