@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
@@ -499,9 +498,6 @@ def run_app():
                     msg = f"🔥 過熱: {br:.1%}" if stt=='hot' else (f"❄️ 冰點: {br:.1%}" if stt=='cold' else "")
                     if msg: send_tg(tg_tok, tg_id, msg)
                     st.session_state['last_stt'] = stt
-                rap_msg, rid = check_rapid(data['raw'])
-                if rap_msg and rid != st.session_state['last_rap']:
-                    send_tg(tg_tok, tg_id, rap_msg); st.session_state[''last_stt'] = stt
                 rap_msg, rid = check_rapid(data['raw'])
                 if rap_msg and rid != st.session_state['last_rap']:
                     send_tg(tg_tok, tg_id, rap_msg); st.session_state['last_rap'] = rid
