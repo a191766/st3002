@@ -11,9 +11,9 @@ import yfinance as yf
 import time as time_module
 
 # ==========================================
-# 設定區 v8.7.1 (圖表修復版)
+# 設定區 v8.7.2 (圖表強制修復版)
 # ==========================================
-APP_VER = "v8.7.1 (圖表修復版)"
+APP_VER = "v8.7.2 (圖表強制修復版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -48,7 +48,11 @@ def check_rapid(row):
         target = None
         for i in range(2, min(10, len(df)+1)):
             r = df.iloc[-i]
-            r_dt = datetime.strptime(f"{r['Date']} {r['Time']}", "%Y-%m-%d %H:%M")
+            # 嘗試解析時間，容錯秒數
+            try: r_t = r['Time'] if len(str(r['Time']))==5 else r['Time'][:5]
+            except: continue
+            
+            r_dt = datetime.strptime(f"{r['Date']} {r_t}", "%Y-%m-%d %H:%M")
             if 170 <= (curr_dt - r_dt).total_seconds() <= 190:
                 target = r; break
         if target is not None:
@@ -56,7 +60,7 @@ def check_rapid(row):
             diff = curr_v - prev_v
             if abs(diff) >= RAPID_THR:
                 d_str = "上漲" if diff>0 else "下跌"
-                msg = f"⚡ <b>【廣度急變】</b>\n{target['Time']}廣度{prev_v:.0%}，{row['Time']}廣度{curr_v:.0%}，{d_str}{abs(diff):.0%}"
+                msg = f"⚡ <b>【廣度急變】</b>\n{target['Time'][:5]}廣度{prev_v:.0%}，{row['Time']}廣度{curr_v:.0%}，{d_str}{abs(diff):.0%}"
                 return msg, str(curr_dt)
     except: pass
     return None, None
@@ -134,7 +138,7 @@ def get_prices_yf(codes):
 
 def save_rec(d, t, b, tc, t_cur, t_prev, intra):
     if t_cur == 0: return 
-    # [修復] 時間只取到「分」，忽略秒數，避免同一分鐘重複存檔導致圖表變形
+    # 只取 HH:MM
     t_short = t[:5] 
     
     row = pd.DataFrame([{'Date':d,'Time':t_short,'Breadth':b,'Taiex_Change':tc,'Taiex_Current':t_cur,'Taiex_Prev_Close':t_prev}])
@@ -144,11 +148,14 @@ def save_rec(d, t, b, tc, t_cur, t_prev, intra):
         df = pd.read_csv(HIST_FILE)
         if df.empty: row.to_csv(HIST_FILE, index=False); return
         
+        # 強制轉字串比較
         df['Date'] = df['Date'].astype(str)
         df['Time'] = df['Time'].astype(str)
         
         last_d = str(df.iloc[-1]['Date'])
-        last_t = str(df.iloc[-1]['Time'])
+        # 處理舊資料可能有秒數的問題
+        last_t_raw = str(df.iloc[-1]['Time'])
+        last_t = last_t_raw[:5]
         
         if last_d != str(d): 
             pd.concat([df, row], ignore_index=True).to_csv(HIST_FILE, index=False)
@@ -156,7 +163,6 @@ def save_rec(d, t, b, tc, t_cur, t_prev, intra):
             if not intra: 
                 df = df[df['Date'] != str(d)]
                 pd.concat([df, row], ignore_index=True).to_csv(HIST_FILE, index=False)
-            # [修復] 只有當「分」不同時才 Append，解決 Yahoo 模式下資料過密的問題
             elif last_t != str(t_short): 
                 row.to_csv(HIST_FILE, mode='a', header=False, index=False)
     except: row.to_csv(HIST_FILE, index=False)
@@ -166,7 +172,16 @@ def plot_chart():
     try:
         df = pd.read_csv(HIST_FILE)
         if df.empty: return None
-        df['DT'] = pd.to_datetime(df['Date'].astype(str)+' '+df['Time'].astype(str))
+        
+        # 強制轉字串，防止格式錯誤
+        df['Date'] = df['Date'].astype(str)
+        df['Time'] = df['Time'].astype(str)
+        # 只取 HH:MM
+        df['Time'] = df['Time'].apply(lambda x: x[:5])
+        
+        df['DT'] = pd.to_datetime(df['Date'] + ' ' + df['Time'], errors='coerce')
+        df = df.dropna(subset=['DT']) # 移除壞掉的日期
+        
         df['T_S'] = (df['Taiex_Change']*10)+0.5
         
         base_d = df.iloc[-1]['Date']
@@ -176,11 +191,10 @@ def plot_chart():
         start_t = pd.to_datetime(f"{base_d} 09:00:00")
         end_t = pd.to_datetime(f"{base_d} 14:30:00")
         
-        base = alt.Chart(chart_data).encode(x=alt.X('DT', title='時間', axis=alt.Axis(format='%H:%M'), scale=alt.Scale(domain=[start_t, end_t])))
+        base = alt.Chart(chart_data).encode(x=alt.X('DT:T', title='時間', axis=alt.Axis(format='%H:%M'), scale=alt.Scale(domain=[start_t, end_t])))
         y_ax = alt.Axis(format='%', values=[i/10 for i in range(11)], tickCount=11, labelOverlap=False)
         
         l_b = base.mark_line(color='#007bff').encode(y=alt.Y('Breadth', title=None, scale=alt.Scale(domain=[0,1], nice=False), axis=y_ax))
-        # [修復] 縮小點的大小 size=30 -> size=15
         p_b = base.mark_circle(color='#007bff', size=15).encode(y='Breadth', tooltip=['DT', alt.Tooltip('Breadth', format='.1%')])
         l_t = base.mark_line(color='#ffc107', strokeDash=[4,4]).encode(y=alt.Y('T_S', scale=alt.Scale(domain=[0,1])))
         p_t = base.mark_circle(color='#ffc107', size=15).encode(y='T_S', tooltip=['DT', alt.Tooltip('Taiex_Change', format='.2%')])
@@ -231,10 +245,8 @@ def fetch_all():
                         api_status_code = 2
                     else: 
                         api_status_code = 1
-                else:
-                    api_status_code = 1
-            except: 
-                api_status_code = 1 
+                else: api_status_code = 1
+            except: api_status_code = 1 
         
         if not pmap:
             pmap = get_prices_yf(final_codes)
@@ -347,6 +359,15 @@ def run_app():
         tg_tok = st.text_input("TG Token", value=st.secrets.get("telegram",{}).get("token",""), type="password")
         tg_id = st.text_input("Chat ID", value=st.secrets.get("telegram",{}).get("chat_id",""))
         if tg_tok and tg_id: st.success("TG Ready")
+        
+        st.write("---")
+        # [關鍵] 重置資料按鈕
+        if st.button("🗑️ 重置圖表資料", type="primary"):
+            if os.path.exists(HIST_FILE):
+                os.remove(HIST_FILE)
+                st.toast("歷史資料已刪除，請重新整理", icon="🗑️")
+                time_module.sleep(1)
+                st.rerun()
 
     if st.button("🔄 刷新"): st.rerun()
 
