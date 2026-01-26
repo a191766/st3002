@@ -4,8 +4,6 @@ import pandas as pd
 import numpy as np
 from FinMind.data import DataLoader
 from datetime import datetime, timedelta, timezone, time
-import traceback
-import sys
 import shioaji as sj
 import os
 import altair as alt
@@ -16,26 +14,26 @@ import requests
 # ==========================================
 # 版本資訊
 # ==========================================
-APP_VERSION = "v8.2.2 (結構標準化修復版)"
+APP_VERSION = "v8.2.3 (穩定運作版)"
 UPDATE_LOG = """
-- v8.2.1: 嘗試修復語法錯誤。
-- v8.2.2: 修正 IndentationError。
-  1. 【代碼重構】將所有簡寫的單行 if 判斷式展開為標準縮排區塊。
-  2. 【格式統一】確保所有層級縮排一致，避免 Python 解析失敗。
-  3. 【功能確認】維持 API 自動重連與 Telegram 雙重警報功能。
+- v8.2.2: 處理縮排問題。
+- v8.2.3: 綜合修復。
+  1. 【防黑屏機制】若資料讀取失敗，顯示提示訊息而非空白畫面。
+  2. 【格式修正】移除可能導致 IndentationError 的寫法。
+  3. 【快取優化】移除 persist="disk" 以消除 Log 警告。
 """
 
 # ==========================================
 # 參數與 Token
 # ==========================================
 TOP_N = 300              
-BREADTH_THRESHOLD = 0.65 # 紅線
-BREADTH_LOWER_REF = 0.55 # 綠線
-RAPID_CHANGE_THRESHOLD = 0.02 # 急速變動門檻 (2%)
+BREADTH_THRESHOLD = 0.65 
+BREADTH_LOWER_REF = 0.55 
+RAPID_CHANGE_THRESHOLD = 0.02 
 EXCLUDE_PREFIXES = ["00", "91"]
 HISTORY_FILE = "breadth_history_v3.csv"
 
-st.set_page_config(page_title="盤中權證進場判斷 (v8.2.2)", layout="wide")
+st.set_page_config(page_title="盤中權證進場判斷 (v8.2.3)", layout="wide")
 
 # ==========================================
 # 🔐 Secrets
@@ -52,14 +50,8 @@ def get_finmind_token():
 def send_telegram_notify(token, chat_id, msg):
     if not token or not chat_id:
         return False
-    
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": msg,
-        "parse_mode": "HTML"
-    }
-    
+    payload = {"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}
     try:
         r = requests.post(url, json=payload)
         return r.status_code == 200
@@ -84,14 +76,13 @@ def check_rapid_change(current_row):
         curr_val = float(current_row['Breadth'])
         
         target_row = None
-        # 尋找 3 分鐘前的紀錄
+        # 尋找 3 分鐘前的紀錄 (誤差容許範圍 170s ~ 190s)
         for i in range(2, min(10, len(df) + 1)): 
             row = df.iloc[-i]
             row_dt_str = f"{row['Date']} {row['Time']}"
             row_dt = datetime.strptime(row_dt_str, "%Y-%m-%d %H:%M:%S")
             diff_seconds = (curr_dt - row_dt).total_seconds()
             
-            # 誤差容許範圍 170s ~ 190s
             if 170 <= diff_seconds <= 190:
                 target_row = row
                 break
@@ -152,7 +143,8 @@ def get_cached_trading_days(token):
         pass
     return []
 
-@st.cache_data(ttl=86400, show_spinner=False, persist="disk")
+# 移除 persist="disk" 避免 Log 警告
+@st.cache_data(ttl=86400, show_spinner=False)
 def get_cached_rank_list(token, date_str, backup_date=None):
     local_api = DataLoader()
     local_api.login_by_token(token)
@@ -428,7 +420,6 @@ def fetch_data():
     fm_token = get_finmind_token()
     sj_api = get_shioaji_api()
     if not fm_token or not sj_api:
-        st.error("Token Error")
         return None
 
     all_days = get_trading_days_robust(fm_token)
@@ -543,4 +534,10 @@ def fetch_data():
         "raw_record": {'Date': d_curr_str, 'Time': record_time, 'Breadth': br_curr}
     }
 
-# ====================================
+# ==========================================
+# UI
+# ==========================================
+def run_streamlit():
+    st.title("📈 盤中權證進場判斷 (v8.2.3)")
+    
+    if 'last_alert_s
