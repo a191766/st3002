@@ -8,12 +8,12 @@ import shioaji as sj
 import os, sys, requests
 import altair as alt
 import yfinance as yf
-import time as time_module # [關鍵修正] 補回這行，修復 NameError
+import time as time_module
 
 # ==========================================
-# 設定區 v8.6.1 (修復 NameError)
+# 設定區 v8.6.2 (錯誤診斷版)
 # ==========================================
-APP_VER = "v8.6.1 (最終修復版)"
+APP_VER = "v8.6.2 (錯誤診斷版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -61,13 +61,18 @@ def check_rapid(row):
     except: pass
     return None, None
 
-@st.cache_resource(ttl=3600) 
+# [診斷核心] 不再隱藏錯誤，直接噴出 Error Message
+@st.cache_resource(ttl=600) 
 def get_api():
+    # 建立物件
     api = sj.Shioaji(simulation=False)
     try: 
+        # 嘗試登入
         api.login(api_key=st.secrets["shioaji"]["api_key"], secret_key=st.secrets["shioaji"]["secret_key"])
-        return api
-    except: return None
+        return api, None # 成功：回傳 api 物件, 錯誤訊息為 None
+    except Exception as e:
+        # 失敗：回傳 None, 並回傳具體錯誤訊息
+        return None, str(e)
 
 # ==========================================
 # 資料處理
@@ -88,7 +93,7 @@ def get_days(token):
         if not df.empty: dates = sorted(df['date'].unique().tolist())
     except: pass
     
-    # 強制補上「今天」，解決週一症候群
+    # 強制補上「今天」
     now = datetime.now(timezone(timedelta(hours=8)))
     today_str = now.strftime("%Y-%m-%d")
     if 0 <= now.weekday() <= 4 and now.time() >= time(8,45):
@@ -124,7 +129,6 @@ def get_hist(token, code, start):
     try: return api.taiwan_stock_daily(stock_id=code, start_date=start)
     except: return pd.DataFrame()
 
-# Yahoo Finance 備援
 def get_prices_yf(codes):
     try:
         tickers = [f"{c}.TW" for c in codes]
@@ -190,7 +194,7 @@ def fetch_all():
     ft = get_finmind_token()
     if not ft: return "FinMind Token Error"
     
-    sj_api = get_api() 
+    sj_api, sj_err = get_api() # 取得 API 物件與錯誤訊息
     days = get_days(ft)
     if len(days)<2: return "日期資料不足"
     
@@ -198,7 +202,6 @@ def fetch_all():
     now = datetime.now(timezone(timedelta(hours=8)))
     is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
     
-    # 強制使用正確的名單日期
     codes_cur = get_ranks(ft, d_cur)
     codes_pre = get_ranks(ft, d_pre)
     final_codes = codes_cur if codes_cur else codes_pre
@@ -320,7 +323,9 @@ def fetch_all():
         "d":d_cur, "d_prev": d_pre,
         "br":br_c, "br_p":br_p, "h":h_c, "v":v_c, "df":pd.DataFrame(dtls), 
         "t":last_t, "tc":t_chg, "slope":slope, "src_type": data_source,
-        "raw":{'Date':d_cur,'Time':rec_t,'Breadth':br_c}, "src":msg_src
+        "raw":{'Date':d_cur,'Time':rec_t,'Breadth':br_c}, "src":msg_src,
+        "sj_ok": True if sj_api else False,
+        "sj_err": sj_err # 回傳錯誤訊息
     }
 
 # ==========================================
@@ -347,6 +352,12 @@ def run_app():
         if isinstance(data, str): st.error(f"❌ {data}")
         elif data:
             st.sidebar.info(f"報價來源: {data['src_type']}")
+            # 如果永豐失敗，顯示紅字錯誤原因
+            if not data['sj_ok'] and data['sj_err']:
+                st.sidebar.error(f"永豐錯誤: {data['sj_err']}")
+            elif data['sj_ok']:
+                st.sidebar.success("永豐連線正常")
+            
             br = data['br']
             if tg_tok and tg_id:
                 stt = 'normal'
