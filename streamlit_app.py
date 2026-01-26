@@ -11,9 +11,9 @@ import yfinance as yf
 import time as time_module
 
 # ==========================================
-# 設定區 v8.6.2 (錯誤診斷版)
+# 設定區 v8.7.0 (狀態同步優化版)
 # ==========================================
-APP_VER = "v8.6.2 (錯誤診斷版)"
+APP_VER = "v8.7.0 (狀態同步優化版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -61,17 +61,13 @@ def check_rapid(row):
     except: pass
     return None, None
 
-# [診斷核心] 不再隱藏錯誤，直接噴出 Error Message
-@st.cache_resource(ttl=600) 
+@st.cache_resource(ttl=3600) 
 def get_api():
-    # 建立物件
     api = sj.Shioaji(simulation=False)
     try: 
-        # 嘗試登入
         api.login(api_key=st.secrets["shioaji"]["api_key"], secret_key=st.secrets["shioaji"]["secret_key"])
-        return api, None # 成功：回傳 api 物件, 錯誤訊息為 None
+        return api, None
     except Exception as e:
-        # 失敗：回傳 None, 並回傳具體錯誤訊息
         return None, str(e)
 
 # ==========================================
@@ -93,13 +89,11 @@ def get_days(token):
         if not df.empty: dates = sorted(df['date'].unique().tolist())
     except: pass
     
-    # 強制補上「今天」
     now = datetime.now(timezone(timedelta(hours=8)))
     today_str = now.strftime("%Y-%m-%d")
     if 0 <= now.weekday() <= 4 and now.time() >= time(8,45):
         if not dates or today_str > dates[-1]:
             dates.append(today_str)
-            
     return dates
 
 @st.cache_data(ttl=86400)
@@ -146,18 +140,14 @@ def save_rec(d, t, b, tc, t_cur, t_prev, intra):
     try:
         df = pd.read_csv(HIST_FILE)
         if df.empty: row.to_csv(HIST_FILE, index=False); return
-        
         df['Date'] = df['Date'].astype(str)
-        last_d = str(df.iloc[-1]['Date'])
-        last_t = str(df.iloc[-1]['Time'])
-        
-        if last_d != str(d): 
+        if str(df.iloc[-1]['Date']) != str(d): 
             pd.concat([df, row], ignore_index=True).to_csv(HIST_FILE, index=False)
         else:
             if not intra: 
                 df = df[df['Date'] != str(d)]
                 pd.concat([df, row], ignore_index=True).to_csv(HIST_FILE, index=False)
-            elif last_t != str(t): 
+            elif str(df.iloc[-1]['Time']) != str(t): 
                 row.to_csv(HIST_FILE, mode='a', header=False, index=False)
     except: row.to_csv(HIST_FILE, index=False)
 
@@ -168,22 +158,17 @@ def plot_chart():
         if df.empty: return None
         df['DT'] = pd.to_datetime(df['Date'].astype(str)+' '+df['Time'].astype(str))
         df['T_S'] = (df['Taiex_Change']*10)+0.5
-        
         base_d = df.iloc[-1]['Date']
         chart_data = df[df['Date'] == base_d].copy()
         if chart_data.empty: return None
-
-        start_t = pd.to_datetime(f"{base_d} 09:00:00")
-        end_t = pd.to_datetime(f"{base_d} 14:30:00")
         
-        base = alt.Chart(chart_data).encode(x=alt.X('DT', title='時間', axis=alt.Axis(format='%H:%M'), scale=alt.Scale(domain=[start_t, end_t])))
+        base = alt.Chart(chart_data).encode(x=alt.X('DT', title='時間', axis=alt.Axis(format='%H:%M'), scale=alt.Scale(domain=[pd.to_datetime(f"{base_d} 09:00:00"), pd.to_datetime(f"{base_d} 14:30:00")])))
         y_ax = alt.Axis(format='%', values=[i/10 for i in range(11)], tickCount=11, labelOverlap=False)
         
         l_b = base.mark_line(color='#007bff').encode(y=alt.Y('Breadth', title=None, scale=alt.Scale(domain=[0,1], nice=False), axis=y_ax))
         p_b = base.mark_circle(color='#007bff', size=30).encode(y='Breadth', tooltip=['DT', alt.Tooltip('Breadth', format='.1%')])
         l_t = base.mark_line(color='#ffc107', strokeDash=[4,4]).encode(y=alt.Y('T_S', scale=alt.Scale(domain=[0,1])))
         p_t = base.mark_circle(color='#ffc107', size=30).encode(y='T_S', tooltip=['DT', alt.Tooltip('Taiex_Change', format='.2%')])
-        
         rule_r = alt.Chart(pd.DataFrame({'y':[BREADTH_THR]})).mark_rule(color='red', strokeDash=[5,5]).encode(y='y')
         rule_g = alt.Chart(pd.DataFrame({'y':[BREADTH_LOW]})).mark_rule(color='green', strokeDash=[5,5]).encode(y='y')
         
@@ -194,7 +179,7 @@ def fetch_all():
     ft = get_finmind_token()
     if not ft: return "FinMind Token Error"
     
-    sj_api, sj_err = get_api() # 取得 API 物件與錯誤訊息
+    sj_api, sj_err = get_api() 
     days = get_days(ft)
     if len(days)<2: return "日期資料不足"
     
@@ -210,9 +195,10 @@ def fetch_all():
     pmap = {}
     data_source = "歷史"
     last_t = "無即時資料"
+    # 連線狀態標記：0=未連線, 1=登入成功但無資料, 2=運作正常
+    api_status_code = 0 
     
     if is_intra:
-        # 1. Shioaji
         if sj_api:
             try:
                 contracts = [sj_api.Contracts.Stocks[c] for c in final_codes if c in sj_api.Contracts.Stocks]
@@ -223,11 +209,18 @@ def fetch_all():
                         if s.close > 0: 
                             pmap[s.code] = float(s.close)
                             ts_obj = datetime.fromtimestamp(s.ts/1e9)
-                    last_t = ts_obj.strftime("%H:%M:%S")
-                    data_source = "永豐API"
-            except: pass
+                    
+                    if pmap: # 真的有抓到資料
+                        last_t = ts_obj.strftime("%H:%M:%S")
+                        data_source = "永豐API"
+                        api_status_code = 2
+                    else: # 登入成功但沒資料
+                        api_status_code = 1
+                else:
+                    api_status_code = 1
+            except: 
+                api_status_code = 1 # 發生錯誤
         
-        # 2. Yahoo Backup
         if not pmap:
             pmap = get_prices_yf(final_codes)
             if pmap:
@@ -275,16 +268,11 @@ def fetch_all():
             else: c_stt="📉"
             v_c += 1
             
-        dtls.append({
-            "代號":c, 
-            "昨收":p_price, "昨MA5":round(p_ma5,2), "昨狀態":p_stt,
-            "現價":curr_p, "今MA5":round(c_ma5,2), "今狀態":c_stt
-        })
+        dtls.append({"代號":c, "昨收":p_price, "昨MA5":round(p_ma5,2), "昨狀態":p_stt, "現價":curr_p, "今MA5":round(c_ma5,2), "今狀態":c_stt})
 
     br_c = h_c/v_c if v_c>0 else 0
     br_p = h_p/v_p if v_p>0 else 0
     
-    # 大盤
     t_cur, t_pre, slope = 0, 0, 0
     try:
         tw = get_hist(ft, "TAIEX", s_dt)
@@ -324,8 +312,8 @@ def fetch_all():
         "br":br_c, "br_p":br_p, "h":h_c, "v":v_c, "df":pd.DataFrame(dtls), 
         "t":last_t, "tc":t_chg, "slope":slope, "src_type": data_source,
         "raw":{'Date':d_cur,'Time':rec_t,'Breadth':br_c}, "src":msg_src,
-        "sj_ok": True if sj_api else False,
-        "sj_err": sj_err # 回傳錯誤訊息
+        "api_status": api_status_code,
+        "sj_err": sj_err
     }
 
 # ==========================================
@@ -352,11 +340,16 @@ def run_app():
         if isinstance(data, str): st.error(f"❌ {data}")
         elif data:
             st.sidebar.info(f"報價來源: {data['src_type']}")
-            # 如果永豐失敗，顯示紅字錯誤原因
-            if not data['sj_ok'] and data['sj_err']:
-                st.sidebar.error(f"永豐錯誤: {data['sj_err']}")
-            elif data['sj_ok']:
-                st.sidebar.success("永豐連線正常")
+            
+            # 依據實際數據狀況顯示狀態
+            status_code = data['api_status']
+            if status_code == 2:
+                st.sidebar.success("🟢 永豐連線正常")
+            elif status_code == 1:
+                st.sidebar.warning("🟠 連線成功但無報價 (忙線中)")
+            else:
+                if data['sj_err']: st.sidebar.error(f"🔴 連線失敗: {data['sj_err']}")
+                else: st.sidebar.error("🔴 未連線")
             
             br = data['br']
             if tg_tok and tg_id:
