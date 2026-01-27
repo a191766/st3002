@@ -12,9 +12,9 @@ import time as time_module
 import random
 
 # ==========================================
-# 設定區 v9.18.0 (證交所MIS救援版)
+# 設定區 v9.19.0 (盤後智慧修正版)
 # ==========================================
-APP_VER = "v9.18.0 (證交所MIS救援版)"
+APP_VER = "v9.19.0 (盤後智慧修正版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -193,13 +193,10 @@ def get_hist(token, code, start):
     try: return api.taiwan_stock_daily(stock_id=code, start_date=start)
     except: return pd.DataFrame()
 
-# [新增] 證交所 MIS 爬蟲 (取代 Yahoo)
 def get_prices_twse_mis(codes, info_map):
     if not codes: return {}
-    
-    # 1. 建立查詢字串 (tse_1101.tw|otc_3293.tw)
     req_strs = []
-    chunk_size = 50 # 證交所一次大概吃 50 檔，太多會爆
+    chunk_size = 50 
     
     for i in range(0, len(codes), chunk_size):
         chunk = codes[i:i+chunk_size]
@@ -211,30 +208,25 @@ def get_prices_twse_mis(codes, info_map):
         req_strs.append("|".join(q_list))
     
     results = {}
-    
-    # 2. 發送請求
     ts = int(time_module.time() * 1000)
     base_url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&_={ts}&ex_ch="
     
     for q_str in req_strs:
         try:
             url = base_url + q_str
-            # 隨機延遲，假裝是人類在點網頁
             time_module.sleep(random.uniform(0.1, 0.3)) 
             r = requests.get(url)
             if r.status_code == 200:
                 data = r.json()
                 if 'msgArray' in data:
                     for item in data['msgArray']:
-                        c = item.get('c', '') # 代號
-                        z = item.get('z', '-') # 最近成交價
-                        y = item.get('y', '-') # 昨收(用來備援)
-                        
+                        c = item.get('c', '') 
+                        z = item.get('z', '-') 
+                        y = item.get('y', '-') 
                         if c and z != '-':
                             try: results[c] = float(z)
                             except: pass
                         elif c and y != '-':
-                             # 如果沒成交價(如剛開盤)，暫用昨收
                             try: results[c] = float(y)
                             except: pass
         except: pass
@@ -337,8 +329,10 @@ def fetch_all():
     api_status_code = 0 
     sj_usage_info = "無資料"
     
-    if allow_live_fetch:
-        # 1. 先試永豐 API
+    # [核心修正] 盤後直接用 FinMind 資料，不抓即時 (因為 MIS 已收工)
+    is_post_market = (now.time() >= time(14, 0))
+    
+    if allow_live_fetch and not is_post_market:
         if sj_api:
             try:
                 try: usage = sj_api.usage(); sj_usage_info = str(usage) if usage else "無法取得"
@@ -373,18 +367,14 @@ def fetch_all():
                 else: api_status_code = 1
             except: api_status_code = 1 
         
-        # 2. 如果永豐失敗 (pmap 為空)，改用證交所 MIS 救援
         if not pmap:
-            # 呼叫證交所爬蟲
             pmap = get_prices_twse_mis(final_codes, info_map)
-            
             if pmap:
                 data_source = "證交所MIS(免登入)"
                 last_t = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
-            else:
-                # 3. 如果證交所也失敗 (可能被擋IP)，最後才用 Yahoo
-                # 但理論上證交所比較穩
-                pass
+    elif is_post_market:
+        data_source = "FinMind盤後資料"
+        last_t = "13:30:00"
 
     s_dt = (datetime.now()-timedelta(days=40)).strftime("%Y-%m-%d")
     h_c, v_c, h_p, v_p = 0, 0, 0, 0
@@ -396,28 +386,61 @@ def fetch_all():
         m_display = {"twse":"上市", "tpex":"上櫃", "emerging":"興櫃"}.get(m_type, "未知")
         
         p_price, p_ma5, p_stt = 0, 0, "-"
-        if not df.empty:
-            check_date = target_date_for_ranks
-            df_pre = df[df['date'] <= check_date].copy()
-            if len(df_pre) >= 5:
-                df_pre['MA5'] = df_pre['close'].rolling(5).mean()
-                last_rec = df_pre.iloc[-1]
-                p_price = float(last_rec['close'])
-                p_ma5 = float(last_rec['MA5'])
-                if p_price > p_ma5: h_p += 1; p_stt="✅"
-                else: p_stt="📉"
-                v_p += 1
+        # [核心修正] 昨收定義: 
+        # 如果 df 最後一筆是 target_date (也就是今天)，那昨收要是 df.iloc[-2]
+        # 如果 df 最後一筆是 昨天，那昨收就是 df.iloc[-1]
         
+        # 1. 先決定 "現價" 來源
         curr_p = pmap.get(c, 0)
+        
+        # 盤後策略: 直接拿 FinMind 最後一筆當現價 (因為已經收盤了)
+        if is_post_market and not df.empty:
+            if df.iloc[-1]['date'] == today_str:
+                curr_p = float(df.iloc[-1]['close'])
+
+        if not df.empty:
+            # 2. 決定 "昨收" (Reference Price)
+            # 找到 target_date 的 index
+            try:
+                # 這裡的 target_date_for_ranks 可能是今天
+                if df.iloc[-1]['date'] == target_date_for_ranks:
+                    # 如果名單是今天，昨收要是倒數第二筆
+                    if len(df) >= 2:
+                        ref_row = df.iloc[-2]
+                        # 重新計算昨天的 MA5 (不含今天)
+                        # 這邊稍微複雜，簡化處理：直接抓當下算好的 MA5
+                        # 但因為 rolling 已經含今天了，所以要倒回去看 iloc[-2] 的 rolling
+                        
+                        df_temp = df.copy()
+                        df_temp['MA5'] = df_temp['close'].rolling(5).mean()
+                        p_price = float(df_temp.iloc[-2]['close'])
+                        p_ma5 = float(df_temp.iloc[-2]['MA5'])
+                    else:
+                        p_price = 0; p_ma5=0
+                else:
+                    # 如果名單是昨天，昨收就是最後一筆 (昨天)
+                    df_temp = df.copy()
+                    df_temp['MA5'] = df_temp['close'].rolling(5).mean()
+                    p_price = float(df_temp.iloc[-1]['close'])
+                    p_ma5 = float(df_temp.iloc[-1]['MA5'])
+
+                if p_price > 0 and p_ma5 > 0:
+                    if p_price > p_ma5: h_p += 1; p_stt="✅"
+                    else: p_stt="📉"
+                    v_p += 1
+            except: pass
+
         c_ma5, c_stt, note = 0, "-", ""
         
         if not df.empty:
             df_cur = df.copy()
             if curr_p > 0:
+                # 如果 curr_p 來自 MIS (盤中) 且 FinMind 還沒今天資料 -> concat
                 if df_cur.iloc[-1]['date'] != today_str:
                      df_cur = pd.concat([df_cur, pd.DataFrame([{'date': today_str, 'close': curr_p}])], ignore_index=True)
                 else:
-                    df_cur.iloc[-1, df_cur.columns.get_loc('close')] = curr_p
+                    # 如果是盤後，FinMind 已經有今天資料，curr_p 也是那筆，就不用動，直接算 MA5
+                    pass
             elif not is_intra and curr_p == 0:
                 pass
             
@@ -449,26 +472,28 @@ def fetch_all():
     try:
         tw = get_hist(ft, "TAIEX", s_dt)
         if not tw.empty:
-            check_date_tw = target_date_for_ranks
-            df_tw_pre = tw[tw['date'] <= check_date_tw]
-            if not df_tw_pre.empty:
-                t_pre = float(df_tw_pre.iloc[-1]['close'])
-            
-            # 大盤也用 MIS 抓
-            if data_source == "永豐API":
-                try: t_cur = float(sj_api.snapshots([sj_api.Contracts.Indices.TSE.TSE001])[0].close)
-                except: pass
-            
-            if t_cur == 0:
-                # 嘗試抓大盤 MIS
-                try:
-                   mis_tw = get_prices_twse_mis(["t00"], {"t00":"twse"}) # t00 是大盤代號
-                   if "t00" in mis_tw: t_cur = mis_tw["t00"]
-                except: pass
+            # 大盤昨收邏輯同個股
+            t_pre = 0
+            if tw.iloc[-1]['date'] == target_date_for_ranks:
+                 if len(tw) >= 2: t_pre = float(tw.iloc[-2]['close'])
+            else:
+                 t_pre = float(tw.iloc[-1]['close'])
 
-            if t_cur == 0: 
-                r = tw.iloc[-1]
-                t_cur = float(r['close'])
+            # 大盤現價
+            if is_post_market and tw.iloc[-1]['date'] == today_str:
+                t_cur = float(tw.iloc[-1]['close'])
+            else:
+                if data_source == "永豐API":
+                    try: t_cur = float(sj_api.snapshots([sj_api.Contracts.Indices.TSE.TSE001])[0].close)
+                    except: pass
+                if t_cur == 0:
+                    try:
+                       mis_tw = get_prices_twse_mis(["t00"], {"t00":"twse"})
+                       if "t00" in mis_tw: t_cur = mis_tw["t00"]
+                    except: pass
+                if t_cur == 0: 
+                    r = tw.iloc[-1]
+                    t_cur = float(r['close'])
             
             if t_cur > 0:
                 if tw.iloc[-1]['date'] != today_str:
@@ -481,7 +506,7 @@ def fetch_all():
     except: pass
     
     t_chg = (t_cur-t_pre)/t_pre if t_pre>0 else 0
-    rec_t = last_t if is_intra and "無" not in str(last_t) else ("14:30:00" if not is_intra else datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S"))
+    rec_t = last_t if is_intra and "無" not in str(last_t) else ("13:30:00" if is_post_market else datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S"))
     
     save_rec(d_cur, rec_t, br_c, t_chg, t_cur, t_pre, is_intra, v_c)
     
