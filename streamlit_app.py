@@ -12,9 +12,9 @@ import time as time_module
 import random
 
 # ==========================================
-# 設定區 v9.19.0 (盤後智慧修正版)
+# 設定區 v9.20.0 (圖表最佳化版)
 # ==========================================
-APP_VER = "v9.19.0 (盤後智慧修正版)"
+APP_VER = "v9.20.0 (圖表最佳化版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -277,8 +277,11 @@ def plot_chart():
         base_d = df.iloc[-1]['Date']
         chart_data = df[df['Date'] == base_d].copy()
         if chart_data.empty: return None
+        
         start_t = pd.to_datetime(f"{base_d} 09:00:00")
-        end_t = pd.to_datetime(f"{base_d} 14:30:00")
+        # [修改] 將 X 軸終點改為 13:30:00，避免右側留白
+        end_t = pd.to_datetime(f"{base_d} 13:30:00")
+        
         base = alt.Chart(chart_data).encode(x=alt.X('DT:T', title='時間', axis=alt.Axis(format='%H:%M'), scale=alt.Scale(domain=[start_t, end_t])))
         y_ax = alt.Axis(format='%', values=[i/10 for i in range(11)], tickCount=11, labelOverlap=False)
         l_b = base.mark_line(color='#007bff').encode(y=alt.Y('Breadth', title=None, scale=alt.Scale(domain=[0,1], nice=False), axis=y_ax))
@@ -329,7 +332,6 @@ def fetch_all():
     api_status_code = 0 
     sj_usage_info = "無資料"
     
-    # [核心修正] 盤後直接用 FinMind 資料，不抓即時 (因為 MIS 已收工)
     is_post_market = (now.time() >= time(14, 0))
     
     if allow_live_fetch and not is_post_market:
@@ -386,31 +388,17 @@ def fetch_all():
         m_display = {"twse":"上市", "tpex":"上櫃", "emerging":"興櫃"}.get(m_type, "未知")
         
         p_price, p_ma5, p_stt = 0, 0, "-"
-        # [核心修正] 昨收定義: 
-        # 如果 df 最後一筆是 target_date (也就是今天)，那昨收要是 df.iloc[-2]
-        # 如果 df 最後一筆是 昨天，那昨收就是 df.iloc[-1]
         
-        # 1. 先決定 "現價" 來源
         curr_p = pmap.get(c, 0)
         
-        # 盤後策略: 直接拿 FinMind 最後一筆當現價 (因為已經收盤了)
         if is_post_market and not df.empty:
             if df.iloc[-1]['date'] == today_str:
                 curr_p = float(df.iloc[-1]['close'])
 
         if not df.empty:
-            # 2. 決定 "昨收" (Reference Price)
-            # 找到 target_date 的 index
             try:
-                # 這裡的 target_date_for_ranks 可能是今天
                 if df.iloc[-1]['date'] == target_date_for_ranks:
-                    # 如果名單是今天，昨收要是倒數第二筆
                     if len(df) >= 2:
-                        ref_row = df.iloc[-2]
-                        # 重新計算昨天的 MA5 (不含今天)
-                        # 這邊稍微複雜，簡化處理：直接抓當下算好的 MA5
-                        # 但因為 rolling 已經含今天了，所以要倒回去看 iloc[-2] 的 rolling
-                        
                         df_temp = df.copy()
                         df_temp['MA5'] = df_temp['close'].rolling(5).mean()
                         p_price = float(df_temp.iloc[-2]['close'])
@@ -418,7 +406,6 @@ def fetch_all():
                     else:
                         p_price = 0; p_ma5=0
                 else:
-                    # 如果名單是昨天，昨收就是最後一筆 (昨天)
                     df_temp = df.copy()
                     df_temp['MA5'] = df_temp['close'].rolling(5).mean()
                     p_price = float(df_temp.iloc[-1]['close'])
@@ -435,11 +422,9 @@ def fetch_all():
         if not df.empty:
             df_cur = df.copy()
             if curr_p > 0:
-                # 如果 curr_p 來自 MIS (盤中) 且 FinMind 還沒今天資料 -> concat
                 if df_cur.iloc[-1]['date'] != today_str:
                      df_cur = pd.concat([df_cur, pd.DataFrame([{'date': today_str, 'close': curr_p}])], ignore_index=True)
                 else:
-                    # 如果是盤後，FinMind 已經有今天資料，curr_p 也是那筆，就不用動，直接算 MA5
                     pass
             elif not is_intra and curr_p == 0:
                 pass
@@ -472,14 +457,12 @@ def fetch_all():
     try:
         tw = get_hist(ft, "TAIEX", s_dt)
         if not tw.empty:
-            # 大盤昨收邏輯同個股
             t_pre = 0
             if tw.iloc[-1]['date'] == target_date_for_ranks:
                  if len(tw) >= 2: t_pre = float(tw.iloc[-2]['close'])
             else:
                  t_pre = float(tw.iloc[-1]['close'])
 
-            # 大盤現價
             if is_post_market and tw.iloc[-1]['date'] == today_str:
                 t_cur = float(tw.iloc[-1]['close'])
             else:
