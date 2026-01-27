@@ -12,9 +12,9 @@ import time as time_module
 import random
 
 # ==========================================
-# 設定區 v9.24.0 (策略邏輯完美修正版)
+# 設定區 v9.24.1 (修復缺失函式版)
 # ==========================================
-APP_VER = "v9.24.0 (策略邏輯完美修正版)"
+APP_VER = "v9.24.1 (修復缺失函式版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -300,6 +300,245 @@ def save_rec(d, t, b, tc, t_cur, t_prev, intra, total_v):
                 row.to_csv(HIST_FILE, mode='a', header=False, index=False)
     except: row.to_csv(HIST_FILE, index=False)
 
+def plot_chart():
+    if not os.path.exists(HIST_FILE): return None
+    try:
+        df = pd.read_csv(HIST_FILE)
+        if df.empty: return None
+        df['Date'] = df['Date'].astype(str)
+        df['Time'] = df['Time'].astype(str)
+        df['Time'] = df['Time'].apply(lambda x: x[:5])
+        df['DT'] = pd.to_datetime(df['Date'] + ' ' + df['Time'], errors='coerce')
+        df = df.dropna(subset=['DT'])
+        df['T_S'] = (df['Taiex_Change']*10)+0.5
+        base_d = df.iloc[-1]['Date']
+        chart_data = df[df['Date'] == base_d].copy()
+        if chart_data.empty: return None
+        
+        start_t = pd.to_datetime(f"{base_d} 09:00:00")
+        end_t = pd.to_datetime(f"{base_d} 13:30:00")
+        
+        base = alt.Chart(chart_data).encode(x=alt.X('DT:T', title='時間', axis=alt.Axis(format='%H:%M'), scale=alt.Scale(domain=[start_t, end_t])))
+        y_ax = alt.Axis(format='%', values=[i/10 for i in range(11)], tickCount=11, labelOverlap=False)
+        l_b = base.mark_line(color='#007bff').encode(y=alt.Y('Breadth', title=None, scale=alt.Scale(domain=[0,1], nice=False), axis=y_ax))
+        p_b = base.mark_circle(color='#007bff', size=15).encode(y='Breadth', tooltip=['DT', alt.Tooltip('Breadth', format='.1%')])
+        l_t = base.mark_line(color='#ffc107', strokeDash=[4,4]).encode(y=alt.Y('T_S', scale=alt.Scale(domain=[0,1])))
+        p_t = base.mark_circle(color='#ffc107', size=15).encode(y='T_S', tooltip=['DT', alt.Tooltip('Taiex_Change', format='.2%')])
+        rule_r = alt.Chart(pd.DataFrame({'y':[BREADTH_THR]})).mark_rule(color='red', strokeDash=[5,5]).encode(y='y')
+        rule_g = alt.Chart(pd.DataFrame({'y':[BREADTH_LOW]})).mark_rule(color='green', strokeDash=[5,5]).encode(y='y')
+        return (l_b+p_b+l_t+p_t+rule_r+rule_g).properties(height=400, title=f"走勢對照 - {base_d}").resolve_scale(y='shared')
+    except: return None
+
+# [核心修復] 補回缺失的 fetch_all 函式
+def fetch_all():
+    ft = get_finmind_token()
+    if not ft: return "FinMind Token Error"
+    
+    sj_api, sj_err = get_api() 
+    days = get_days(ft)
+    if len(days)<2: return "日期資料不足"
+    
+    info_map = get_stock_info_map(ft)
+    
+    d_cur = days[-1]
+    now = datetime.now(timezone(timedelta(hours=8)))
+    is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
+    allow_live_fetch = (0<=now.weekday()<=4) and (now.time() >= time(8,45))
+    
+    today_str = now.strftime("%Y-%m-%d")
+    target_date_for_ranks = ""
+    
+    if now.time() < time(14, 0):
+        if d_cur == today_str: target_date_for_ranks = days[-2]
+        else: target_date_for_ranks = d_cur
+    else:
+        target_date_for_ranks = today_str
+
+    final_codes, from_disk = get_ranks_strict(ft, target_date_for_ranks)
+    
+    if not final_codes and target_date_for_ranks == today_str:
+        fallback_date = days[-2] if d_cur == today_str else d_cur
+        final_codes, _ = get_ranks_strict(ft, fallback_date)
+        msg_src = f"名單:{fallback_date}(今日未出，沿用舊單)"
+    else:
+        msg_src = f"名單:{target_date_for_ranks} {'(硬碟)' if from_disk else '(新抓)'}"
+
+    pmap = {}
+    data_source = "歷史"
+    last_t = "無即時資料"
+    api_status_code = 0 
+    sj_usage_info = "無資料"
+    
+    is_post_market = (now.time() >= time(14, 0))
+    
+    if allow_live_fetch and not is_post_market:
+        if sj_api:
+            try:
+                try: usage = sj_api.usage(); sj_usage_info = str(usage) if usage else "無法取得"
+                except: sj_usage_info = "無法取得"
+
+                contracts = []
+                for c in final_codes:
+                    if c in sj_api.Contracts.Stocks: contracts.append(sj_api.Contracts.Stocks[c])
+                
+                chunk_size = 20
+                count_sj = 0
+                ts_obj = datetime.now()
+                
+                if contracts:
+                    for i in range(0, len(contracts), chunk_size):
+                        chunk = contracts[i:i+chunk_size]
+                        try:
+                            snaps = sj_api.snapshots(chunk)
+                            for s in snaps:
+                                if s.close > 0: 
+                                    pmap[s.code] = float(s.close)
+                                    ts_obj = datetime.fromtimestamp(s.ts/1e9)
+                                    count_sj += 1
+                            time_module.sleep(1.0)
+                        except: pass
+                    
+                    if count_sj > 0:
+                        last_t = ts_obj.strftime("%H:%M:%S")
+                        data_source = "永豐API"
+                        api_status_code = 2
+                    else: api_status_code = 1
+                else: api_status_code = 1
+            except: api_status_code = 1 
+        
+        if not pmap:
+            pmap = get_prices_twse_mis(final_codes, info_map)
+            if pmap:
+                data_source = "證交所MIS(免登入)"
+                last_t = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
+    elif is_post_market:
+        data_source = "FinMind盤後資料"
+        last_t = "13:30:00"
+
+    s_dt = (datetime.now()-timedelta(days=40)).strftime("%Y-%m-%d")
+    h_c, v_c, h_p, v_p = 0, 0, 0, 0
+    dtls = []
+    
+    for c in final_codes:
+        df = get_hist(ft, c, s_dt)
+        m_type = info_map.get(c, "未知")
+        m_display = {"twse":"上市", "tpex":"上櫃", "emerging":"興櫃"}.get(m_type, "未知")
+        
+        p_price, p_ma5, p_stt = 0, 0, "-"
+        
+        curr_p = pmap.get(c, 0)
+        
+        if is_post_market and not df.empty:
+            if df.iloc[-1]['date'] == today_str:
+                curr_p = float(df.iloc[-1]['close'])
+
+        if not df.empty:
+            try:
+                if df.iloc[-1]['date'] == target_date_for_ranks:
+                    if len(df) >= 2:
+                        df_temp = df.copy()
+                        df_temp['MA5'] = df_temp['close'].rolling(5).mean()
+                        p_price = float(df_temp.iloc[-2]['close'])
+                        p_ma5 = float(df_temp.iloc[-2]['MA5'])
+                    else:
+                        p_price = 0; p_ma5=0
+                else:
+                    df_temp = df.copy()
+                    df_temp['MA5'] = df_temp['close'].rolling(5).mean()
+                    p_price = float(df_temp.iloc[-1]['close'])
+                    p_ma5 = float(df_temp.iloc[-1]['MA5'])
+
+                if p_price > 0 and p_ma5 > 0:
+                    if p_price > p_ma5: h_p += 1; p_stt="✅"
+                    else: p_stt="📉"
+                    v_p += 1
+            except: pass
+
+        c_ma5, c_stt, note = 0, "-", ""
+        
+        if not df.empty:
+            df_cur = df.copy()
+            if curr_p > 0:
+                if df_cur.iloc[-1]['date'] != today_str:
+                     df_cur = pd.concat([df_cur, pd.DataFrame([{'date': today_str, 'close': curr_p}])], ignore_index=True)
+                else:
+                    pass
+            elif not is_intra and curr_p == 0:
+                pass
+            
+            if curr_p > 0 and len(df_cur) >= 5:
+                df_cur['MA5'] = df_cur['close'].rolling(5).mean()
+                c_ma5 = df_cur.iloc[-1]['MA5']
+                if curr_p > c_ma5: h_c += 1; c_stt="✅"
+                else: c_stt="📉"
+                v_c += 1
+            else:
+                if curr_p == 0: 
+                    c_stt = "⚠️無報價"
+                    note += "抓取失敗 "
+                if len(df_cur) < 5: c_stt = "⚠️無MA5"; note += "歷史過短 "
+        else:
+            c_stt = "⚠️無歷史"; note = "FinMind缺資料"
+
+        dtls.append({
+            "代號":c, "市場": m_display,
+            "昨收":p_price, "昨MA5":round(p_ma5,2), "昨狀態":p_stt,
+            "現價":curr_p, "今MA5":round(c_ma5,2), "今狀態":c_stt,
+            "備註": note
+        })
+
+    br_c = h_c/v_c if v_c>0 else 0
+    br_p = h_p/v_p if v_p>0 else 0
+    
+    t_cur, t_pre, slope = 0, 0, 0
+    try:
+        tw = get_hist(ft, "TAIEX", s_dt)
+        if not tw.empty:
+            t_pre = 0
+            if tw.iloc[-1]['date'] == target_date_for_ranks:
+                 if len(tw) >= 2: t_pre = float(tw.iloc[-2]['close'])
+            else:
+                 t_pre = float(tw.iloc[-1]['close'])
+
+            if is_post_market and tw.iloc[-1]['date'] == today_str:
+                t_cur = float(tw.iloc[-1]['close'])
+            else:
+                if data_source == "永豐API":
+                    try: t_cur = float(sj_api.snapshots([sj_api.Contracts.Indices.TSE.TSE001])[0].close)
+                    except: pass
+                if t_cur == 0:
+                    try:
+                       mis_tw = get_prices_twse_mis(["t00"], {"t00":"twse"})
+                       if "t00" in mis_tw: t_cur = mis_tw["t00"]
+                    except: pass
+                if t_cur == 0: 
+                    r = tw.iloc[-1]
+                    t_cur = float(r['close'])
+            
+            if t_cur > 0:
+                if tw.iloc[-1]['date'] != today_str:
+                    tw = pd.concat([tw, pd.DataFrame([{'date':today_str, 'close':t_cur}])], ignore_index=True)
+                else:
+                    tw.iloc[-1, tw.columns.get_loc('close')] = t_cur
+            if len(tw) >= 6:
+                tw['MA5'] = tw['close'].rolling(5).mean()
+                slope = tw.iloc[-1]['MA5'] - tw.iloc[-2]['MA5']
+    except: pass
+    
+    t_chg = (t_cur-t_pre)/t_pre if t_pre>0 else 0
+    rec_t = last_t if is_intra and "無" not in str(last_t) else ("13:30:00" if is_post_market else datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S"))
+    
+    save_rec(d_cur, rec_t, br_c, t_chg, t_cur, t_pre, is_intra, v_c)
+    
+    return {
+        "d":d_cur, "d_prev": target_date_for_ranks, 
+        "br":br_c, "br_p":br_p, "h":h_c, "v":v_c, "h_p":h_p, "v_p":v_p,
+        "df":pd.DataFrame(dtls), 
+        "t":last_t, "tc":t_chg, "slope":slope, "src_type": data_source,
+        "raw":{'Date':d_cur,'Time':rec_t,'Breadth':br_c}, "src":msg_src,
+        "api_status": api_status_code, "sj_err": sj_err, "sj_usage": sj_usage_info
+    }
+
 # [核心修改] 修正戰略顯示邏輯，完全對應 Excel
 def display_strategy_panel(slope, open_br, br, n_state):
     st.subheader("♟️ 戰略指揮所")
@@ -474,7 +713,7 @@ def run_app():
                         should_notify = False
                         # 多頭回檔 (買點)
                         if data['slope'] > 0 and n_state['intraday_trend'] == 'up': should_notify = True
-                        # 空頭遇壓 (逃命點)
+                        # 空頭遇壓 (逃命點) (這裡修正為: 空頭戰場，但盤中鎖定偏多 -> 遇壓)
                         if data['slope'] < 0 and n_state['intraday_trend'] == 'up': should_notify = True
                         
                         if should_notify:
@@ -491,7 +730,7 @@ def run_app():
                         should_notify = False
                         # 空頭反彈 (空點)
                         if data['slope'] < 0 and n_state['intraday_trend'] == 'down': should_notify = True
-                        # 多頭支撐 (逃命點)
+                        # 多頭支撐 (逃命點) (這裡修正為: 多頭戰場，但盤中鎖定偏空 -> 遇撐)
                         if data['slope'] > 0 and n_state['intraday_trend'] == 'down': should_notify = True
                         
                         if should_notify:
