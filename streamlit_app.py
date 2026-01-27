@@ -12,9 +12,9 @@ import time as time_module
 import random
 
 # ==========================================
-# 設定區 v9.21.0 (永久記憶防吵版)
+# 設定區 v9.22.0 (策略訊號戰情版)
 # ==========================================
-APP_VER = "v9.21.0 (永久記憶防吵版)"
+APP_VER = "v9.22.0 (策略訊號戰情版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -25,7 +25,7 @@ OPEN_COUNT_THR = 295
 EXCL_PFX = ["00", "91"]
 HIST_FILE = "breadth_history_v3.csv"
 RANK_FILE = "ranking_cache.json"
-NOTIFY_FILE = "notify_state.json" # [新增] 用來存通知狀態的檔案
+NOTIFY_FILE = "notify_state.json" 
 
 st.set_page_config(page_title="盤中權證進場判斷", layout="wide")
 
@@ -44,7 +44,6 @@ def send_tg(token, chat_id, msg):
         return r.status_code == 200
     except: return False
 
-# [新增] 讀取通知狀態 (永久記憶)
 def load_notify_state(today_str):
     default_state = {
         "date": today_str,
@@ -61,13 +60,11 @@ def load_notify_state(today_str):
     try:
         with open(NOTIFY_FILE, 'r') as f:
             state = json.load(f)
-            # 如果是新的一天，重置狀態
             if state.get("date") != today_str:
                 return default_state
             return state
     except: return default_state
 
-# [新增] 儲存通知狀態
 def save_notify_state(state):
     try:
         with open(NOTIFY_FILE, 'w') as f:
@@ -229,6 +226,12 @@ def get_prices_twse_mis(codes, info_map):
     req_strs = []
     chunk_size = 50 
     
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Referer": "https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw",
+    }
+
     for i in range(0, len(codes), chunk_size):
         chunk = codes[i:i+chunk_size]
         q_list = []
@@ -246,7 +249,7 @@ def get_prices_twse_mis(codes, info_map):
         try:
             url = base_url + q_str
             time_module.sleep(random.uniform(0.1, 0.3)) 
-            r = requests.get(url)
+            r = requests.get(url, headers=headers)
             if r.status_code == 200:
                 data = r.json()
                 if 'msgArray' in data:
@@ -532,6 +535,89 @@ def fetch_all():
         "api_status": api_status_code, "sj_err": sj_err, "sj_usage": sj_usage_info
     }
 
+# [新增] 策略邏輯顯示區
+def display_strategy_panel(slope, open_br, br, n_state):
+    st.subheader("♟️ 戰略指揮所")
+    
+    strategies = []
+    
+    # 1. 大盤趨勢 (斜率)
+    if slope > 0:
+        strategies.append({"sig": "MA5斜率為正 ➜ 大盤偏多", "act": "只做多單，放棄空單", "type": "success"})
+    elif slope < 0:
+        strategies.append({"sig": "MA5斜率為負 ➜ 大盤偏空", "act": "只做空單，放棄多單", "type": "error"})
+    else:
+        strategies.append({"sig": "MA5斜率持平", "act": "", "type": "info"})
+        
+    # 2. 開盤氣氛 (開盤廣度)
+    if open_br is not None:
+        if slope > 0:
+            if open_br >= 0.60:
+                strategies.append({"sig": "開盤廣度 > 60% ➜ 行情延續", "act": "", "type": "success"})
+            else:
+                strategies.append({"sig": "開盤廣度 < 60% ➜ 行情轉折", "act": "", "type": "warning"})
+        elif slope < 0:
+            if open_br >= 0.60:
+                strategies.append({"sig": "開盤廣度 > 60% ➜ 行情轉折", "act": "", "type": "warning"})
+            else:
+                strategies.append({"sig": "開盤廣度 < 60% ➜ 行情延續", "act": "", "type": "error"})
+
+    # 3. 盤中變化 (乖離)
+    if open_br is not None:
+        if br >= (open_br + 0.05):
+            strategies.append({"sig": "廣度較開盤 +5% ➜ 今日偏多", "act": "", "type": "success"})
+        elif br <= (open_br - 0.05):
+            strategies.append({"sig": "廣度較開盤 -5% ➜ 今日偏空", "act": "", "type": "error"})
+            
+    # 4. 精細戰術 (回檔/反彈) - 根據 n_state (通知狀態) 來觸發
+    #
+    if slope > 0:
+        # 多頭回檔買進 (高點回落 5%)
+        if n_state['notified_drop_high']:
+            strategies.append({
+                "sig": "今日偏多 + 賣壓短暫回檔 (高點落 5%)",
+                "act": "🎯 進場多單 (確認止穩後)",
+                "type": "success"
+            })
+        # 多頭遇壓 (低點反彈 5% 但上不去) -> 這裡用反向思考，如果有低點反彈，可能代表稍早殺低了
+        if n_state['notified_rise_low']:
+            strategies.append({
+                "sig": "今日偏空(短) + 買方短暫支撐",
+                "act": "⚠️ 多單出場 / 收盤再進場",
+                "type": "warning"
+            })
+            
+    elif slope < 0:
+        # 空頭反彈放空 (低點反彈 5%)
+        if n_state['notified_rise_low']:
+             strategies.append({
+                "sig": "今日偏空 + 買方短暫反彈 (低點彈 5%)",
+                "act": "🎯 進場空單 (確認止漲後)",
+                "type": "error"
+            })
+        # 空頭遇撐 (高點回落 5%)
+        if n_state['notified_drop_high']:
+            strategies.append({
+                "sig": "今日偏多(短) + 賣方短暫壓制",
+                "act": "⚠️ 空單出場 / 收盤再進場",
+                "type": "warning"
+            })
+
+    # 顯示區塊
+    cols = st.columns(len(strategies))
+    for i, s in enumerate(strategies):
+        with cols[i]:
+            title = s["sig"]
+            body = s["act"]
+            if s["type"] == "success":
+                st.success(f"**{title}**\n\n{body}")
+            elif s["type"] == "error":
+                st.error(f"**{title}**\n\n{body}")
+            elif s["type"] == "warning":
+                st.warning(f"**{title}**\n\n{body}")
+            else:
+                st.info(f"**{title}**\n\n{body}")
+
 def run_app():
     st.title(f"📈 {APP_VER}")
     
@@ -582,7 +668,6 @@ def run_app():
             today_max = br if hist_max is None else max(hist_max, br)
             today_min = br if hist_min is None else min(hist_min, br)
             
-            # [核心修改] 讀取硬碟中的通知狀態
             n_state = load_notify_state(data['d']) 
 
             if tg_tok and tg_id:
@@ -591,11 +676,10 @@ def run_app():
                 if br >= BREADTH_THR: stt = 'hot'
                 elif br <= BREADTH_LOW: stt = 'cold'
                 
-                # 比對硬碟紀錄，而不是 session_state
                 if stt != n_state['last_stt']:
                     msg = f"🔥 過熱: {br:.1%}" if stt=='hot' else (f"❄️ 冰點: {br:.1%}" if stt=='cold' else "")
                     if msg: send_tg(tg_tok, tg_id, msg)
-                    n_state['last_stt'] = stt # 更新狀態
+                    n_state['last_stt'] = stt 
                 
                 # 2. 急變
                 rap_msg, rid = check_rapid(data['raw'])
@@ -635,8 +719,10 @@ def run_app():
                 else:
                     n_state['notified_rise_low'] = False
                 
-                # 統一存回硬碟
                 save_notify_state(n_state)
+            
+            # [新增] 呼叫策略面板
+            display_strategy_panel(data['slope'], open_br, br, n_state)
 
             st.subheader(f"📅 {data['d']}")
             st.caption(f"名單基準日: {data['d_prev']}") 
