@@ -12,9 +12,9 @@ import time as time_module
 import random
 
 # ==========================================
-# 設定區 v9.20.0 (圖表最佳化版)
+# 設定區 v9.21.0 (永久記憶防吵版)
 # ==========================================
-APP_VER = "v9.20.0 (圖表最佳化版)"
+APP_VER = "v9.21.0 (永久記憶防吵版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -25,6 +25,7 @@ OPEN_COUNT_THR = 295
 EXCL_PFX = ["00", "91"]
 HIST_FILE = "breadth_history_v3.csv"
 RANK_FILE = "ranking_cache.json"
+NOTIFY_FILE = "notify_state.json" # [新增] 用來存通知狀態的檔案
 
 st.set_page_config(page_title="盤中權證進場判斷", layout="wide")
 
@@ -42,6 +43,36 @@ def send_tg(token, chat_id, msg):
         r = requests.post(url, json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"})
         return r.status_code == 200
     except: return False
+
+# [新增] 讀取通知狀態 (永久記憶)
+def load_notify_state(today_str):
+    default_state = {
+        "date": today_str,
+        "last_stt": "normal",
+        "last_rap": "",
+        "was_dev_high": False,
+        "was_dev_low": False,
+        "notified_drop_high": False,
+        "notified_rise_low": False
+    }
+    
+    if not os.path.exists(NOTIFY_FILE): return default_state
+    
+    try:
+        with open(NOTIFY_FILE, 'r') as f:
+            state = json.load(f)
+            # 如果是新的一天，重置狀態
+            if state.get("date") != today_str:
+                return default_state
+            return state
+    except: return default_state
+
+# [新增] 儲存通知狀態
+def save_notify_state(state):
+    try:
+        with open(NOTIFY_FILE, 'w') as f:
+            json.dump(state, f)
+    except: pass
 
 def check_rapid(row):
     if not os.path.exists(HIST_FILE): return None, None
@@ -279,7 +310,6 @@ def plot_chart():
         if chart_data.empty: return None
         
         start_t = pd.to_datetime(f"{base_d} 09:00:00")
-        # [修改] 將 X 軸終點改為 13:30:00，避免右側留白
         end_t = pd.to_datetime(f"{base_d} 13:30:00")
         
         base = alt.Chart(chart_data).encode(x=alt.X('DT:T', title='時間', axis=alt.Axis(format='%H:%M'), scale=alt.Scale(domain=[start_t, end_t])))
@@ -504,13 +534,7 @@ def fetch_all():
 
 def run_app():
     st.title(f"📈 {APP_VER}")
-    if 'last_stt' not in st.session_state: st.session_state['last_stt'] = 'normal'
-    if 'last_rap' not in st.session_state: st.session_state['last_rap'] = ""
-    if 'was_dev_high' not in st.session_state: st.session_state['was_dev_high'] = False
-    if 'was_dev_low' not in st.session_state: st.session_state['was_dev_low'] = False
-    if 'notified_drop_high' not in st.session_state: st.session_state['notified_drop_high'] = False
-    if 'notified_rise_low' not in st.session_state: st.session_state['notified_rise_low'] = False
-
+    
     with st.sidebar:
         st.subheader("設定")
         auto = st.checkbox("自動更新", value=False)
@@ -558,49 +582,61 @@ def run_app():
             today_max = br if hist_max is None else max(hist_max, br)
             today_min = br if hist_min is None else min(hist_min, br)
             
+            # [核心修改] 讀取硬碟中的通知狀態
+            n_state = load_notify_state(data['d']) 
+
             if tg_tok and tg_id:
+                # 1. 過熱/冰點
                 stt = 'normal'
                 if br >= BREADTH_THR: stt = 'hot'
                 elif br <= BREADTH_LOW: stt = 'cold'
-                if stt != st.session_state['last_stt']:
+                
+                # 比對硬碟紀錄，而不是 session_state
+                if stt != n_state['last_stt']:
                     msg = f"🔥 過熱: {br:.1%}" if stt=='hot' else (f"❄️ 冰點: {br:.1%}" if stt=='cold' else "")
                     if msg: send_tg(tg_tok, tg_id, msg)
-                    st.session_state['last_stt'] = stt
+                    n_state['last_stt'] = stt # 更新狀態
                 
+                # 2. 急變
                 rap_msg, rid = check_rapid(data['raw'])
-                if rap_msg and rid != st.session_state['last_rap']:
-                    send_tg(tg_tok, tg_id, rap_msg); st.session_state['last_rap'] = rid
+                if rap_msg and rid != n_state['last_rap']:
+                    send_tg(tg_tok, tg_id, rap_msg)
+                    n_state['last_rap'] = rid
                 
+                # 3. 乖離
                 if open_br is not None:
                     is_dev_high = (br >= open_br + OPEN_DEV_THR)
                     is_dev_low = (br <= open_br - OPEN_DEV_THR)
                     
-                    if is_dev_high and not st.session_state['was_dev_high']:
+                    if is_dev_high and not n_state['was_dev_high']:
                         msg = f"🚀 <b>【向上乖離】</b>\n開盤廣度: {open_br:.1%}\n目前廣度: {br:.1%}\n已高於開盤 5%"
                         send_tg(tg_tok, tg_id, msg)
+                        n_state['was_dev_high'] = True
                     
-                    if is_dev_low and not st.session_state['was_dev_low']:
+                    if is_dev_low and not n_state['was_dev_low']:
                         msg = f"📉 <b>【向下乖離】</b>\n開盤廣度: {open_br:.1%}\n目前廣度: {br:.1%}\n已低於開盤 5%"
                         send_tg(tg_tok, tg_id, msg)
-                        
-                    st.session_state['was_dev_high'] = is_dev_high
-                    st.session_state['was_dev_low'] = is_dev_low
+                        n_state['was_dev_low'] = True
                 
+                # 4. 反轉
                 if br <= (today_max - 0.05):
-                    if not st.session_state['notified_drop_high']:
+                    if not n_state['notified_drop_high']:
                         msg = f"📉 <b>【高點回落】</b>\n今日高點: {today_max:.1%}\n目前廣度: {br:.1%}\n已自高點回檔 5%"
                         send_tg(tg_tok, tg_id, msg)
-                        st.session_state['notified_drop_high'] = True
+                        n_state['notified_drop_high'] = True
                 else:
-                    st.session_state['notified_drop_high'] = False
+                    n_state['notified_drop_high'] = False
                 
                 if br >= (today_min + 0.05):
-                    if not st.session_state['notified_rise_low']:
+                    if not n_state['notified_rise_low']:
                         msg = f"🚀 <b>【低點反彈】</b>\n今日低點: {today_min:.1%}\n目前廣度: {br:.1%}\n已自低點反彈 5%"
                         send_tg(tg_tok, tg_id, msg)
-                        st.session_state['notified_rise_low'] = True
+                        n_state['notified_rise_low'] = True
                 else:
-                    st.session_state['notified_rise_low'] = False
+                    n_state['notified_rise_low'] = False
+                
+                # 統一存回硬碟
+                save_notify_state(n_state)
 
             st.subheader(f"📅 {data['d']}")
             st.caption(f"名單基準日: {data['d_prev']}") 
