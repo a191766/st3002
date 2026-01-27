@@ -12,9 +12,9 @@ import time as time_module
 import random
 
 # ==========================================
-# 設定區 v9.22.0 (策略訊號戰情版)
+# 設定區 v9.23.0 (嚴格時序鎖定版)
 # ==========================================
-APP_VER = "v9.22.0 (策略訊號戰情版)"
+APP_VER = "v9.23.0 (嚴格時序鎖定版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -44,6 +44,7 @@ def send_tg(token, chat_id, msg):
         return r.status_code == 200
     except: return False
 
+# [核心修改] 增加 intraday_trend (盤中趨勢鎖定)
 def load_notify_state(today_str):
     default_state = {
         "date": today_str,
@@ -52,7 +53,8 @@ def load_notify_state(today_str):
         "was_dev_high": False,
         "was_dev_low": False,
         "notified_drop_high": False,
-        "notified_rise_low": False
+        "notified_rise_low": False,
+        "intraday_trend": None  # None: 未定, 'up': 鎖定偏多, 'down': 鎖定偏空
     }
     
     if not os.path.exists(NOTIFY_FILE): return default_state
@@ -62,6 +64,9 @@ def load_notify_state(today_str):
             state = json.load(f)
             if state.get("date") != today_str:
                 return default_state
+            # 確保舊檔案有新欄位
+            if "intraday_trend" not in state:
+                state["intraday_trend"] = None
             return state
     except: return default_state
 
@@ -535,13 +540,13 @@ def fetch_all():
         "api_status": api_status_code, "sj_err": sj_err, "sj_usage": sj_usage_info
     }
 
-# [新增] 策略邏輯顯示區
+# [核心修改] 顯示策略區塊 (加入嚴格順序判斷)
 def display_strategy_panel(slope, open_br, br, n_state):
     st.subheader("♟️ 戰略指揮所")
     
     strategies = []
     
-    # 1. 大盤趨勢 (斜率)
+    # 1. 趨勢與開盤
     if slope > 0:
         strategies.append({"sig": "MA5斜率為正 ➜ 大盤偏多", "act": "只做多單，放棄空單", "type": "success"})
     elif slope < 0:
@@ -549,74 +554,62 @@ def display_strategy_panel(slope, open_br, br, n_state):
     else:
         strategies.append({"sig": "MA5斜率持平", "act": "", "type": "info"})
         
-    # 2. 開盤氣氛 (開盤廣度)
-    if open_br is not None:
-        if slope > 0:
-            if open_br >= 0.60:
-                strategies.append({"sig": "開盤廣度 > 60% ➜ 行情延續", "act": "", "type": "success"})
-            else:
-                strategies.append({"sig": "開盤廣度 < 60% ➜ 行情轉折", "act": "", "type": "warning"})
-        elif slope < 0:
-            if open_br >= 0.60:
-                strategies.append({"sig": "開盤廣度 > 60% ➜ 行情轉折", "act": "", "type": "warning"})
-            else:
-                strategies.append({"sig": "開盤廣度 < 60% ➜ 行情延續", "act": "", "type": "error"})
+    # 2. 盤中趨勢鎖定 (Trend Lock)
+    trend_status = n_state.get('intraday_trend')
+    if trend_status == 'up':
+        strategies.append({"sig": "🔒 已觸發【開盤+5%】", "act": "今日偏多確認，等待回檔", "type": "success"})
+    elif trend_status == 'down':
+        strategies.append({"sig": "🔒 已觸發【開盤-5%】", "act": "今日偏空確認，等待反彈", "type": "error"})
+    else:
+        strategies.append({"sig": "⏳ 盤整中 (未達 +/- 5%)", "act": "觀望，等待趨勢表態", "type": "info"})
 
-    # 3. 盤中變化 (乖離)
-    if open_br is not None:
-        if br >= (open_br + 0.05):
-            strategies.append({"sig": "廣度較開盤 +5% ➜ 今日偏多", "act": "", "type": "success"})
-        elif br <= (open_br - 0.05):
-            strategies.append({"sig": "廣度較開盤 -5% ➜ 今日偏空", "act": "", "type": "error"})
-            
-    # 4. 精細戰術 (回檔/反彈) - 根據 n_state (通知狀態) 來觸發
-    #
+    # 3. 戰術執行 (根據鎖定狀態決定動作)
     if slope > 0:
-        # 多頭回檔買進 (高點回落 5%)
-        if n_state['notified_drop_high']:
-            strategies.append({
-                "sig": "今日偏多 + 賣壓短暫回檔 (高點落 5%)",
-                "act": "🎯 進場多單 (確認止穩後)",
-                "type": "success"
-            })
-        # 多頭遇壓 (低點反彈 5% 但上不去) -> 這裡用反向思考，如果有低點反彈，可能代表稍早殺低了
-        if n_state['notified_rise_low']:
-            strategies.append({
-                "sig": "今日偏空(短) + 買方短暫支撐",
-                "act": "⚠️ 多單出場 / 收盤再進場",
-                "type": "warning"
-            })
-            
-    elif slope < 0:
-        # 空頭反彈放空 (低點反彈 5%)
-        if n_state['notified_rise_low']:
-             strategies.append({
-                "sig": "今日偏空 + 買方短暫反彈 (低點彈 5%)",
-                "act": "🎯 進場空單 (確認止漲後)",
-                "type": "error"
-            })
-        # 空頭遇撐 (高點回落 5%)
-        if n_state['notified_drop_high']:
-            strategies.append({
-                "sig": "今日偏多(短) + 賣方短暫壓制",
-                "act": "⚠️ 空單出場 / 收盤再進場",
-                "type": "warning"
-            })
+        # 只有在「偏多鎖定」狀態下，才去抓回檔買點
+        if trend_status == 'up':
+            if n_state['notified_drop_high']:
+                strategies.append({
+                    "sig": "趨勢多 + 賣壓短暫回檔 (高點落 5%)",
+                    "act": "🎯 進場多單 (確認止穩後)",
+                    "type": "success"
+                })
+        # 如果鎖定偏空 (反向)，則提示出場
+        elif trend_status == 'down':
+             if n_state['notified_rise_low']:
+                strategies.append({
+                    "sig": "趨勢轉空 (觸發-5%) + 反彈",
+                    "act": "⚠️ 多單出場 / 觀望",
+                    "type": "warning"
+                })
 
-    # 顯示區塊
+    elif slope < 0:
+        # 只有在「偏空鎖定」狀態下，才去抓反彈空點
+        if trend_status == 'down':
+            if n_state['notified_rise_low']:
+                strategies.append({
+                    "sig": "趨勢空 + 買方短暫反彈 (低點彈 5%)",
+                    "act": "🎯 進場空單 (確認止漲後)",
+                    "type": "error"
+                })
+        # 如果鎖定偏多 (反向)，則提示出場
+        elif trend_status == 'up':
+            if n_state['notified_drop_high']:
+                strategies.append({
+                    "sig": "趨勢轉多 (觸發+5%) + 回檔",
+                    "act": "⚠️ 空單出場 / 觀望",
+                    "type": "warning"
+                })
+
+    # 顯示
     cols = st.columns(len(strategies))
     for i, s in enumerate(strategies):
         with cols[i]:
             title = s["sig"]
             body = s["act"]
-            if s["type"] == "success":
-                st.success(f"**{title}**\n\n{body}")
-            elif s["type"] == "error":
-                st.error(f"**{title}**\n\n{body}")
-            elif s["type"] == "warning":
-                st.warning(f"**{title}**\n\n{body}")
-            else:
-                st.info(f"**{title}**\n\n{body}")
+            if s["type"] == "success": st.success(f"**{title}**\n\n{body}")
+            elif s["type"] == "error": st.error(f"**{title}**\n\n{body}")
+            elif s["type"] == "warning": st.warning(f"**{title}**\n\n{body}")
+            else: st.info(f"**{title}**\n\n{body}")
 
 def run_app():
     st.title(f"📈 {APP_VER}")
@@ -670,6 +663,15 @@ def run_app():
             
             n_state = load_notify_state(data['d']) 
 
+            # [核心邏輯] 判斷並鎖定 Intraday Trend
+            if open_br is not None and n_state['intraday_trend'] is None:
+                if br >= (open_br + 0.05):
+                    n_state['intraday_trend'] = 'up'
+                    if tg_tok and tg_id: send_tg(tg_tok, tg_id, f"🔒 <b>【趨勢鎖定】</b>\n廣度先達開盤+5% (目前{br:.1%})，今日確認偏多！")
+                elif br <= (open_br - 0.05):
+                    n_state['intraday_trend'] = 'down'
+                    if tg_tok and tg_id: send_tg(tg_tok, tg_id, f"🔒 <b>【趨勢鎖定】</b>\n廣度先達開盤-5% (目前{br:.1%})，今日確認偏空！")
+
             if tg_tok and tg_id:
                 # 1. 過熱/冰點
                 stt = 'normal'
@@ -687,41 +689,41 @@ def run_app():
                     send_tg(tg_tok, tg_id, rap_msg)
                     n_state['last_rap'] = rid
                 
-                # 3. 乖離
+                # 3. 乖離 (只通知一次)
                 if open_br is not None:
                     is_dev_high = (br >= open_br + OPEN_DEV_THR)
                     is_dev_low = (br <= open_br - OPEN_DEV_THR)
                     
                     if is_dev_high and not n_state['was_dev_high']:
-                        msg = f"🚀 <b>【向上乖離】</b>\n開盤廣度: {open_br:.1%}\n目前廣度: {br:.1%}\n已高於開盤 5%"
-                        send_tg(tg_tok, tg_id, msg)
+                        # 這裡不再發送通知，因為已經合併到 trend lock 通知了，避免重複
                         n_state['was_dev_high'] = True
                     
                     if is_dev_low and not n_state['was_dev_low']:
-                        msg = f"📉 <b>【向下乖離】</b>\n開盤廣度: {open_br:.1%}\n目前廣度: {br:.1%}\n已低於開盤 5%"
-                        send_tg(tg_tok, tg_id, msg)
                         n_state['was_dev_low'] = True
                 
-                # 4. 反轉
-                if br <= (today_max - 0.05):
-                    if not n_state['notified_drop_high']:
-                        msg = f"📉 <b>【高點回落】</b>\n今日高點: {today_max:.1%}\n目前廣度: {br:.1%}\n已自高點回檔 5%"
-                        send_tg(tg_tok, tg_id, msg)
-                        n_state['notified_drop_high'] = True
-                else:
-                    n_state['notified_drop_high'] = False
+                # 4. 反轉 (根據鎖定狀態來決定是否通知)
+                # 只有鎖定多頭，才監控高點回落
+                if n_state['intraday_trend'] == 'up':
+                    if br <= (today_max - 0.05):
+                        if not n_state['notified_drop_high']:
+                            msg = f"📉 <b>【多頭回檔】</b>\n今日高點: {today_max:.1%}\n目前廣度: {br:.1%}\n已回檔 5%，留意進場時機"
+                            send_tg(tg_tok, tg_id, msg)
+                            n_state['notified_drop_high'] = True
+                    else:
+                        n_state['notified_drop_high'] = False
                 
-                if br >= (today_min + 0.05):
-                    if not n_state['notified_rise_low']:
-                        msg = f"🚀 <b>【低點反彈】</b>\n今日低點: {today_min:.1%}\n目前廣度: {br:.1%}\n已自低點反彈 5%"
-                        send_tg(tg_tok, tg_id, msg)
-                        n_state['notified_rise_low'] = True
-                else:
-                    n_state['notified_rise_low'] = False
+                # 只有鎖定空頭，才監控低點反彈
+                if n_state['intraday_trend'] == 'down':
+                    if br >= (today_min + 0.05):
+                        if not n_state['notified_rise_low']:
+                            msg = f"🚀 <b>【空頭反彈】</b>\n今日低點: {today_min:.1%}\n目前廣度: {br:.1%}\n已反彈 5%，留意進場時機"
+                            send_tg(tg_tok, tg_id, msg)
+                            n_state['notified_rise_low'] = True
+                    else:
+                        n_state['notified_rise_low'] = False
                 
                 save_notify_state(n_state)
             
-            # [新增] 呼叫策略面板
             display_strategy_panel(data['slope'], open_br, br, n_state)
 
             st.subheader(f"📅 {data['d']}")
