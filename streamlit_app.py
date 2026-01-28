@@ -18,9 +18,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.16 (復刻修正版)
+# 設定區 v9.55.16 (期貨修復+圖表強制顯示版)
 # ==========================================
-APP_VER = "v9.55.16 (復刻修正版)"
+APP_VER = "v9.55.16 (期貨修復+圖表強制顯示版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -156,11 +156,13 @@ def get_api():
         return None, str(e)
 
 # ==========================================
-# 籌碼面資料處理 (Restored Scanner from v9.55.14)
+# 籌碼面資料處理 (Restored Scanner Logic)
 # ==========================================
 def call_finmind_api_try_versions(dataset_candidates, data_id, start_date, token):
     """
-    恢復使用 v9.55.14 的自動掃描機制
+    自動掃描機制：
+    1. 嘗試不同的 dataset 名稱
+    2. 嘗試不同的 API 版本 (v4, v3, v2)
     """
     versions = ["v4", "v3", "v2"]
     last_error = ""
@@ -200,12 +202,12 @@ def get_chips_data(token, target_date_str):
     start_date = (datetime.strptime(target_date_str, "%Y-%m-%d") - timedelta(days=10)).strftime("%Y-%m-%d")
     res = {}
     
-    # 1. 外資期貨 (掃描 + 正確欄位) - 恢復 v9.55.14 邏輯
+    # 1. 外資期貨 (掃描 + 正確欄位)
     fut_candidates = ["TaiwanFuturesInstitutional", "TaiwanFuturesInstitutionalInvestors"]
     df_fut, fut_src = call_finmind_api_try_versions(fut_candidates, "TX", start_date, token)
     
     if df_fut.empty:
-        diagnosis.append(f"❌ 期貨: 掃描失敗 ({fut_src})")
+        diagnosis.append(f"❌ 期貨: 掃描失敗 (最後: {fut_src})")
     else:
         # 尋找外資
         col_name = None
@@ -222,11 +224,12 @@ def get_chips_data(token, target_date_str):
                 latest = df_foreign.iloc[-1]
                 prev = df_foreign.iloc[-2] if len(df_foreign) >= 2 else latest
                 
-                # 正確欄位計算
+                # 正確欄位計算: 多方未平倉 - 空方未平倉
                 try:
                     curr_long = float(latest.get('long_open_interest_balance_volume', 0))
                     curr_short = float(latest.get('short_open_interest_balance_volume', 0))
                     
+                    # 如果找不到長欄位，嘗試舊欄位
                     if curr_long == 0 and curr_short == 0 and 'open_interest' in latest:
                         res['fut_oi'] = int(latest['open_interest'])
                         prev_oi = int(prev.get('open_interest', 0))
@@ -239,13 +242,13 @@ def get_chips_data(token, target_date_str):
                         prev_net_oi = int(prev_long - prev_short)
                         res['fut_oi_chg'] = res['fut_oi'] - prev_net_oi
                     
-                    diagnosis.append(f"✅ 期貨(外資): 成功 ({fut_src}, OI: {res['fut_oi']}, 變動: {res['fut_oi_chg']})")
+                    diagnosis.append(f"✅ 期貨(外資): 成功 (OI: {res['fut_oi']}, 變動: {res['fut_oi_chg']})")
                 except:
-                    diagnosis.append("❌ 期貨: 數值計算錯誤")
+                    diagnosis.append(f"❌ 期貨: 數值計算錯誤")
         else:
-            diagnosis.append(f"❌ 期貨: 欄位識別失敗 {list(df_fut.columns)}")
+            diagnosis.append(f"❌ 期貨: 找不到法人欄位 {list(df_fut.columns)}")
 
-    # 2. 選擇權
+    # 2. 選擇權 (V4 OK)
     df_opt, opt_src = call_finmind_api_try_versions(["TaiwanOptionDaily"], "TXO", start_date, token)
     if not df_opt.empty:
         last_date = df_opt['date'].max()
@@ -258,7 +261,17 @@ def get_chips_data(token, target_date_str):
                 res['pc_ratio'] = round((put_oi / call_oi) * 100, 2)
                 diagnosis.append(f"✅ 選擇權: 成功 (PC={res['pc_ratio']}%)")
 
-    # 3. 融資餘額 (替代維持率)
+    # 3. 融資維持率 (掃描嘗試，雖然大概率失敗)
+    maint_candidates = ["TaiwanStockMarginMaintenanceRatio", "TaiwanStockAverageMarginMaintenanceRatio"]
+    df_maint, maint_src = call_finmind_api_try_versions(maint_candidates, None, start_date, token)
+    if not df_maint.empty:
+        latest = df_maint.iloc[-1]
+        col_maint = 'margin_maintenance_ratio' if 'margin_maintenance_ratio' in latest else 'MarginMaintenanceRatio'
+        if col_maint in latest:
+            res['margin_ratio'] = float(latest[col_maint])
+            diagnosis.append(f"✅ 維持率: 成功 ({res['margin_ratio']}%)")
+    
+    # 4. 融資餘額 (替代方案)
     df_margin, margin_src = call_finmind_api_try_versions(["TaiwanStockTotalMarginPurchaseShortSale"], None, start_date, token)
     if not df_margin.empty:
         df_money = df_margin[df_margin['name'] == 'MarginPurchaseMoney'].sort_values('date')
@@ -270,8 +283,6 @@ def get_chips_data(token, target_date_str):
             res['margin_chg'] = round((curr_bal - prev_bal) / 100000000, 2) 
             res['margin_bal'] = round(curr_bal / 100000000, 1)
             diagnosis.append(f"✅ 大盤融資餘額: 成功 (總額:{res['margin_bal']}億, 變動:{res['margin_chg']}億)")
-    else:
-        diagnosis.append("⚠️ 融資餘額: 抓取失敗")
 
     return res, diagnosis
 
@@ -287,30 +298,32 @@ def get_chip_strategy(ma5_slope, chips):
     act = "觀察技術面為主"
     color = "info"
     
+    # 1. 殺盤 (空頭順勢)
     if ma5_slope <= 0 and fut_oi < -10000 and margin_chg > 0:
         sig = "📉 殺戮盤 (散戶接刀)"
         act = "主力殺、散戶接，籌碼極亂。全力放空，不要猜底。"
         color = "error"
+    # 2. 多頭燃料充足
     elif ma5_slope > 0 and fut_oi > 10000 and pc_ratio > 110:
         sig = "🚀 火力全開 (外資助攻)"
         act = "外資期現貨同步作多，支撐強勁。多單抱緊，甚至加碼。"
         color = "success"
+    # 3. 融資大減 (清洗籌碼)
     elif ma5_slope < 0 and margin_chg < -15: 
         sig = "💎 籌碼清洗 (融資大減)"
         act = f"融資單日大減 {abs(margin_chg)} 億，浮額清洗中。留意止跌訊號。"
         color = "primary"
+    # 4. 多頭力竭
     elif ma5_slope > 0 and fut_chg < -3000 and margin_chg > 5: 
         sig = "⚠️ 籌碼渙散 (拉高出貨)"
         act = "指數漲但外資大逃亡，散戶在接最後一棒。獲利了結，小心反轉。"
         color = "warning"
+    # 5. 潛伏期
     elif abs(ma5_slope) < 10 and fut_chg > 2000 and pc_ratio > 110:
         sig = "🟩 潛伏期 (主力吃貨)"
         act = "盤整中見外資偷佈局多單。建議提前建倉，等待噴出。"
         color = "success"
-    elif abs(ma5_slope) < 10 and margin_chg > 10:
-        sig = "🟥 溫水煮青蛙 (散戶堆疊)"
-        act = "盤整中融資暴增，籌碼凌亂，易跌難漲。空手觀望。"
-        color = "error"
+    # 6. 假突破
     elif ma5_slope > 0 and fut_oi < -3000:
         sig = "🟨 假突破警戒"
         act = "現貨漲但期貨空單留倉。可能是假突破，多單要設緊停損。"
@@ -413,8 +426,6 @@ def get_hist(token, code, start):
 def get_prices_twse_mis(codes, info_map):
     if not codes: return {}, {}
     
-    print(f"DEBUG: 準備從 MIS 抓取 {len(codes)} 檔股票...")
-    
     session = cffi_requests.Session(impersonate="chrome")
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -439,7 +450,6 @@ def get_prices_twse_mis(codes, info_map):
     for i in range(0, len(codes), chunk_size):
         chunk = codes[i:i+chunk_size]
         q_list = []
-        current_batch_codes = []
         for c in chunk:
             c = str(c).strip()
             if not c: continue
@@ -449,8 +459,6 @@ def get_prices_twse_mis(codes, info_map):
                 q_list.append(f"tse_{c}.tw")
             else:
                 q_list.append(f"otc_{c}.tw")
-                 
-            current_batch_codes.append(c)
                  
         if q_list:
             req_strs.append("|".join(q_list))
@@ -468,9 +476,7 @@ def get_prices_twse_mis(codes, info_map):
             if r.status_code == 200:
                 try:
                     data = r.json()
-                    if 'msgArray' not in data: 
-                        for c in codes[idx*chunk_size : (idx+1)*chunk_size]: debug_log[c] = "MIS回傳空值"
-                        continue
+                    if 'msgArray' not in data: continue
                     
                     for item in data['msgArray']:
                         c = item.get('c', '') 
@@ -566,6 +572,7 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
     st.subheader("♟️ 戰略指揮所")
     strategies = []
     
+    # 1. 技術面
     if slope > 0:
         strategies.append({"sig": "MA5斜率為正 ➜ 大盤偏多", "act": "只做多單，放棄空單", "type": "success"})
     elif slope < 0:
@@ -573,6 +580,7 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
     else:
         strategies.append({"sig": "MA5斜率持平", "act": "", "type": "info"})
     
+    # 2. 日內趨勢
     trend_status = n_state.get('intraday_trend')
     if trend_status == 'up':
         strategies.append({"sig": "🔒 已觸發【開盤+5%】", "act": "今日偏多確認，留意回檔", "type": "success"})
@@ -581,6 +589,7 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
     else:
         strategies.append({"sig": "⏳ 盤整中 (未達 +/- 5%)", "act": "觀望，等待趨勢表態", "type": "info"})
 
+    # 3. 動態戰術
     if slope > 0:
         if trend_status == 'up':
             if n_state['notified_drop_high']:
@@ -624,6 +633,7 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
             elif s["type"] == "primary": st.info(f"**{title}**\n\n{body}")
             else: st.info(f"**{title}**\n\n{body}")
     
+    # 4. 籌碼氣象站 (Sponsor)
     st.markdown("---")
     st.subheader("♟️ 籌碼氣象站 (Sponsor)")
     
@@ -665,63 +675,91 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
                 st.write(msg)
 
 def plot_chart():
-    now_date = datetime.now().strftime("%Y-%m-%d")
+    # 強制顯示圖表的邏輯
+    chart_data = pd.DataFrame()
+    base_d = ""
     
-    # 預設建立今天的空圖表 (以防沒資料)
-    start_t = pd.to_datetime(f"{now_date} 09:00:00")
-    end_t = pd.to_datetime(f"{now_date} 13:30:00")
+    if os.path.exists(HIST_FILE):
+        try:
+            df = pd.read_csv(HIST_FILE)
+            if not df.empty:
+                df['Date'] = df['Date'].astype(str)
+                df['Time'] = df['Time'].astype(str)
+                df['Time'] = df['Time'].apply(lambda x: x[:5])
+                
+                # 優先找今日 09:00 後的資料
+                df_valid = df[df['Time'] >= "09:00"].copy()
+                
+                if not df_valid.empty:
+                    df_valid = df_valid.sort_values(['Date', 'Time'])
+                    base_d = df_valid.iloc[-1]['Date']
+                    chart_data = df_valid[df_valid['Date'] == base_d].copy()
+                    chart_data['DT'] = pd.to_datetime(chart_data['Date'] + ' ' + chart_data['Time'], errors='coerce')
+                    chart_data = chart_data.dropna(subset=['DT'])
+                    chart_data['T_S'] = (chart_data['Taiex_Change']*10)+0.5
+        except: pass
+
+    # 如果沒有有效資料 (例如盤前)，建立一個空圖表底稿
+    if chart_data.empty:
+        # 使用今天日期作為標題
+        base_d = datetime.now().strftime("%Y-%m-%d")
+        
+        # 建立一個假的 09:00 - 13:30 時間序列 (只是為了撐開X軸)
+        start = datetime.strptime(f"{base_d} 09:00", "%Y-%m-%d %H:%M")
+        end = datetime.strptime(f"{base_d} 13:30", "%Y-%m-%d %H:%M")
+        # 這裡不需要填入數據，只要定義 Scale 即可
+    else:
+        start = pd.to_datetime(f"{base_d} 09:00:00")
+        end = pd.to_datetime(f"{base_d} 13:30:00")
+
+    # Altair Chart Definition
+    # X軸: 固定 09:00 ~ 13:30
+    x_scale = alt.Scale(domain=[pd.to_datetime(f"{base_d} 09:00:00"), pd.to_datetime(f"{base_d} 13:30:00")])
     
-    # 基本底圖
-    base_chart = alt.Chart(pd.DataFrame({'DT': [start_t, end_t]})).encode(
-        x=alt.X('DT:T', scale=alt.Scale(domain=[start_t, end_t]), axis=alt.Axis(format='%H:%M', title='時間')),
-        y=alt.Y('v:Q', scale=alt.Scale(domain=[0, 1]), axis=alt.Axis(format='%', title='廣度'))
-    ).mark_text(text="尚無資料") # 佔位
-
-    if not os.path.exists(HIST_FILE): 
-        return base_chart.mark_rule(color='transparent') # 回傳空圖
-
-    try:
-        df = pd.read_csv(HIST_FILE)
-        if df.empty: return base_chart.mark_rule(color='transparent')
+    # Y軸: 0 ~ 1 (0% ~ 100%), 每 0.1 一格
+    y_vals = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    y_axis = alt.Axis(format='%', values=y_vals, tickCount=11, title=None) # title=None 移除廣度文字
+    
+    if chart_data.empty:
+        # 空圖表 (只顯示軸)
+        base = alt.Chart(pd.DataFrame({'DT': [start, end]})).mark_point(opacity=0).encode(
+            x=alt.X('DT:T', title=None, axis=alt.Axis(format='%H:%M'), scale=x_scale),
+            y=alt.Y('val:Q', axis=y_axis, scale=alt.Scale(domain=[0, 1]))
+        )
+        # 加上紅綠虛線
+        rule_r = alt.Chart(pd.DataFrame({'y':[BREADTH_THR]})).mark_rule(color='red', strokeDash=[5,5]).encode(y='y')
+        rule_g = alt.Chart(pd.DataFrame({'y':[BREADTH_LOW]})).mark_rule(color='green', strokeDash=[5,5]).encode(y='y')
+        return (base + rule_r + rule_g).properties(height=400, title=f"走勢對照 - {base_d} (等待開盤)")
         
-        df['Date'] = df['Date'].astype(str)
-        df['Time'] = df['Time'].astype(str)
-        df['Time'] = df['Time'].apply(lambda x: x[:5])
+    else:
+        # 有資料的圖表
+        base = alt.Chart(chart_data).encode(
+            x=alt.X('DT:T', title=None, axis=alt.Axis(format='%H:%M'), scale=x_scale)
+        )
         
-        # 取得最新且有資料的日期
-        valid_dates = df[df['Time'] >= "09:00"]['Date'].unique()
-        if len(valid_dates) == 0:
-             # 如果完全沒有任何一天的盤中資料，回傳今天的空圖
-             return base_chart.mark_rule(color='transparent')
-             
-        base_d = valid_dates[-1] # 取最新一天
+        # 廣度: 黃色線 + 黃色點 (#ffc107)
+        l_b = base.mark_line(color='#ffc107').encode(
+            y=alt.Y('Breadth', title=None, scale=alt.Scale(domain=[0,1], nice=False), axis=y_axis)
+        )
+        p_b = base.mark_circle(color='#ffc107', size=20).encode(
+            y='Breadth', 
+            tooltip=['DT', alt.Tooltip('Breadth', format='.1%')]
+        )
         
-        # 重新設定時間軸為該日期
-        start_t = pd.to_datetime(f"{base_d} 09:00:00")
-        end_t = pd.to_datetime(f"{base_d} 13:30:00")
+        # 大盤: 藍色虛線 + 藍色點 (#007bff)
+        l_t = base.mark_line(color='#007bff', strokeDash=[4,4]).encode(
+            y=alt.Y('T_S', scale=alt.Scale(domain=[0,1]))
+        )
+        p_t = base.mark_circle(color='#007bff', size=20).encode(
+            y='T_S', 
+            tooltip=['DT', alt.Tooltip('Taiex_Change', format='.2%')]
+        )
         
-        chart_data = df[df['Date'] == base_d].copy()
-        chart_data['DT'] = pd.to_datetime(chart_data['Date'] + ' ' + chart_data['Time'], errors='coerce')
-        chart_data = chart_data.dropna(subset=['DT'])
-        chart_data['T_S'] = (chart_data['Taiex_Change']*10)+0.5
-        
-        if chart_data.empty: return base_chart.mark_rule(color='transparent')
-        
-        base = alt.Chart(chart_data).encode(x=alt.X('DT:T', title='時間', axis=alt.Axis(format='%H:%M'), scale=alt.Scale(domain=[start_t, end_t])))
-        y_ax = alt.Axis(format='%', values=[i/10 for i in range(11)], tickCount=11, labelOverlap=False)
-        
-        l_b = base.mark_line(color='#007bff').encode(y=alt.Y('Breadth', title=None, scale=alt.Scale(domain=[0,1], nice=False), axis=y_ax))
-        p_b = base.mark_circle(color='#007bff', size=15).encode(y='Breadth', tooltip=['DT', alt.Tooltip('Breadth', format='.1%')])
-        l_t = base.mark_line(color='#ffc107', strokeDash=[4,4]).encode(y=alt.Y('T_S', scale=alt.Scale(domain=[0,1])))
-        p_t = base.mark_circle(color='#ffc107', size=15).encode(y='T_S', tooltip=['DT', alt.Tooltip('Taiex_Change', format='.2%')])
-        
+        # 警戒線
         rule_r = alt.Chart(pd.DataFrame({'y':[BREADTH_THR]})).mark_rule(color='red', strokeDash=[5,5]).encode(y='y')
         rule_g = alt.Chart(pd.DataFrame({'y':[BREADTH_LOW]})).mark_rule(color='green', strokeDash=[5,5]).encode(y='y')
         
-        return (l_b+p_b+l_t+p_t+rule_r+rule_g).properties(height=400, title=f"走勢對照 - {base_d}").resolve_scale(y='shared')
-        
-    except: 
-        return base_chart.mark_rule(color='transparent')
+        return (l_b + p_b + l_t + p_t + rule_r + rule_g).properties(height=400, title=f"走勢對照 - {base_d}").resolve_scale(y='shared')
 
 def fetch_all():
     ft = get_finmind_token()
@@ -767,6 +805,7 @@ def fetch_all():
     is_post_market = (now.time() >= time(14, 0))
     
     if allow_live_fetch:
+        # 1. Shioaji
         if sj_api:
             try:
                 usage = sj_api.usage(); sj_usage_info = str(usage) if usage else "無法取得"
@@ -792,6 +831,7 @@ def fetch_all():
                         api_status_code = 2
             except: pass
         
+        # 2. MIS
         missing_codes = [c for c in all_targets if c not in pmap]
         if missing_codes:
             mis_data, debug_log = get_prices_twse_mis(missing_codes, info_map)
@@ -812,6 +852,7 @@ def fetch_all():
 
     s_dt = (datetime.now()-timedelta(days=40)).strftime("%Y-%m-%d")
     
+    # --- 計算今日廣度 ---
     h_c, v_c = 0, 0
     dtls = []
     
@@ -890,6 +931,7 @@ def fetch_all():
             "備註": note
         })
 
+    # --- 計算昨日廣度 ---
     h_p, v_p = 0, 0
     for c in ranks_prev:
         df = get_hist(ft, c, s_dt)
@@ -1113,6 +1155,19 @@ def run_app():
         st.error(f"Error: {e}")
         st.text(traceback.format_exc())
 
+    if auto:
+        now = datetime.now(timezone(timedelta(hours=8)))
+        is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
+        if is_intra:
+            sec = 120
+            with st.sidebar:
+                t = st.empty()
+                for i in range(sec, 0, -1):
+                    t.info(f"⏳ {i}s")
+                    time_module.sleep(1)
+            st.rerun()
+        else: st.sidebar.warning("⏸ 休市")
+
 if __name__ == "__main__":
     try:
         from streamlit.web import cli as stcli
@@ -1125,7 +1180,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (復刻修正版)...")
+        print("正在啟動 Streamlit 介面 (期貨修復+圖表強制顯示版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
