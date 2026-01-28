@@ -11,9 +11,9 @@ import time as time_module
 import random
 
 # ==========================================
-# 設定區 v9.40.0 (證交所連線強化修復版)
+# 設定區 v9.41.0 (報價診斷版)
 # ==========================================
-APP_VER = "v9.40.0 (證交所連線強化修復版)"
+APP_VER = "v9.41.0 (報價診斷版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -177,22 +177,16 @@ def get_days(token):
 
 @st.cache_data(ttl=86400)
 def get_stock_info_map(token):
-    """
-    建立股票代號 -> 市場別(tse/otc) 的對照表
-    """
-    # 內建一些常見的，防止 API 失敗時全軍覆沒
     base_map = {
         "2330":"twse", "2317":"twse", "2454":"twse", "2303":"twse", "2308":"twse",
         "0050":"twse", "0056":"twse", "00878":"twse", "t00": "twse"
     }
-    
     api = DataLoader()
     if token: api.login_by_token(token)
     try:
         df = api.taiwan_stock_info()
         if df.empty: return base_map
         df['stock_id'] = df['stock_id'].astype(str)
-        # 合併內建清單與 API 清單
         api_map = dict(zip(df['stock_id'], df['type']))
         base_map.update(api_map)
         return base_map
@@ -241,22 +235,21 @@ def get_hist(token, code, start):
     try: return api.taiwan_stock_daily(stock_id=code, start_date=start)
     except: return pd.DataFrame()
 
-# [核心修復] 
+# [核心修復 + 診斷功能] 
 def get_prices_twse_mis(codes, info_map):
     """
-    V3 終極修復版：
-    1. 增加 Headers 偽裝
-    2. 增加 Session 初始化 (取得 Cookie)
-    3. 嚴格區分 TSE/OTC
-    4. 增加除錯 Print
+    回傳兩個值: 
+    1. results: {code: {z: price, y: close, ...}}
+    2. debug_log: {code: "失敗原因"} (用於診斷為什麼是0)
     """
-    if not codes: return {}
+    if not codes: return {}, {}
     
     print(f"DEBUG: 準備從 MIS 抓取 {len(codes)} 檔股票...")
+    
+    results = {}
+    debug_log = {} # 記錄失敗原因
 
-    # Session 初始化
     session = requests.Session()
-    # 使用最新的 User-Agent
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
         "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -268,62 +261,71 @@ def get_prices_twse_mis(codes, info_map):
     }
     session.headers.update(headers)
     
-    # 1. 取得 Cookie (重要步驟，這是大部分抓不到的主因)
+    # 1. 取得 Cookie
     try:
         ts_now = int(time_module.time() * 1000)
-        # 先訪問首頁建立 Session
         session.get(f"https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw&_={ts_now}", timeout=10)
-        time_module.sleep(1) # 給一點時間種 Cookie
+        time_module.sleep(1)
     except Exception as e:
         print(f"DEBUG: Session 初始化失敗 - {e}")
-        return {}
+        # 所有這些股票都標記為連線失敗
+        for c in codes: debug_log[c] = "MIS連線初始化失敗"
+        return {}, debug_log
     
-    # 2. 構建查詢字串
+    # 2. 構建查詢
     req_strs = []
-    chunk_size = 5 # 安全距離
+    chunk_size = 5
     
+    # 建立一個代碼對應表，用來追蹤哪些代碼在這次請求中
+    batch_map = [] 
+
     for i in range(0, len(codes), chunk_size):
         chunk = codes[i:i+chunk_size]
         q_list = []
+        current_batch_codes = []
         for c in chunk:
             c = str(c).strip()
             if not c: continue
             
-            # [重要] 判斷市場別，預設上市
             m_type = info_map.get(c, "twse").lower()
-            
             if "tpex" in m_type or "otc" in m_type:
                 q_list.append(f"otc_{c}.tw")
             else:
                 q_list.append(f"tse_{c}.tw")
+            current_batch_codes.append(c)
                  
         if q_list:
             req_strs.append("|".join(q_list))
+            batch_map.append(current_batch_codes)
     
-    results = {}
     base_url = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
     
-    print(f"DEBUG: 將送出 {len(req_strs)} 個請求...")
-
     for idx, q_str in enumerate(req_strs):
         ts = int(time_module.time() * 1000)
         params = {"json": "1", "delay": "0", "_": ts, "ex_ch": q_str}
-        
+        batch_codes = batch_map[idx] # 這一批送出的股票代碼
+
         try:
-            time_module.sleep(random.uniform(0.5, 1.0)) # 稍微放慢速度避免被 Ban
+            time_module.sleep(random.uniform(0.5, 1.0))
             r = session.get(base_url, params=params, timeout=10)
             
             if r.status_code == 200:
                 try:
                     data = r.json()
                     if 'msgArray' not in data: 
-                        print(f"DEBUG: 請求成功但無 msgArray (可能休市或被擋): {q_str}")
+                        print(f"DEBUG: 請求成功但無 msgArray: {q_str}")
+                        for c in batch_codes: debug_log[c] = "MIS回傳空值(可能被擋)"
                         continue
                     
+                    # 這一批回傳了哪些股票
+                    returned_codes = set()
+
                     for item in data['msgArray']:
                         c = item.get('c', '') 
-                        z = item.get('z', '-') # 最近成交
-                        y = item.get('y', '-') # 昨收
+                        returned_codes.add(c)
+                        
+                        z = item.get('z', '-') 
+                        y = item.get('y', '-') 
                         
                         val = {}
                         if y != '-' and y != '':
@@ -331,12 +333,13 @@ def get_prices_twse_mis(codes, info_map):
                             except: pass
                         
                         price = 0
-                        # 嘗試解析成交價
+                        status_note = ""
+
                         if z != '-' and z != '':
                             try: price = float(z)
                             except: pass
                         
-                        # 如果沒有成交價，試試看最佳買賣價 (針對剛開盤或冷門股)
+                        # 嘗試最佳買賣價
                         if price == 0:
                             try:
                                 b = item.get('b', '-').split('_')[0]
@@ -345,19 +348,34 @@ def get_prices_twse_mis(codes, info_map):
                                     a = item.get('a', '-').split('_')[0]
                                     if a != '-' and a: price = float(a)
                             except: pass
+                            
+                            if price == 0:
+                                status_note = "MIS有資料但無價(未成交)"
                         
-                        if price > 0: val['z'] = price
+                        if price > 0: 
+                            val['z'] = price
+                        elif status_note:
+                            # 即使是0，也要把這個原因記下來，傳出去
+                            debug_log[c] = status_note
                         
                         if c and val: results[c] = val
+                    
+                    # 檢查這一批有沒有漏掉的股票 (明明送出請求，但 msgArray 沒回傳)
+                    for bc in batch_codes:
+                        if bc not in returned_codes:
+                            debug_log[bc] = "MIS查無此股(市場別錯誤?)"
+
                 except: 
                     print(f"DEBUG: JSON 解析錯誤")
+                    for c in batch_codes: debug_log[c] = "MIS回傳JSON錯誤"
             else:
                 print(f"DEBUG: 請求失敗 Status: {r.status_code}")
+                for c in batch_codes: debug_log[c] = f"MIS HTTP錯誤{r.status_code}"
         except Exception as e:
              print(f"DEBUG: 連線例外 - {e}")
+             for c in batch_codes: debug_log[c] = "MIS連線例外中止"
         
-    print(f"DEBUG: 總共取得 {len(results)} 檔即時報價")
-    return results
+    return results, debug_log
 
 def save_rec(d, t, b, tc, t_cur, t_prev, intra, total_v):
     if t_cur == 0: return 
@@ -511,6 +529,8 @@ def fetch_all():
         msg_src = f"名單:{target_date_for_ranks} {'(硬碟)' if from_disk else '(新抓)'}"
 
     pmap = {}
+    mis_debug_map = {} # 用來存 MIS 的錯誤訊息
+    
     data_source = "歷史"
     last_t = "無即時資料"
     api_status_code = 0 
@@ -548,7 +568,9 @@ def fetch_all():
         # 2. MIS (Shioaji 沒抓到的補)
         missing_codes = [c for c in final_codes if c not in pmap]
         if missing_codes:
-            mis_data = get_prices_twse_mis(missing_codes, info_map)
+            mis_data, debug_log = get_prices_twse_mis(missing_codes, info_map)
+            mis_debug_map = debug_log # 儲存錯誤日誌
+
             for c, val in mis_data.items():
                 pmap[c] = val
             
@@ -573,7 +595,6 @@ def fetch_all():
         info = pmap.get(c, {})
         curr_p = info.get('z', info.get('price', 0)) # MIS 用 z, SJ 用 price
         
-        # 如果 MIS 只抓到 z (價格) 沒抓到 y (昨收)，嘗試用 FinMind 昨收補
         real_y = info.get('y', info.get('y_close', 0)) 
         
         if is_post_market and not df.empty:
@@ -612,7 +633,28 @@ def fetch_all():
         
         if curr_p == 0: 
             c_stt = "⚠️無報價"
-            if p_price > 0: note = f"昨收{p_price} "
+            # [診斷核心] 為什麼是0?
+            reason = ""
+            if not allow_live_fetch and not is_post_market:
+                reason = "非盤中時間"
+            elif is_post_market:
+                reason = "盤後資料缺失"
+            else:
+                # 檢查 MIS debug log
+                if c in mis_debug_map:
+                    reason = mis_debug_map[c] # 直接取用錯誤原因 (例如: MIS HTTP錯誤)
+                elif c not in pmap:
+                    # 不在 pmap 也不在 debug log (理論上 get_prices_twse_mis 會填滿 debug_log)
+                    # 只有可能是 SJ 沒抓到 且 MIS 也沒抓到
+                    if sj_api and c in sj_api.Contracts.Stocks:
+                        reason = "SJ+MIS皆失敗"
+                    else:
+                        reason = "MIS未回傳(連線/代號問題)"
+            
+            if reason:
+                note = f"⚠️{reason} | 昨收{p_price}"
+            else:
+                note = f"昨收{p_price}"
 
         if curr_p > 0 and p_price > 0 and not df.empty:
             hist_closes = df['close'].tail(4).tolist()
@@ -639,8 +681,7 @@ def fetch_all():
     try:
         tw = get_hist(ft, "TAIEX", s_dt)
         if not tw.empty:
-            # 大盤 t00 一定是 twse
-            mis_tw = get_prices_twse_mis(["t00"], {"t00":"twse"}) 
+            mis_tw, _ = get_prices_twse_mis(["t00"], {"t00":"twse"}) 
             t_curr = mis_tw.get("t00", {}).get("z", 0)
             t_y = mis_tw.get("t00", {}).get("y", 0)
 
@@ -848,12 +889,11 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (強化連線版)...")
+        print("正在啟動 Streamlit 介面 (報價診斷版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
             print(f"啟動失敗: {e}")
             print("請確認已安裝 streamlit (pip install streamlit)")
         
-        # 確保無論如何都暫停
         input("\n程式執行結束 (或發生錯誤)，請按 Enter 鍵離開...")
