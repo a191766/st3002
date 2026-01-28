@@ -18,15 +18,15 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.50.0 (興櫃修復版)
+# 設定區 v9.50.0 (市場別自動容錯版)
 # ==========================================
-APP_VER = "v9.50.0 (興櫃修復版)"
+APP_VER = "v9.50.0 (市場別自動容錯版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
 RAPID_THR = 0.03 
 OPEN_DEV_THR = 0.05 
-OPEN_COUNT_THR = 290  
+OPEN_COUNT_THR = 290 
 
 EXCL_PFX = ["00", "91"]
 HIST_FILE = "breadth_history_v3.csv"
@@ -242,189 +242,183 @@ def get_hist(token, code, start):
     try: return api.taiwan_stock_daily(stock_id=code, start_date=start)
     except: return pd.DataFrame()
 
-# [核心功能修正: 分流查詢 MIS 興櫃與上市櫃]
+def _fetch_mis_batch(session, codes, info_map, force_prefix=None):
+    """
+    內部函式：負責執行一次批次查詢
+    """
+    req_strs = []
+    chunk_size = 5
+    batch_map = [] 
+    
+    results = {}
+    debug_log = {}
+
+    for i in range(0, len(codes), chunk_size):
+        chunk = codes[i:i+chunk_size]
+        q_list = []
+        current_batch_codes = []
+        for c in chunk:
+            c = str(c).strip()
+            if not c: continue
+            
+            # 決定前綴
+            if force_prefix:
+                # 強制模式 (Retry 用)
+                q_list.append(f"{force_prefix}_{c}.tw")
+            else:
+                # 正常模式 (查表)
+                m_type = info_map.get(c, "twse").lower()
+                if "emerging" in m_type:
+                    q_list.append(f"emg_{c}.tw")
+                elif "tpex" in m_type or "otc" in m_type:
+                    q_list.append(f"otc_{c}.tw")
+                else:
+                    q_list.append(f"tse_{c}.tw")
+                    
+            current_batch_codes.append(c)
+                 
+        if q_list:
+            req_strs.append("|".join(q_list))
+            batch_map.append(current_batch_codes)
+    
+    base_url = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+    
+    for idx, q_str in enumerate(req_strs):
+        ts = int(time_module.time() * 1000)
+        params = {"json": "1", "delay": "0", "_": ts, "ex_ch": q_str}
+        batch_codes = batch_map[idx] 
+
+        try:
+            time_module.sleep(random.uniform(0.3, 0.8)) # 稍微加快一點
+            r = session.get(base_url, params=params, timeout=10)
+            
+            if r.status_code == 200:
+                try:
+                    data = r.json()
+                    if 'msgArray' not in data: 
+                        for c in batch_codes: debug_log[c] = "MIS回傳空值"
+                        continue
+                    
+                    for item in data['msgArray']:
+                        c = item.get('c', '') 
+                        z = item.get('z', '-') 
+                        pz = item.get('pz', '-') 
+                        y = item.get('y', '-') 
+                        
+                        val = {}
+                        if y != '-' and y != '':
+                            try: val['y'] = float(y)
+                            except: pass
+                        
+                        price = 0
+                        source_note = ""
+
+                        # 1. 成交價
+                        if z != '-' and z != '':
+                            try: 
+                                price = float(z)
+                                source_note = "來源:成交"
+                            except: pass
+                        
+                        # 2. 試撮價
+                        if price == 0 and pz != '-' and pz != '':
+                            try:
+                                price = float(pz)
+                                source_note = "來源:試撮"
+                            except: pass
+
+                        # 3. 買賣價
+                        if price == 0:
+                            try:
+                                b = item.get('b', '-').split('_')[0]
+                                if b != '-' and b: 
+                                    price = float(b)
+                                    source_note = "來源:委買"
+                                else:
+                                    a = item.get('a', '-').split('_')[0]
+                                    if a != '-' and a: 
+                                        price = float(a)
+                                        source_note = "來源:委賣"
+                            except: pass
+                            
+                            if price == 0:
+                                source_note = "無成交/無掛單"
+                        
+                        if price > 0: 
+                            val['z'] = price
+                            val['note'] = source_note
+                        elif source_note:
+                            debug_log[c] = source_note
+                        
+                        if c and val: results[c] = val
+
+                except: 
+                    for c in batch_codes: debug_log[c] = "JSON錯誤"
+            else:
+                for c in batch_codes: debug_log[c] = f"HTTP {r.status_code}"
+        except Exception as e:
+             for c in batch_codes: debug_log[c] = "連線中斷"
+             
+    return results, debug_log
+
+# [核心修復: 自動容錯查詢]
 def get_prices_twse_mis(codes, info_map):
     if not codes: return {}, {}
     
-    # 1. 拆分名單：興櫃去櫃買中心 (TPEx)，其他去證交所 (TWSE)
-    codes_twse = []
-    codes_tpex = [] # 興櫃專用
+    print(f"DEBUG: 準備從 MIS 抓取 {len(codes)} 檔股票...")
     
+    session = cffi_requests.Session(impersonate="chrome")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Referer": "https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw",
+        "Host": "mis.twse.com.tw",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    session.headers.update(headers)
+    
+    # Init Cookie
+    try:
+        ts_now = int(time_module.time() * 1000)
+        session.get(f"https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw&_={ts_now}", timeout=10)
+        time_module.sleep(1)
+    except:
+        # 如果初始化失敗，直接回傳失敗，讓外層去處理
+        fail_log = {c: "初始化失敗" for c in codes}
+        return {}, fail_log
+
+    # === Round 1: 正常查詢 (依照 info_map) ===
+    results, logs = _fetch_mis_batch(session, codes, info_map)
+    
+    # 找出失敗的股票 (不在 results 裡面的)
+    missing_codes = [c for c in codes if c not in results]
+    
+    if missing_codes:
+        print(f"DEBUG: 有 {len(missing_codes)} 檔股票第一輪失敗，開始暴力盲測...")
+        
+        # === Round 2: 暴力嘗試 emg_ (針對興櫃) ===
+        # 很多時候是興櫃被誤判，先救這些
+        retry_emg, _ = _fetch_mis_batch(session, missing_codes, info_map, force_prefix="emg")
+        for c, val in retry_emg.items():
+            val['note'] = val.get('note', '') + "(盲測修正)"
+            results[c] = val
+            
+        # 更新還沒抓到的
+        still_missing = [c for c in codes if c not in results]
+        
+        if still_missing:
+             # === Round 3: 暴力嘗試 otc_ (有些興櫃其實在 otc) ===
+             retry_otc, _ = _fetch_mis_batch(session, still_missing, info_map, force_prefix="otc")
+             for c, val in retry_otc.items():
+                val['note'] = val.get('note', '') + "(盲測修正)"
+                results[c] = val
+    
+    # 合併錯誤訊息 (以最後一輪的狀態為主，如果還是沒抓到)
+    final_logs = logs
     for c in codes:
-        m_type = info_map.get(c, "twse").lower()
-        if "emerging" in m_type:
-            codes_tpex.append(c)
-        else:
-            codes_twse.append(c) # 上市櫃 (含 OTC) 都可以在證交所 MIS 查到，或若 OTC 失敗會由下方機制處理
-
-    results_all = {}
-    debug_log_all = {}
-    
-    # 定義通用的抓取函式 (內部使用)
-    def _fetch_from_mis_source(target_codes, base_url, referer_url, label):
-        if not target_codes: return {}, {}
-        
-        print(f"DEBUG: [{label}] 準備抓取 {len(target_codes)} 檔 (curl_cffi)...")
-        res = {}
-        dbg = {}
-        
-        session = cffi_requests.Session(impersonate="chrome")
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Referer": referer_url,
-            "Host": base_url.replace("https://", "").replace("http://", ""),
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        session.headers.update(headers)
-        
-        # A. 取得 Cookie
-        cookie_ok = False
-        last_err = ""
-        try:
-            ts_now = int(time_module.time() * 1000)
-            time_module.sleep(random.uniform(0.5, 1.5))
-            # 訪問 fibest.jsp 拿 cookie
-            session.get(f"{referer_url}&_={ts_now}", timeout=10)
-            cookie_ok = True
-        except Exception as e:
-            last_err = str(e)
+        if c not in results:
+            final_logs[c] = "查無此股(嘗試所有市場別皆失敗)"
             
-        if not cookie_ok:
-            for c in target_codes: dbg[c] = f"{label}連線失敗"
-            return res, dbg
-
-        # B. 批次查詢
-        chunk_size = 5
-        req_strs = []
-        batch_map = []
-        
-        for i in range(0, len(target_codes), chunk_size):
-            chunk = target_codes[i:i+chunk_size]
-            q_list = []
-            curr_batch = []
-            for c in chunk:
-                c = str(c).strip()
-                if not c: continue
-                
-                # 構建查詢字串
-                # 興櫃 (TPEx MIS) 通常用 emg_
-                # 上市櫃 (TWSE MIS) 用 tse_ 或 otc_
-                # 這裡保留「霰彈槍策略」，確保命中
-                m_type = info_map.get(c, "").lower()
-                
-                if label == "TPEx_EMG": # 針對興櫃
-                    q_list.append(f"emg_{c}.tw")
-                    q_list.append(f"otc_{c}.tw") # 以防萬一
-                else: # 針對一般 (TWSE/OTC)
-                    if "tpex" in m_type or "otc" in m_type:
-                        q_list.append(f"otc_{c}.tw")
-                        q_list.append(f"tse_{c}.tw") # 以防誤判
-                    else:
-                        q_list.append(f"tse_{c}.tw")
-                        q_list.append(f"otc_{c}.tw") # 以防誤判
-                
-                curr_batch.append(c)
-            
-            if q_list:
-                req_strs.append("|".join(q_list))
-                batch_map.append(curr_batch)
-        
-        api_url = f"{base_url}/stock/api/getStockInfo.jsp"
-        
-        for idx, q_str in enumerate(req_strs):
-            ts = int(time_module.time() * 1000)
-            params = {"json": "1", "delay": "0", "_": ts, "ex_ch": q_str}
-            batch_codes = batch_map[idx]
-            
-            try:
-                time_module.sleep(random.uniform(0.3, 0.8))
-                r = session.get(api_url, params=params, timeout=10)
-                
-                if r.status_code == 200:
-                    try:
-                        data = r.json()
-                        if 'msgArray' not in data:
-                            for c in batch_codes: dbg[c] = "MIS回傳空值"
-                            continue
-                        
-                        returned_codes = set()
-                        for item in data['msgArray']:
-                            c = item.get('c', '')
-                            returned_codes.add(c)
-                            
-                            z = item.get('z', '-') # 成交
-                            pz = item.get('pz', '-') # 試撮
-                            y = item.get('y', '-') # 昨收
-                            
-                            val = {}
-                            if y != '-' and y != '':
-                                try: val['y'] = float(y)
-                                except: pass
-                            
-                            price = 0
-                            source_note = ""
-                            
-                            if z != '-' and z != '':
-                                try: price = float(z); source_note = "來源:成交"
-                                except: pass
-                            
-                            if price == 0 and pz != '-' and pz != '':
-                                try: price = float(pz); source_note = "來源:試撮"
-                                except: pass
-                            
-                            if price == 0:
-                                try:
-                                    b = item.get('b', '-').split('_')[0]
-                                    if b != '-' and b: price = float(b); source_note = "來源:委買"
-                                    else:
-                                        a = item.get('a', '-').split('_')[0]
-                                        if a != '-' and a: price = float(a); source_note = "來源:委賣"
-                                except: pass
-                            
-                            if price > 0:
-                                val['z'] = price
-                                val['note'] = source_note
-                            
-                            if c and val: res[c] = val
-                        
-                        # 檢查遺漏
-                        for bc in batch_codes:
-                            if bc not in returned_codes and bc not in res:
-                                dbg[bc] = f"{label}查無此股"
-                    except:
-                        for c in batch_codes: dbg[c] = "MIS JSON錯誤"
-                else:
-                    for c in batch_codes: dbg[c] = f"HTTP {r.status_code}"
-            except:
-                for c in batch_codes: dbg[c] = "連線中斷"
-        
-        return res, dbg
-
-    # 2. 執行兩路抓取
-    # 來源 A: 證交所 (上市/上櫃)
-    r1, d1 = _fetch_from_mis_source(
-        codes_twse, 
-        "https://mis.twse.com.tw", 
-        "https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw", 
-        "TWSE"
-    )
-    
-    # 來源 B: 櫃買中心 (興櫃)
-    r2, d2 = _fetch_from_mis_source(
-        codes_tpex, 
-        "https://mis.tpex.org.tw", 
-        "https://mis.tpex.org.tw/stock/fibest.jsp?lang=zh_tw", 
-        "TPEx_EMG"
-    )
-    
-    results_all.update(r1)
-    results_all.update(r2)
-    debug_log_all.update(d1)
-    debug_log_all.update(d2)
-    
-    return results_all, debug_log_all
+    return results, final_logs
 
 def save_rec(d, t, b, tc, t_cur, t_prev, intra, total_v):
     if t_cur == 0: return 
@@ -624,7 +618,7 @@ def fetch_all():
                 pmap[c] = val
             
             if len(mis_data) > 0 and data_source == "歷史":
-                data_source = "證交所/櫃買MIS"
+                data_source = "證交所MIS"
                 last_t = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
                 api_status_code = 2
 
@@ -885,7 +879,7 @@ def run_app():
                 else:
                     n_state['notified_rise_low'] = False
             
-            save_notify_state(n_state)
+                save_notify_state(n_state)
             
             display_strategy_panel(data['slope'], open_br, br, n_state)
 
@@ -940,7 +934,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (興櫃修復版)...")
+        print("正在啟動 Streamlit 介面 (市場別自動容錯版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
