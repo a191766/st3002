@@ -18,15 +18,15 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.48.0 (興櫃雙重查詢終極版)
+# 設定區 v9.49.0 (廣度門檻調整版)
 # ==========================================
-APP_VER = "v9.48.0 (興櫃雙重查詢終極版)"
+APP_VER = "v9.49.0 (廣度門檻調整版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
 RAPID_THR = 0.03 
 OPEN_DEV_THR = 0.05 
-OPEN_COUNT_THR = 295 
+OPEN_COUNT_THR = 290  # [修改] 門檻從 295 降為 290
 
 EXCL_PFX = ["00", "91"]
 HIST_FILE = "breadth_history_v3.csv"
@@ -921,7 +921,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (興櫃雙重查詢終極版)...")
+        print("正在啟動 Streamlit 介面 (廣度門檻調整版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
