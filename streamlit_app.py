@@ -18,9 +18,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.47.0 (漲跌停/試撮價強力補全)
+# 設定區 v9.48.0 (興櫃雙重查詢終極版)
 # ==========================================
-APP_VER = "v9.47.0 (漲跌停/試撮價強力補全)"
+APP_VER = "v9.48.0 (興櫃雙重查詢終極版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -242,7 +242,7 @@ def get_hist(token, code, start):
     try: return api.taiwan_stock_daily(stock_id=code, start_date=start)
     except: return pd.DataFrame()
 
-# [核心功能: 查詢 MIS - 增加 pz 試撮價檢查] 
+# [核心功能: MIS 興櫃雙重查詢 + 價格補全] 
 def get_prices_twse_mis(codes, info_map):
     if not codes: return {}, {}
     
@@ -284,7 +284,7 @@ def get_prices_twse_mis(codes, info_map):
         for c in codes: debug_log[c] = fail_reason
         return {}, debug_log
     
-    # 2. 構建查詢
+    # 2. 構建查詢 - [修正] 興櫃雙重查詢
     req_strs = []
     chunk_size = 5
     batch_map = [] 
@@ -299,8 +299,11 @@ def get_prices_twse_mis(codes, info_map):
             
             m_type = info_map.get(c, "twse").lower()
             
+            # [修正: 霰彈槍策略]
+            # 興櫃股票有時候在 otc_ 有時候在 emg_，直接兩個都問，確保抓到
             if "emerging" in m_type:
                 q_list.append(f"emg_{c}.tw")
+                q_list.append(f"otc_{c}.tw")
             elif "tpex" in m_type or "otc" in m_type:
                 q_list.append(f"otc_{c}.tw")
             else:
@@ -336,7 +339,7 @@ def get_prices_twse_mis(codes, info_map):
                         returned_codes.add(c)
                         
                         z = item.get('z', '-') # 最近成交
-                        pz = item.get('pz', '-') # [關鍵] 試算/模擬成交價 (漲跌停或緩撮時用)
+                        pz = item.get('pz', '-') # 試算/模擬
                         y = item.get('y', '-') # 昨收
                         
                         val = {}
@@ -347,8 +350,7 @@ def get_prices_twse_mis(codes, info_map):
                         price = 0
                         source_note = ""
 
-                        # [修復邏輯: 優先順序調整]
-                        
+                        # [價格邏輯]
                         # 1. 嘗試成交價 (z)
                         if z != '-' and z != '':
                             try: 
@@ -356,15 +358,14 @@ def get_prices_twse_mis(codes, info_map):
                                 source_note = "來源:成交"
                             except: pass
                         
-                        # 2. 如果沒有 z，嘗試 pz (試撮價/漲跌停鎖死價)
-                        # 這就是漲停股會用到的欄位
+                        # 2. 嘗試 pz (試撮價/漲跌停)
                         if price == 0 and pz != '-' and pz != '':
                             try:
                                 price = float(pz)
                                 source_note = "來源:試撮(漲跌停?)"
                             except: pass
 
-                        # 3. 如果連試撮都沒有，嘗試最佳買賣價 (b/a)
+                        # 3. 嘗試最佳買賣價 (b/a)
                         if price == 0:
                             try:
                                 b = item.get('b', '-').split('_')[0]
@@ -387,11 +388,15 @@ def get_prices_twse_mis(codes, info_map):
                         elif source_note:
                             debug_log[c] = source_note
                         
+                        # 只要有資料就更新
                         if c and val: results[c] = val
                     
                     for bc in batch_codes:
                         if bc not in returned_codes:
-                            debug_log[bc] = "MIS查無此股(市場別錯誤?)"
+                            # 只有當 results 裡也沒有這個代號時才報錯
+                            # (因為雙重查詢會有一個失敗是正常的)
+                            if bc not in results:
+                                debug_log[bc] = "MIS查無此股(代號/市場別?)"
 
                 except: 
                     for c in batch_codes: debug_log[c] = "MIS回傳JSON錯誤"
@@ -916,7 +921,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (漲跌停/試撮價強力補全)...")
+        print("正在啟動 Streamlit 介面 (興櫃雙重查詢終極版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
