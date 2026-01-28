@@ -11,9 +11,9 @@ import time as time_module
 import random
 
 # ==========================================
-# 設定區 v9.37.0 (證交所連線修復版)
+# 設定區 v9.37.1 (Key值與連線修復版)
 # ==========================================
-APP_VER = "v9.37.0 (證交所連線修復版)"
+APP_VER = "v9.37.1 (Key值與連線修復版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -55,27 +55,20 @@ def load_notify_state(today_str):
         "notified_rise_low": False,
         "intraday_trend": None  
     }
-    
-    if not os.path.exists(NOTIFY_FILE):
-        return default_state
-    
+    if not os.path.exists(NOTIFY_FILE): return default_state
     try:
         with open(NOTIFY_FILE, 'r') as f:
             state = json.load(f)
-            if state.get("date") != today_str:
-                return default_state
-            if "intraday_trend" not in state:
-                state["intraday_trend"] = None
+            if state.get("date") != today_str: return default_state
+            if "intraday_trend" not in state: state["intraday_trend"] = None
             return state
-    except:
-        return default_state
+    except: return default_state
 
 def save_notify_state(state):
     try:
         with open(NOTIFY_FILE, 'w') as f:
             json.dump(state, f)
-    except:
-        pass
+    except: pass
 
 def check_rapid(row):
     if not os.path.exists(HIST_FILE): return None, None
@@ -85,19 +78,15 @@ def check_rapid(row):
         curr_dt = datetime.strptime(f"{row['Date']} {row['Time']}", "%Y-%m-%d %H:%M")
         curr_v = float(row['Breadth'])
         target = None
-        
         for i in range(2, min(15, len(df)+1)):
             r = df.iloc[-i]
             try: 
                 r_t = r['Time'] if len(str(r['Time']))==5 else r['Time'][:5]
             except: continue
-            
             r_dt = datetime.strptime(f"{r['Date']} {r_t}", "%Y-%m-%d %H:%M")
             seconds_diff = (curr_dt - r_dt).total_seconds()
-            
             if 230 <= seconds_diff <= 250:
                 target = r; break
-                
         if target is not None:
             prev_v = float(target['Breadth'])
             diff = curr_v - prev_v
@@ -114,16 +103,12 @@ def get_opening_breadth(d_cur):
         df = pd.read_csv(HIST_FILE)
         if df.empty: return None
         if 'Total' not in df.columns: df['Total'] = 0
-        
         df['Date'] = df['Date'].astype(str)
         df_today = df[df['Date'] == str(d_cur)].copy()
         if df_today.empty: return None
-        
         df_today = df_today[df_today['Time'] >= "09:00"]
         df_valid = df_today[df_today['Total'] >= OPEN_COUNT_THR].sort_values('Time')
-        
-        if not df_valid.empty:
-            return float(df_valid.iloc[0]['Breadth'])
+        if not df_valid.empty: return float(df_valid.iloc[0]['Breadth'])
     except: pass
     return None
 
@@ -167,12 +152,10 @@ def get_days(token):
         df = api.taiwan_stock_daily(stock_id="0050", start_date=(datetime.now()-timedelta(days=20)).strftime("%Y-%m-%d"))
         if not df.empty: dates = sorted(df['date'].unique().tolist())
     except: pass
-    
     now = datetime.now(timezone(timedelta(hours=8)))
     today_str = now.strftime("%Y-%m-%d")
     if 0 <= now.weekday() <= 4 and now.time() >= time(8,0):
-        if not dates or today_str > dates[-1]:
-            dates.append(today_str)
+        if not dates or today_str > dates[-1]: dates.append(today_str)
     return dates
 
 @st.cache_data(ttl=86400)
@@ -194,32 +177,25 @@ def get_ranks_strict(token, target_date_str):
                 if data.get("date") == target_date_str and data.get("ranks"):
                     return data["ranks"], True
         except: pass
-
     api = DataLoader()
     if token: api.login_by_token(token)
     df = pd.DataFrame()
     try: df = api.taiwan_stock_daily(stock_id="", start_date=target_date_str)
     except: pass
-    
     if df.empty: return [], False
-
     df['ID'] = get_col(df, ['stock_id','code'])
     df['Money'] = get_col(df, ['Trading_money','turnover'])
     if df['ID'] is None or df['Money'] is None: return [], False
-    
     df['ID'] = df['ID'].astype(str)
     df = df[df['ID'].str.len()==4]
     df = df[df['ID'].str.isdigit()]
     for p in EXCL_PFX: df = df[~df['ID'].str.startswith(p)]
-    
     ranks = df.sort_values('Money', ascending=False).head(TOP_N)['ID'].tolist()
-    
     if ranks:
         try:
             with open(RANK_FILE, 'w') as f:
                 json.dump({"date": target_date_str, "ranks": ranks}, f)
         except: pass
-        
     return ranks, False
 
 @st.cache_data(ttl=43200)
@@ -229,139 +205,74 @@ def get_hist(token, code, start):
     try: return api.taiwan_stock_daily(stock_id=code, start_date=start)
     except: return pd.DataFrame()
 
-# [核心升級] 真正的瀏覽器偽裝與 Session 管理
 def get_prices_twse_mis(codes, info_map):
     """
-    強化版：針對證交所擋爬蟲機制進行優化
-    修復重點：縮小 Chunk Size 以避免 URL 過長被擋
+    強化版：統一 Key 值為 price 與 y_close
     """
     if not codes: return {}
-    
-    # 建立或重用 Session
     if 'mis_session' not in st.session_state:
         session = requests.Session()
-        # 設置跟真實瀏覽器完全一樣的 Headers (更新至 2025 標準)
         session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
             "Accept": "application/json, text/javascript, */*; q=0.01",
-            "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
             "Referer": "https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw",
-            "X-Requested-With": "XMLHttpRequest",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin"
+            "X-Requested-With": "XMLHttpRequest"
         })
-        
-        # 訪問首頁取得 Cookie (關鍵步驟)
         try:
-            print("正在初始化證交所連線 (取得 Cookie)...")
-            r_home = session.get("https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw", timeout=10)
-            if r_home.status_code != 200:
-                print(f"Warning: 無法訪問首頁，Status Code: {r_home.status_code}")
-        except Exception as e:
-            print(f"Session 初始化失敗: {e}")
-        
+            session.get("https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw", timeout=10)
+        except: pass
         st.session_state['mis_session'] = session
     
     session = st.session_state['mis_session']
-    
-    # 準備查詢字串
-    req_strs = []
-    # [重要修改] 將批次數量從 25 降至 5，因為 URL 過長是回傳空值的主因
-    chunk_size = 5 
+    results = {}
+    chunk_size = 20 # 稍微放大以提高效率，但若失敗可改回 5
     
     for i in range(0, len(codes), chunk_size):
         chunk = codes[i:i+chunk_size]
         q_list = []
         for c in chunk:
-            m_type = info_map.get(c, "")
-            # 如果知道市場別，精準查詢
-            if m_type == "tpex":
-                q_list.append(f"otc_{c}.tw")
-            elif m_type == "twse":
-                q_list.append(f"tse_{c}.tw")
+            if c == "t00": q_list.append("tse_t00.tw")
             else:
-                # [容錯] 如果不知道市場別，乾脆兩個都查
-                q_list.append(f"tse_{c}.tw")
-                q_list.append(f"otc_{c}.tw")
-                
-        req_strs.append("|".join(q_list))
-    
-    results = {}
-    ts = int(time_module.time() * 1000)
-    # 加上隨機參數避免快取
-    base_url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=0&_={ts}&ex_ch="
-    
-    print(f"開始抓取 {len(codes)} 檔股票報價 (Batch Size: {chunk_size})...")
-    
-    for idx, q_str in enumerate(req_strs):
+                m_type = info_map.get(c, "")
+                if m_type == "tpex": q_list.append(f"otc_{c}.tw")
+                elif m_type == "twse": q_list.append(f"tse_{c}.tw")
+                else:
+                    q_list.append(f"tse_{c}.tw")
+                    q_list.append(f"otc_{c}.tw")
+        
+        q_str = "|".join(q_list)
+        ts = int(time_module.time() * 1000)
+        url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=0&_={ts}&ex_ch={q_str}"
+        
         try:
-            url = base_url + q_str
-            # 隨機延遲，模擬人類行為
-            time_module.sleep(random.uniform(0.3, 0.8))
+            time_module.sleep(random.uniform(0.2, 0.5))
             r = session.get(url, timeout=10)
-            
             if r.status_code == 200:
-                try:
-                    data = r.json()
-                    if 'msgArray' not in data:
-                        # 偶爾會發生有回應但沒 msgArray 的情況
-                        print(f"Batch {idx}: 回應中沒有 msgArray")
-                        continue
-                    
-                    if not data['msgArray']:
-                         print(f"Batch {idx}: msgArray 為空 (可能是代號錯誤或無成交)")
-
+                data = r.json()
+                if 'msgArray' in data:
                     for item in data['msgArray']:
+                        c = item.get('c', '')
+                        z = item.get('z', '-') # 當前成交價
+                        y = item.get('y', '-') # 昨收
+                        
+                        val = {}
                         try:
-                            c = item.get('c', '') 
-                            z = item.get('z', '-') 
-                            y = item.get('y', '-') 
-                            
-                            val = {}
-                            if y != '-' and y != '': 
-                                try: val['y'] = float(y)
-                                except: pass
+                            if y != '-' and y != '': val['y_close'] = float(y)
                             
                             price = 0
-                            # 優先抓最近成交價 (z)
-                            if z != '-' and z != '': 
-                                try: price = float(z)
-                                except: pass
-                            
-                            # 如果 z 抓不到或為 0，改抓最佳買價 (b)
+                            if z != '-' and z != '': price = float(z)
                             if price == 0:
                                 b_str = item.get('b', '-')
-                                if b_str != '-' and b_str != '':
-                                    try: price = float(b_str.split('_')[0])
-                                    except: pass
+                                if b_str != '-' and b_str != '': price = float(b_str.split('_')[0])
                             
-                            # 如果 b 也抓不到，改抓最佳賣價 (a)
-                            if price == 0:
-                                a_str = item.get('a', '-')
-                                if a_str != '-' and a_str != '':
-                                    try: price = float(a_str.split('_')[0])
-                                    except: pass
-                            
-                            # 只要有價格或有昨收，就存入
-                            if price > 0: val['z'] = price
-                            
-                            if c and val: results[c] = val
-                        except:
-                            continue
-                except json.JSONDecodeError:
-                    print(f"JSON 解析失敗: {r.text[:50]}...")
-            else:
-                print(f"請求失敗: Status {r.status_code}")
-                # 如果 403 Forbidden，通常代表 Session 失效，清除它
-                if r.status_code in [403, 401]:
-                    if 'mis_session' in st.session_state:
-                        del st.session_state['mis_session']
-        except Exception as e: 
-            print(f"連線例外: {e}")
-            pass
+                            if price > 0: 
+                                val['price'] = price
+                                results[c] = val
+                        except: continue
+            elif r.status_code in [403, 401]:
+                del st.session_state['mis_session']
+                break
+        except: pass
             
     return results
 
@@ -394,466 +305,164 @@ def save_rec(d, t, b, tc, t_cur, t_prev, intra, total_v):
 def display_strategy_panel(slope, open_br, br, n_state):
     st.subheader("♟️ 戰略指揮所")
     strategies = []
-    
-    if slope > 0:
-        strategies.append({"sig": "MA5斜率為正 ➜ 大盤偏多", "act": "只做多單，放棄空單", "type": "success"})
-    elif slope < 0:
-        strategies.append({"sig": "MA5斜率為負 ➜ 大盤偏空", "act": "只做空單，放棄多單", "type": "error"})
-    else:
-        strategies.append({"sig": "MA5斜率持平", "act": "", "type": "info"})
+    if slope > 0: strategies.append({"sig": "MA5斜率為正 ➜ 大盤偏多", "act": "只做多單", "type": "success"})
+    elif slope < 0: strategies.append({"sig": "MA5斜率為負 ➜ 大盤偏空", "act": "只做空單", "type": "error"})
+    else: strategies.append({"sig": "MA5斜率持平", "act": "", "type": "info"})
         
     trend_status = n_state.get('intraday_trend')
-    if trend_status == 'up':
-        strategies.append({"sig": "🔒 已觸發【開盤+5%】", "act": "今日偏多確認，留意回檔", "type": "success"})
-    elif trend_status == 'down':
-        strategies.append({"sig": "🔒 已觸發【開盤-5%】", "act": "今日偏空確認，留意反彈", "type": "error"})
-    else:
-        strategies.append({"sig": "⏳ 盤整中 (未達 +/- 5%)", "act": "觀望，等待趨勢表態", "type": "info"})
+    if trend_status == 'up': strategies.append({"sig": "🔒 已觸發【開盤+5%】", "act": "今日偏多確認", "type": "success"})
+    elif trend_status == 'down': strategies.append({"sig": "🔒 已觸發【開盤-5%】", "act": "今日偏空確認", "type": "error"})
 
-    if slope > 0:
-        if trend_status == 'up':
-            if n_state['notified_drop_high']:
-                strategies.append({
-                    "sig": "今日偏多 + 賣壓短暫回檔 (高點落 5%)",
-                    "act": "🎯 進場多單 (確認止穩後)",
-                    "type": "success"
-                })
-        elif trend_status == 'down':
-             if n_state['notified_rise_low']:
-                strategies.append({
-                    "sig": "今日偏空(逆勢) + 買方短暫支撐",
-                    "act": "⚠️ 多單出場 / 收盤再進場多單",
-                    "type": "warning"
-                })
-
-    elif slope < 0:
-        if trend_status == 'down':
-            if n_state['notified_rise_low']:
-                strategies.append({
-                    "sig": "今日偏空 + 買方短暫反彈 (低點彈 5%)",
-                    "act": "🎯 進場空單 (確認止漲後)",
-                    "type": "error"
-                })
-        elif trend_status == 'up':
-            if n_state['notified_drop_high']:
-                strategies.append({
-                    "sig": "今日偏多(逆勢) + 賣方短暫壓制",
-                    "act": "⚠️ 空單出場 / 收盤再進場空單",
-                    "type": "warning"
-                })
+    if slope > 0 and trend_status == 'up' and n_state['notified_drop_high']:
+        strategies.append({"sig": "多頭回檔 (高點落 5%)", "act": "🎯 尋找進場多點", "type": "success"})
+    elif slope < 0 and trend_status == 'down' and n_state['notified_rise_low']:
+        strategies.append({"sig": "空頭反彈 (低點彈 5%)", "act": "🎯 尋找放空點位", "type": "error"})
 
     cols = st.columns(len(strategies))
     for i, s in enumerate(strategies):
         with cols[i]:
-            title = s["sig"]
-            body = s["act"]
-            if s["type"] == "success": st.success(f"**{title}**\n\n{body}")
-            elif s["type"] == "error": st.error(f"**{title}**\n\n{body}")
-            elif s["type"] == "warning": st.warning(f"**{title}**\n\n{body}")
-            else: st.info(f"**{title}**\n\n{body}")
+            if s["type"] == "success": st.success(f"**{s['sig']}**\n\n{s['act']}")
+            elif s["type"] == "error": st.error(f"**{s['sig']}**\n\n{s['act']}")
+            else: st.info(f"**{s['sig']}**\n\n{s['act']}")
 
 def plot_chart():
     if not os.path.exists(HIST_FILE): return None
     try:
         df = pd.read_csv(HIST_FILE)
         if df.empty: return None
-        df['Date'] = df['Date'].astype(str)
-        df['Time'] = df['Time'].astype(str)
-        df['Time'] = df['Time'].apply(lambda x: x[:5])
+        df['Date'] = df['Date'].astype(str); df['Time'] = df['Time'].astype(str).apply(lambda x: x[:5])
         df['DT'] = pd.to_datetime(df['Date'] + ' ' + df['Time'], errors='coerce')
         df = df.dropna(subset=['DT'])
         df['T_S'] = (df['Taiex_Change']*10)+0.5
         base_d = df.iloc[-1]['Date']
         chart_data = df[df['Date'] == base_d].copy()
         if chart_data.empty: return None
-        
-        start_t = pd.to_datetime(f"{base_d} 09:00:00")
-        end_t = pd.to_datetime(f"{base_d} 13:30:00")
-        
-        base = alt.Chart(chart_data).encode(x=alt.X('DT:T', title='時間', axis=alt.Axis(format='%H:%M'), scale=alt.Scale(domain=[start_t, end_t])))
-        y_ax = alt.Axis(format='%', values=[i/10 for i in range(11)], tickCount=11, labelOverlap=False)
-        l_b = base.mark_line(color='#007bff').encode(y=alt.Y('Breadth', title=None, scale=alt.Scale(domain=[0,1], nice=False), axis=y_ax))
-        p_b = base.mark_circle(color='#007bff', size=15).encode(y='Breadth', tooltip=['DT', alt.Tooltip('Breadth', format='.1%')])
+        start_t = pd.to_datetime(f"{base_d} 09:00:00"); end_t = pd.to_datetime(f"{base_d} 13:30:00")
+        base = alt.Chart(chart_data).encode(x=alt.X('DT:T', axis=alt.Axis(format='%H:%M'), scale=alt.Scale(domain=[start_t, end_t])))
+        l_b = base.mark_line(color='#007bff').encode(y=alt.Y('Breadth', scale=alt.Scale(domain=[0,1])))
         l_t = base.mark_line(color='#ffc107', strokeDash=[4,4]).encode(y=alt.Y('T_S', scale=alt.Scale(domain=[0,1])))
-        p_t = base.mark_circle(color='#ffc107', size=15).encode(y='T_S', tooltip=['DT', alt.Tooltip('Taiex_Change', format='.2%')])
-        rule_r = alt.Chart(pd.DataFrame({'y':[BREADTH_THR]})).mark_rule(color='red', strokeDash=[5,5]).encode(y='y')
-        rule_g = alt.Chart(pd.DataFrame({'y':[BREADTH_LOW]})).mark_rule(color='green', strokeDash=[5,5]).encode(y='y')
-        return (l_b+p_b+l_t+p_t+rule_r+rule_g).properties(height=400, title=f"走勢對照 - {base_d}").resolve_scale(y='shared')
+        return (l_b+l_t).properties(height=400, title=f"走勢對照 - {base_d}")
     except: return None
 
 def fetch_all():
     ft = get_finmind_token()
-    # 就算 FinMind Token 錯誤，也要能往下執行 (為了測試爬蟲)
-    
     sj_api, sj_err = get_api() 
     days = get_days(ft)
-    # 如果沒抓到日期，手動補今天，確保程式不會因為沒日期就掛掉
     now = datetime.now(timezone(timedelta(hours=8)))
     today_str = now.strftime("%Y-%m-%d")
     if not days: days = [today_str]
-    
     info_map = get_stock_info_map(ft)
-    
     d_cur = days[-1]
     is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
     allow_live_fetch = (0<=now.weekday()<=4) and (now.time() >= time(8,45))
     
     target_date_for_ranks = days[-2] if (len(days)>1 and now.time() < time(14, 0) and d_cur == today_str) else d_cur
-    if now.time() >= time(14, 0): target_date_for_ranks = today_str
-
     final_codes, from_disk = get_ranks_strict(ft, target_date_for_ranks)
-    if not final_codes and target_date_for_ranks == today_str and len(days)>1:
-        target_date_for_ranks = days[-2]
-        final_codes, _ = get_ranks_strict(ft, target_date_for_ranks)
-        msg_src = f"名單:{target_date_for_ranks}(延用舊單)"
-    else:
-        msg_src = f"名單:{target_date_for_ranks} {'(硬碟)' if from_disk else '(新抓)'}"
-
+    
     pmap = {}
     data_source = "歷史"
     last_t = "無即時資料"
     api_status_code = 0 
-    sj_usage_info = "無資料"
     
-    is_post_market = (now.time() >= time(14, 0))
-    
-    if allow_live_fetch and not is_post_market:
+    if allow_live_fetch:
         # 1. Shioaji
         if sj_api:
             try:
-                usage = sj_api.usage(); sj_usage_info = str(usage) if usage else "無法取得"
-                contracts = []
-                for c in final_codes:
-                    if c in sj_api.Contracts.Stocks: contracts.append(sj_api.Contracts.Stocks[c])
-                
+                contracts = [sj_api.Contracts.Stocks[c] for c in final_codes if c in sj_api.Contracts.Stocks]
                 if contracts:
                     for i in range(0, len(contracts), 50):
-                        chunk = contracts[i:i+50]
-                        snaps = sj_api.snapshots(chunk)
+                        snaps = sj_api.snapshots(contracts[i:i+50])
                         for s in snaps:
                             if s.close > 0:
-                                pmap[s.code] = {
-                                    'price': float(s.close),
-                                    'y_close': float(s.reference_price) 
-                                }
-                        time_module.sleep(0.2)
-                    
-                    if len(pmap) > 0:
-                        data_source = "永豐API"
-                        last_t = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
-                        api_status_code = 2
+                                pmap[s.code] = {'price': float(s.close), 'y_close': float(s.reference_price)}
+                    if pmap: data_source = "永豐API"; api_status_code = 2
             except: pass
         
-        # 2. MIS (Shioaji 沒抓到的補)
+        # 2. MIS
         missing_codes = [c for c in final_codes if c not in pmap]
         if missing_codes:
             mis_data = get_prices_twse_mis(missing_codes, info_map)
-            for c, val in mis_data.items():
-                pmap[c] = val
-            
-            if len(mis_data) > 0 and data_source == "歷史":
-                data_source = "證交所MIS"
-                last_t = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
-                api_status_code = 2
-
-    elif is_post_market:
-        data_source = "FinMind盤後資料"
-        last_t = "13:30:00"
+            for c, val in mis_data.items(): pmap[c] = val
+            if mis_data and data_source == "歷史": data_source = "證交所MIS"; api_status_code = 2
 
     s_dt = (datetime.now()-timedelta(days=40)).strftime("%Y-%m-%d")
     h_c, v_c, h_p, v_p = 0, 0, 0, 0
     dtls = []
     
     for c in final_codes:
-        df = get_hist(ft, c, s_dt) 
-        m_type = info_map.get(c, "未知")
-        m_display = {"twse":"上市", "tpex":"上櫃", "emerging":"興櫃"}.get(m_type, "未知")
-        
+        df = get_hist(ft, c, s_dt)
+        m_display = {"twse":"上市", "tpex":"上櫃"}.get(info_map.get(c, ""), "未知")
         info = pmap.get(c, {})
         curr_p = info.get('price', 0)
-        # 如果 MIS 只抓到 z (價格) 沒抓到 y (昨收)，嘗試用 FinMind 昨收補
-        real_y = info.get('y', info.get('y_close', 0)) 
+        real_y = info.get('y_close', 0)
         
-        if is_post_market and not df.empty:
-            if df.iloc[-1]['date'] == today_str:
-                curr_p = float(df.iloc[-1]['close'])
-                if len(df) >= 2: real_y = float(df.iloc[-2]['close'])
-
-        # 昨收與昨 MA5
-        p_price = 0
-        if real_y > 0: 
-            p_price = real_y
-        elif not df.empty:
-            p_price = float(df.iloc[-1]['close']) 
-
-        p_ma5 = 0
-        p_stt = "-"
-        
+        p_price = real_y if real_y > 0 else (float(df.iloc[-1]['close']) if not df.empty else 0)
+        p_ma5, p_stt = 0, "-"
         if not df.empty and p_price > 0:
-            last_date_db = df.iloc[-1]['date']
-            closes = []
-            if last_date_db == today_str:
-                closes = df['close'].tail(6).tolist()[:-1] 
-            else:
-                 closes = df['close'].tail(4).tolist()
-                 closes.append(p_price) 
-            
+            closes = df['close'].tail(5).tolist()
             if len(closes) >= 5:
-                p_ma5 = sum(closes[-5:]) / 5
-                if p_price > p_ma5: h_p += 1; p_stt="✅"
-                else: p_stt="📉"
-                v_p += 1
+                p_ma5 = sum(closes) / 5
+                p_stt = "✅" if p_price > p_ma5 else "📉"
+                h_p += (1 if p_price > p_ma5 else 0); v_p += 1
 
-        c_ma5 = 0
-        c_stt = "-"
-        note = ""
-        
-        # [絕對不補] 沒報價就沒報價，不補昨收
-        if curr_p == 0: 
-            c_stt = "⚠️無報價"
-            if p_price > 0: note = f"昨收{p_price} "
-
+        c_ma5, c_stt = 0, "-"
         if curr_p > 0 and p_price > 0 and not df.empty:
             hist_closes = df['close'].tail(4).tolist()
-            hist_closes.append(p_price) 
-            if len(hist_closes) >= 5:
-                ma5_input = hist_closes[-4:] 
-                ma5_input.append(curr_p)     
-                c_ma5 = sum(ma5_input) / 5
-                if curr_p > c_ma5: h_c += 1; c_stt="✅"
-                else: c_stt="📉"
-                v_c += 1
+            hist_closes.append(curr_p)
+            c_ma5 = sum(hist_closes) / 5
+            c_stt = "✅" if curr_p > c_ma5 else "📉"
+            h_c += (1 if curr_p > c_ma5 else 0); v_c += 1
+        elif curr_p == 0: c_stt = "⚠️無報價"
         
-        dtls.append({
-            "代號":c, "市場": m_display,
-            "昨收":p_price, "昨MA5":round(p_ma5,2), "昨狀態":p_stt,
-            "現價":curr_p, "今MA5":round(c_ma5,2), "今狀態":c_stt,
-            "備註": note
-        })
+        dtls.append({"代號":c, "市場": m_display, "昨收":p_price, "昨MA5":round(p_ma5,2), "昨狀態":p_stt, "現價":curr_p, "今MA5":round(c_ma5,2), "今狀態":c_stt})
 
     br_c = h_c/v_c if v_c>0 else 0
     br_p = h_p/v_p if v_p>0 else 0
     
+    # 大盤處理
     t_cur, t_pre, slope = 0, 0, 0
     try:
         tw = get_hist(ft, "TAIEX", s_dt)
-        if not tw.empty:
-            # 大盤也用 MIS
-            mis_tw = get_prices_twse_mis(["t00"], {"t00":"twse"}) 
-            t_curr = mis_tw.get("t00", {}).get("z", 0)
-            t_y = mis_tw.get("t00", {}).get("y", 0)
-
-            if t_y > 0: t_pre = t_y
-            else: t_pre = float(tw.iloc[-1]['close'])
-
-            if t_curr > 0: t_cur = t_curr
-            else: t_cur = t_pre
-
-            hist_tw = tw['close'].tail(4).tolist()
-            hist_tw.append(t_pre)
-            ma5_yest = 0
-            if len(hist_tw) >= 5: ma5_yest = sum(hist_tw[-5:]) / 5
-            
-            if ma5_yest > 0:
-                today_input = hist_tw[-4:]
-                today_input.append(t_cur)
-                ma5_today = sum(today_input) / 5
-                slope = ma5_today - ma5_yest
-            
+        mis_tw = get_prices_twse_mis(["t00"], {"t00":"twse"})
+        t_cur = mis_tw.get("t00", {}).get("price", 0)
+        t_pre = mis_tw.get("t00", {}).get("y_close", (float(tw.iloc[-1]['close']) if not tw.empty else 0))
+        if t_cur > 0 and not tw.empty:
+            h_tw = tw['close'].tail(4).tolist()
+            ma5_y = sum(tw['close'].tail(5)) / 5
+            ma5_c = (sum(h_tw) + t_cur) / 5
+            slope = ma5_c - ma5_y
     except: pass
     
-    if t_cur == t_pre: t_chg = 0
-    else: t_chg = (t_cur-t_pre)/t_pre if t_pre>0 else 0
-    
-    rec_t = last_t if is_intra and "無" not in str(last_t) else ("13:30:00" if is_post_market else datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S"))
-    
+    t_chg = (t_cur-t_pre)/t_pre if t_pre>0 else 0
+    rec_t = now.strftime("%H:%M")
     save_rec(d_cur, rec_t, br_c, t_chg, t_cur, t_pre, is_intra, v_c)
     
     return {
-        "d":d_cur, "d_prev": target_date_for_ranks, 
-        "br":br_c, "br_p":br_p, "h":h_c, "v":v_c, "h_p":h_p, "v_p":v_p,
-        "df":pd.DataFrame(dtls), 
-        "t":last_t, "tc":t_chg, "slope":slope, "src_type": data_source,
-        "raw":{'Date':d_cur,'Time':rec_t,'Breadth':br_c}, "src":msg_src,
-        "api_status": api_status_code, "sj_err": sj_err, "sj_usage": sj_usage_info
+        "d":d_cur, "br":br_c, "br_p":br_p, "h":h_c, "v":v_c, "df":pd.DataFrame(dtls), 
+        "t":rec_t, "tc":t_chg, "slope":slope, "src_type": data_source, "api_status": api_status_code
     }
 
 def run_app():
     st.title(f"📈 {APP_VER}")
-    
-    with st.sidebar:
-        st.subheader("設定")
-        auto = st.checkbox("自動更新", value=False)
-        fin_ok = "🟢" if get_finmind_token() else "🔴"
-        st.caption(f"FinMind Token: {fin_ok}")
-        tg_tok = st.text_input("TG Token", value=st.secrets.get("telegram",{}).get("token",""), type="password")
-        tg_id = st.text_input("Chat ID", value=st.secrets.get("telegram",{}).get("chat_id",""))
-        if tg_tok and tg_id: st.success("TG Ready")
+    data = fetch_all()
+    if data:
+        st.sidebar.info(f"報價來源: {data['src_type']}")
+        br = data['br']
+        open_br = get_opening_breadth(data['d'])
+        n_state = load_notify_state(data['d']) 
+        display_strategy_panel(data['slope'], open_br, br, n_state)
         
-        st.write("---")
-        if st.button("⚡ 強制清除快取 (重抓名單)", type="primary"):
-            st.cache_data.clear()
-            if os.path.exists(RANK_FILE): os.remove(RANK_FILE)
-            st.toast("快取已清除，正在重新抓取名單...", icon="🚀")
-            time_module.sleep(1)
-            st.rerun()
-            
-        if st.button("🗑️ 重置圖表資料"):
-            if os.path.exists(HIST_FILE):
-                os.remove(HIST_FILE)
-                st.toast("歷史資料已刪除，請重新整理", icon="🗑️")
-                time_module.sleep(1)
-            st.rerun()
-
-    if st.button("🔄 刷新"): st.rerun()
-
-    try:
-        data = fetch_all()
-        if isinstance(data, str): st.error(f"❌ {data}")
-        elif data:
-            st.sidebar.info(f"報價來源: {data['src_type']}")
-            st.sidebar.caption(f"永豐API額度: {data.get('sj_usage', '未知')}")
-            
-            status_code = data['api_status']
-            if status_code == 2: st.sidebar.success("🟢 連線正常")
-            elif status_code == 1: st.sidebar.warning("🟠 流量/連線異常 (忙線)")
-            else:
-                if data['sj_err']: st.sidebar.error(f"🔴 連線失敗: {data['sj_err']}")
-                else: st.sidebar.error("🔴 未連線")
-            
-            br = data['br']
-            open_br = get_opening_breadth(data['d'])
-            
-            hist_max, hist_min = get_intraday_extremes(data['d'])
-            today_max = br if hist_max is None else max(hist_max, br)
-            today_min = br if hist_min is None else min(hist_min, br)
+        c1,c2,c3 = st.columns(3)
+        c1.metric("今日廣度", f"{br:.1%}", f"{data['h']}/{data['v']}")
+        c2.metric("大盤漲跌", f"{data['tc']:.2%}")
+        c3.metric("大盤MA5斜率", f"{data['slope']:.2f}")
         
-            n_state = load_notify_state(data['d']) 
-
-            if open_br is not None and n_state['intraday_trend'] is None:
-                if br >= (open_br + 0.05):
-                    n_state['intraday_trend'] = 'up'
-                    if tg_tok and tg_id: send_tg(tg_tok, tg_id, f"🔒 <b>【趨勢鎖定】</b>\n廣度先達開盤+5% (目前{br:.1%})，今日確認偏多！")
-                elif br <= (open_br - 0.05):
-                    n_state['intraday_trend'] = 'down'
-                    if tg_tok and tg_id: send_tg(tg_tok, tg_id, f"🔒 <b>【趨勢鎖定】</b>\n廣度先達開盤-5% (目前{br:.1%})，今日確認偏空！")
-
-            if tg_tok and tg_id:
-                stt = 'normal'
-                if br >= BREADTH_THR: stt = 'hot'
-                elif br <= BREADTH_LOW: stt = 'cold'
-                
-                if stt != n_state['last_stt']:
-                    msg = f"🔥 過熱: {br:.1%}" if stt=='hot' else (f"❄️ 冰點: {br:.1%}" if stt=='cold' else "")
-                    if msg: send_tg(tg_tok, tg_id, msg)
-                
-                n_state['last_stt'] = stt 
-                
-                rap_msg, rid = check_rapid(data['raw'])
-                if rap_msg and rid != n_state['last_rap']:
-                    send_tg(tg_tok, tg_id, rap_msg)
-                    n_state['last_rap'] = rid
-                
-                if open_br is not None:
-                    is_dev_high = (br >= open_br + OPEN_DEV_THR)
-                    is_dev_low = (br <= open_br - OPEN_DEV_THR)
-                
-                    if is_dev_high and not n_state['was_dev_high']:
-                        n_state['was_dev_high'] = True
-                    
-                    if is_dev_low and not n_state['was_dev_low']:
-                        n_state['was_dev_low'] = True
-                
-                if br <= (today_max - 0.05):
-                    if not n_state['notified_drop_high']:
-                        should_notify = False
-                        if data['slope'] > 0 and n_state['intraday_trend'] == 'up': should_notify = True
-                        if data['slope'] < 0 and n_state['intraday_trend'] == 'up': should_notify = True
-            
-                        if should_notify:
-                            msg = f"📉 <b>【高點回落】</b>\n今日高點: {today_max:.1%}\n目前廣度: {br:.1%}\n已回檔 5%"
-                            send_tg(tg_tok, tg_id, msg)
-                            
-                        n_state['notified_drop_high'] = True
-                else:
-                    n_state['notified_drop_high'] = False
-                
-                if br >= (today_min + 0.05):
-                    if not n_state['notified_rise_low']:
-                        should_notify = False
-                        if data['slope'] < 0 and n_state['intraday_trend'] == 'down': should_notify = True
-                        if data['slope'] > 0 and n_state['intraday_trend'] == 'down': should_notify = True
-                        
-                        if should_notify:
-                            msg = f"🚀 <b>【低點反彈】</b>\n今日低點: {today_min:.1%}\n目前廣度: {br:.1%}\n已反彈 5%"
-                            send_tg(tg_tok, tg_id, msg)
-
-                        n_state['notified_rise_low'] = True
-                else:
-                    n_state['notified_rise_low'] = False
-                
-                save_notify_state(n_state)
-            
-            display_strategy_panel(data['slope'], open_br, br, n_state)
-
-            st.subheader(f"📅 {data['d']}")
-            st.caption(f"名單基準日: {data['d_prev']}") 
-            st.info(f"{data['src']} | 更新: {data['t']}")
-            chart = plot_chart()
-            if chart: st.altair_chart(chart, use_container_width=True)
-            
-            c1,c2,c3 = st.columns(3)
-            c1.metric("今日廣度", f"{br:.1%}", f"{data['h']}/{data['v']}")
-            
-            caption_str = f"昨日廣度: {data['br_p']:.1%} ({data['h_p']}/{data['v_p']})"
-            if open_br:
-                caption_str += f" | 開盤: {open_br:.1%}"
-            else:
-                caption_str += " | 開盤: 等待中..."
-            c1.caption(caption_str)
-            
-            c2.metric("大盤漲跌", f"{data['tc']:.2%}")
-            sl = data['slope']; icon = "📈 正" if sl > 0 else "📉 負"
-            c3.metric("大盤MA5斜率", f"{sl:.2f}", icon)
-            
-            st.dataframe(data['df'], use_container_width=True, hide_index=True)
-        else: st.warning("⚠️ 無資料")
-    except Exception as e: 
-        st.error(f"Error: {e}")
-        # 在 UI 上也印出 traceback 方便除錯
-        st.text(traceback.format_exc())
-
-    if auto:
-        now = datetime.now(timezone(timedelta(hours=8)))
-        is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
-        if is_intra:
-            sec = 120
-            with st.sidebar:
-                t = st.empty()
-                for i in range(sec, 0, -1):
-                    t.info(f"⏳ {i}s")
-                    time_module.sleep(1)
-            st.rerun()
-        else: st.sidebar.warning("⏸ 休市")
+        st.dataframe(data['df'], use_container_width=True, hide_index=True)
+    else: st.warning("⚠️ 無資料")
 
 if __name__ == "__main__":
-    try:
-        from streamlit.web import cli as stcli
-    except ImportError:
-        try:
-            import streamlit.cli as stcli
-        except:
-            pass
-
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (強化連線版)...")
-        try:
-            subprocess.call(["streamlit", "run", __file__])
-        except Exception as e:
-            print(f"啟動失敗: {e}")
-            print("請確認已安裝 streamlit (pip install streamlit)")
-        
-        # 確保無論如何都暫停
-        input("\n程式執行結束 (或發生錯誤)，請按 Enter 鍵離開...")
+        subprocess.call(["streamlit", "run", __file__])
+        input("\n程式執行結束，請按 Enter 鍵離開...")
