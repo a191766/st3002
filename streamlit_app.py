@@ -12,9 +12,9 @@ import time as time_module
 import random
 
 # ==========================================
-# 設定區 v9.30.2 (結構修復版)
+# 設定區 v9.31.0 (Yahoo救援版)
 # ==========================================
-APP_VER = "v9.30.2 (結構修復版)"
+APP_VER = "v9.31.0 (Yahoo救援版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -33,10 +33,8 @@ st.set_page_config(page_title="盤中權證進場判斷", layout="wide")
 # 基礎函式
 # ==========================================
 def get_finmind_token():
-    try:
-        return st.secrets["finmind"]["token"]
-    except:
-        return None
+    try: return st.secrets["finmind"]["token"]
+    except: return None
 
 def send_tg(token, chat_id, msg):
     if not token or not chat_id: return False
@@ -44,8 +42,7 @@ def send_tg(token, chat_id, msg):
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         r = requests.post(url, json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"})
         return r.status_code == 200
-    except:
-        return False
+    except: return False
 
 def load_notify_state(today_str):
     default_state = {
@@ -59,26 +56,19 @@ def load_notify_state(today_str):
         "intraday_trend": None  
     }
     
-    if not os.path.exists(NOTIFY_FILE):
-        return default_state
-    
+    if not os.path.exists(NOTIFY_FILE): return default_state
     try:
         with open(NOTIFY_FILE, 'r') as f:
             state = json.load(f)
-            if state.get("date") != today_str:
-                return default_state
-            if "intraday_trend" not in state:
-                state["intraday_trend"] = None
+            if state.get("date") != today_str: return default_state
+            if "intraday_trend" not in state: state["intraday_trend"] = None
             return state
-    except:
-        return default_state
+    except: return default_state
 
 def save_notify_state(state):
     try:
-        with open(NOTIFY_FILE, 'w') as f:
-            json.dump(state, f)
-    except:
-        pass
+        with open(NOTIFY_FILE, 'w') as f: json.dump(state, f)
+    except: pass
 
 def check_rapid(row):
     if not os.path.exists(HIST_FILE): return None, None
@@ -88,19 +78,13 @@ def check_rapid(row):
         curr_dt = datetime.strptime(f"{row['Date']} {row['Time']}", "%Y-%m-%d %H:%M")
         curr_v = float(row['Breadth'])
         target = None
-        
         for i in range(2, min(15, len(df)+1)):
             r = df.iloc[-i]
-            try: 
-                r_t = r['Time'] if len(str(r['Time']))==5 else r['Time'][:5]
+            try: r_t = r['Time'] if len(str(r['Time']))==5 else r['Time'][:5]
             except: continue
-            
             r_dt = datetime.strptime(f"{r['Date']} {r_t}", "%Y-%m-%d %H:%M")
-            seconds_diff = (curr_dt - r_dt).total_seconds()
-            
-            if 230 <= seconds_diff <= 250:
+            if 230 <= (curr_dt - r_dt).total_seconds() <= 250:
                 target = r; break
-                
         if target is not None:
             prev_v = float(target['Breadth'])
             diff = curr_v - prev_v
@@ -117,16 +101,12 @@ def get_opening_breadth(d_cur):
         df = pd.read_csv(HIST_FILE)
         if df.empty: return None
         if 'Total' not in df.columns: df['Total'] = 0
-        
         df['Date'] = df['Date'].astype(str)
         df_today = df[df['Date'] == str(d_cur)].copy()
         if df_today.empty: return None
-        
         df_today = df_today[df_today['Time'] >= "09:00"]
         df_valid = df_today[df_today['Total'] >= OPEN_COUNT_THR].sort_values('Time')
-        
-        if not df_valid.empty:
-            return float(df_valid.iloc[0]['Breadth'])
+        if not df_valid.empty: return float(df_valid.iloc[0]['Breadth'])
     except: pass
     return None
 
@@ -228,15 +208,56 @@ def get_hist(token, code, start):
     try: return api.taiwan_stock_daily(stock_id=code, start_date=start)
     except: return pd.DataFrame()
 
-# 全域 Session 保護 MIS 連線
-mis_session = requests.Session()
-mis_session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "Referer": "https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw",
-    "X-Requested-With": "XMLHttpRequest"
-})
+# [核心] Yahoo Finance 報價抓取
+def get_prices_yfinance(codes, info_map):
+    if not codes: return {}
+    # 轉換代碼: 上市 .TW, 上櫃 .TWO
+    yf_codes = []
+    mapping = {}
+    
+    # 防呆清單
+    fallback_map = {"2330":"twse", "0050":"twse", "2317":"twse", "2603":"twse", "2454":"twse", "3105":"tpex"}
+    
+    for c in codes:
+        m_type = info_map.get(c, fallback_map.get(c, "twse"))
+        suffix = ".TWO" if m_type == "tpex" else ".TW"
+        yf_c = f"{c}{suffix}"
+        yf_codes.append(yf_c)
+        mapping[yf_c] = c
+    
+    results = {}
+    try:
+        # 批量下載，速度快
+        data = yf.download(yf_codes, period="1d", interval="1m", progress=False)
+        
+        # 處理單一股票 vs 多檔股票的結構差異
+        if len(yf_codes) == 1:
+            close_data = data['Close']
+            prev_close_data = data['Open'].iloc[0] # 暫時用開盤頂替，或需額外抓 info
+            
+            # yfinance 的 info 抓昨收比較慢，這裡用 'Close' 的最後一筆當現價
+            last_price = float(close_data.iloc[-1])
+            if last_price > 0:
+                results[codes[0]] = {'price': last_price, 'y_close': 0} # y_close 稍後補
+        else:
+            # 多檔股票
+            close_df = data['Close']
+            last_row = close_df.iloc[-1]
+            
+            for yf_c, price in last_row.items():
+                if not pd.isna(price) and price > 0:
+                    orig_c = mapping.get(yf_c)
+                    if orig_c:
+                        # yfinance 盤中不一定給昨收，這裡先回傳現價
+                        results[orig_c] = {'price': float(price), 'y_close': 0}
+                        
+        # 補充昨收 (yfinance 盤中抓昨收比較慢，如果不為0則用，否則會在 fetch_all 用 FinMind 補)
+        # 為了速度，這裡先只抓現價
+    except: pass
+    
+    return results
 
+# MIS 備援
 def get_prices_twse_mis(codes, info_map):
     if not codes: return {}
     req_strs = []
@@ -259,7 +280,7 @@ def get_prices_twse_mis(codes, info_map):
         try:
             url = base_url + q_str
             time_module.sleep(random.uniform(0.1, 0.3)) 
-            r = mis_session.get(url, timeout=4)
+            r = requests.get(url, timeout=3)
             if r.status_code == 200:
                 data = r.json()
                 if 'msgArray' in data:
@@ -267,23 +288,14 @@ def get_prices_twse_mis(codes, info_map):
                         c = item.get('c', '') 
                         z = item.get('z', '-') 
                         y = item.get('y', '-') 
-                        
                         val = {}
                         if y != '-': val['y'] = float(y)
-                        
                         price = 0
-                        if z != '-': 
-                            price = float(z)
+                        if z != '-': price = float(z)
                         elif item.get('b', '-') != '-': 
                              try: price = float(item.get('b').split('_')[0])
                              except: pass
-                        elif item.get('a', '-') != '-': 
-                             try: price = float(item.get('a').split('_')[0])
-                             except: pass
-                        
                         if price > 0: val['z'] = price
-                        elif 'y' in val: val['z'] = val['y'] # 歸零防護
-                        
                         if c and val: results[c] = val
         except: pass
     return results
@@ -440,6 +452,7 @@ def fetch_all():
     is_post_market = (now.time() >= time(14, 0))
     
     if allow_live_fetch and not is_post_market:
+        # 1. Shioaji
         if sj_api:
             try:
                 usage = sj_api.usage(); sj_usage_info = str(usage) if usage else "無法取得"
@@ -460,21 +473,30 @@ def fetch_all():
                         time_module.sleep(0.2)
                     
                     if len(pmap) > 0:
-                        data_source = "永豐API (精準)"
+                        data_source = "永豐API"
                         last_t = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
                         api_status_code = 2
             except: pass
         
-        missing_codes = [c for c in final_codes if c not in pmap]
-        if missing_codes:
-            mis_data = get_prices_twse_mis(missing_codes, info_map)
+        # 2. Yahoo Finance 救援
+        missing_for_yf = [c for c in final_codes if c not in pmap]
+        if missing_for_yf:
+            yf_data = get_prices_yfinance(missing_for_yf, info_map)
+            for c, val in yf_data.items():
+                pmap[c] = val
+            if len(yf_data) > 0 and data_source == "歷史":
+                data_source = "Yahoo Finance (救援)"
+                last_t = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
+                api_status_code = 2
+
+        # 3. MIS 墊底
+        missing_for_mis = [c for c in final_codes if c not in pmap]
+        if missing_for_mis:
+            mis_data = get_prices_twse_mis(missing_for_mis, info_map)
             for c, val in mis_data.items():
-                pmap[c] = {
-                    'price': val.get('z', 0),
-                    'y_close': val.get('y', 0)
-                }
-            if data_source == "歷史" and len(mis_data) > 0:
-                data_source = "證交所MIS (備援)"
+                pmap[c] = val
+            if len(mis_data) > 0 and data_source == "歷史":
+                data_source = "證交所MIS"
                 last_t = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
                 api_status_code = 2
 
@@ -493,18 +515,20 @@ def fetch_all():
         
         info = pmap.get(c, {})
         curr_p = info.get('price', 0)
-        real_y = info.get('y_close', 0)
+        real_y = info.get('y_close', 0) # 優先使用即時源的昨收
         
+        # 盤後處理
         if is_post_market and not df.empty:
             if df.iloc[-1]['date'] == today_str:
                 curr_p = float(df.iloc[-1]['close'])
                 if len(df) >= 2: real_y = float(df.iloc[-2]['close'])
 
+        # 昨收與昨 MA5
         p_price = 0
         if real_y > 0: 
-            p_price = real_y 
+            p_price = real_y
         elif not df.empty:
-            p_price = float(df.iloc[-1]['close'])
+            p_price = float(df.iloc[-1]['close']) # 直接取最後一筆
 
         p_ma5 = 0
         p_stt = "-"
@@ -512,12 +536,11 @@ def fetch_all():
         if not df.empty and p_price > 0:
             last_date_db = df.iloc[-1]['date']
             closes = []
-            
             if last_date_db == today_str:
                  closes = df['close'].tail(6).tolist()[:-1] 
-            elif last_date_db < today_str:
+            else:
                  closes = df['close'].tail(4).tolist()
-                 closes.append(p_price)
+                 closes.append(p_price) # 補昨收
             
             if len(closes) >= 5:
                 p_ma5 = sum(closes[-5:]) / 5
@@ -529,14 +552,9 @@ def fetch_all():
         c_stt = "-"
         note = ""
         
-        if curr_p == 0 and p_price > 0:
-            curr_p = p_price 
-            note = "即時價失效(用昨收) "
-
         if curr_p > 0 and p_price > 0 and not df.empty:
             hist_closes = df['close'].tail(4).tolist()
             hist_closes.append(p_price) 
-            
             if len(hist_closes) >= 5:
                 ma5_input = hist_closes[-4:] 
                 ma5_input.append(curr_p)     
@@ -544,6 +562,8 @@ def fetch_all():
                 if curr_p > c_ma5: h_c += 1; c_stt="✅"
                 else: c_stt="📉"
                 v_c += 1
+        else:
+            if curr_p == 0: c_stt = "⚠️無報價"
         
         dtls.append({
             "代號":c, "市場": m_display,
@@ -559,22 +579,36 @@ def fetch_all():
     try:
         tw = get_hist(ft, "TAIEX", s_dt)
         if not tw.empty:
+            # 大盤也嘗試用 Yahoo 救援
+            t_curr, t_y = 0, 0
+            
+            # 1. MIS
             mis_tw = get_prices_twse_mis(["t00"], {"t00":"twse"}) 
-            tw_curr = mis_tw.get("t00", {}).get("z", 0)
-            tw_y = mis_tw.get("t00", {}).get("y", 0)
+            t_curr = mis_tw.get("t00", {}).get("z", 0)
+            t_y = mis_tw.get("t00", {}).get("y", 0)
+            
+            # 2. Yahoo (^TWII)
+            if t_curr == 0:
+                try:
+                    yf_tw = yf.Ticker("^TWII")
+                    hist = yf_tw.history(period="1d", interval="1m")
+                    if not hist.empty:
+                        t_curr = float(hist['Close'].iloc[-1])
+                        # Yahoo 昨收要另外抓 info，略過
+                except: pass
 
-            if tw_y > 0: t_pre = tw_y
+            if t_y > 0: t_pre = t_y
             else: t_pre = float(tw.iloc[-1]['close'])
 
-            if tw_curr > 0: t_cur = tw_curr
+            if t_curr > 0: t_cur = t_curr
             else: t_cur = t_pre
 
+            # 斜率
             hist_tw = tw['close'].tail(4).tolist()
             hist_tw.append(t_pre)
             ma5_yest = 0
             if len(hist_tw) >= 5: ma5_yest = sum(hist_tw[-5:]) / 5
             
-            ma5_today = 0
             if ma5_yest > 0:
                 today_input = hist_tw[-4:]
                 today_input.append(t_cur)
