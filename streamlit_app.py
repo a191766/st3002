@@ -274,7 +274,7 @@ def get_prices_twse_mis(codes, info_map):
         return {}, {c: "初始化失敗" for c in codes}
 
     req_strs = []
-    chunk_size = 50
+    chunk_size = 3
     results = {}
     debug_log = {}
 
