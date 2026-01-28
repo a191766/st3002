@@ -11,9 +11,9 @@ import time as time_module
 import random
 
 # ==========================================
-# 設定區 v9.34.0 (語法修復與真實連線版)
+# 設定區 v9.34.0 (真實連線修正版)
 # ==========================================
-APP_VER = "v9.34.0 (語法修復與真實連線版)"
+APP_VER = "v9.34.0 (真實連線修正版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -227,7 +227,7 @@ def get_hist(token, code, start):
     try: return api.taiwan_stock_daily(stock_id=code, start_date=start)
     except: return pd.DataFrame()
 
-# [核心升級] 動態 User-Agent 與 Session 管理
+# [核心升級] 真正的瀏覽器偽裝與 Session 管理
 def get_random_agent():
     agents = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
@@ -258,7 +258,7 @@ def get_prices_twse_mis(codes, info_map):
     session = st.session_state['mis_session']
     
     req_strs = []
-    chunk_size = 35
+    chunk_size = 30 # 降低請求量，避免被擋
     
     for i in range(0, len(codes), chunk_size):
         chunk = codes[i:i+chunk_size]
@@ -276,8 +276,9 @@ def get_prices_twse_mis(codes, info_map):
     for q_str in req_strs:
         try:
             url = base_url + q_str
-            time_module.sleep(random.uniform(0.1, 0.4))
-            r = session.get(url, timeout=5)
+            # 使用已經有 Cookie 的 session 發請求，並加上隨機延遲
+            time_module.sleep(random.uniform(0.3, 0.8))
+            r = session.get(url, timeout=8)
             
             if r.status_code == 200:
                 data = r.json()
@@ -300,12 +301,12 @@ def get_prices_twse_mis(codes, info_map):
                              try: price = float(item.get('a').split('_')[0])
                              except: pass
                         
-                        # 只回傳大於 0 的價格，不補昨收，確保真實性
+                        # [誠實數據] 只回傳大於 0 的價格
                         if price > 0: val['z'] = price
                         
                         if c and val: results[c] = val
         except: 
-            # 如果連線失敗，清除 Session 下次重來
+            # 如果 Session 過期或失敗，清除它以便下次重建
             if 'mis_session' in st.session_state:
                 del st.session_state['mis_session']
             pass
@@ -455,11 +456,7 @@ def fetch_all():
     else:
         msg_src = f"名單:{target_date_for_ranks} {'(硬碟)' if from_disk else '(新抓)'}"
 
-    # 快取機制: 只要抓到過就存起來，避免下一次連線失敗變 0
-    if 'price_cache' not in st.session_state:
-        st.session_state['price_cache'] = {}
-    
-    pmap = st.session_state['price_cache']
+    pmap = {}
     data_source = "歷史"
     last_t = "無即時資料"
     api_status_code = 0 
@@ -488,27 +485,23 @@ def fetch_all():
                                 }
                         time_module.sleep(0.2)
                     
-                    data_source = "永豐API"
-                    last_t = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
-                    api_status_code = 2
+                    if len(pmap) > 0:
+                        data_source = "永豐API"
+                        last_t = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
+                        api_status_code = 2
             except: pass
         
-        # 2. MIS (只補快取沒有的，或全部更新)
+        # 2. MIS (Shioaji 沒抓到的補)
         missing_codes = [c for c in final_codes if c not in pmap]
-        # 如果缺很多，或者永豐沒通，就全抓
-        target_codes = final_codes if (len(missing_codes) > 10 or api_status_code != 2) else missing_codes
-
-        if target_codes:
-            mis_data = get_prices_twse_mis(target_codes, info_map)
+        if missing_codes:
+            mis_data = get_prices_twse_mis(missing_codes, info_map)
             for c, val in mis_data.items():
                 pmap[c] = val
             
-            if api_status_code != 2 and len(mis_data) > 0:
+            if len(mis_data) > 0 and data_source == "歷史":
                 data_source = "證交所MIS"
                 last_t = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
                 api_status_code = 2
-
-        st.session_state['price_cache'] = pmap
 
     elif is_post_market:
         data_source = "FinMind盤後資料"
@@ -525,16 +518,19 @@ def fetch_all():
         
         info = pmap.get(c, {})
         curr_p = info.get('price', 0)
-        real_y = info.get('y_close', 0)
+        real_y = info.get('y_close', 0) # 優先使用即時源的昨收
         
         if is_post_market and not df.empty:
             if df.iloc[-1]['date'] == today_str:
                 curr_p = float(df.iloc[-1]['close'])
                 if len(df) >= 2: real_y = float(df.iloc[-2]['close'])
 
+        # 昨收與昨 MA5
         p_price = 0
-        if real_y > 0: p_price = real_y
-        elif not df.empty: p_price = float(df.iloc[-1]['close'])
+        if real_y > 0: 
+            p_price = real_y
+        elif not df.empty:
+            p_price = float(df.iloc[-1]['close']) 
 
         p_ma5 = 0
         p_stt = "-"
@@ -542,8 +538,11 @@ def fetch_all():
         if not df.empty and p_price > 0:
             last_date_db = df.iloc[-1]['date']
             closes = []
-            if last_date_db == today_str: closes = df['close'].tail(6).tolist()[:-1] 
-            else: closes = df['close'].tail(4).tolist(); closes.append(p_price)
+            if last_date_db == today_str:
+                 closes = df['close'].tail(6).tolist()[:-1] 
+            else:
+                 closes = df['close'].tail(4).tolist()
+                 closes.append(p_price) 
             
             if len(closes) >= 5:
                 p_ma5 = sum(closes[-5:]) / 5
@@ -555,11 +554,10 @@ def fetch_all():
         c_stt = "-"
         note = ""
         
-        # [邏輯修正] 如果有快取，這裡就不會是 0
-        # 如果還是 0，且有昨收，也不補，直接顯示 0 (真實呈現)
+        # [絕對不補] 沒報價就沒報價，不補昨收
         if curr_p == 0: 
             c_stt = "⚠️無報價"
-            if p_price > 0: note = f"昨收{p_price}"
+            if p_price > 0: note = f"昨收{p_price} "
 
         if curr_p > 0 and p_price > 0 and not df.empty:
             hist_closes = df['close'].tail(4).tolist()
@@ -586,6 +584,7 @@ def fetch_all():
     try:
         tw = get_hist(ft, "TAIEX", s_dt)
         if not tw.empty:
+            # 大盤也用 MIS
             mis_tw = get_prices_twse_mis(["t00"], {"t00":"twse"}) 
             t_curr = mis_tw.get("t00", {}).get("z", 0)
             t_y = mis_tw.get("t00", {}).get("y", 0)
