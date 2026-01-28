@@ -18,9 +18,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.16 (期貨修復+圖表強制顯示版)
+# 設定區 v9.55.17 (正確引用大盤維持率版)
 # ==========================================
-APP_VER = "v9.55.16 (期貨修復+圖表強制顯示版)"
+APP_VER = "v9.55.17 (正確引用大盤維持率版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -156,7 +156,7 @@ def get_api():
         return None, str(e)
 
 # ==========================================
-# 籌碼面資料處理 (Restored Scanner Logic)
+# 籌碼面資料處理 (Smart Request)
 # ==========================================
 def call_finmind_api_try_versions(dataset_candidates, data_id, start_date, token):
     """
@@ -202,12 +202,13 @@ def get_chips_data(token, target_date_str):
     start_date = (datetime.strptime(target_date_str, "%Y-%m-%d") - timedelta(days=10)).strftime("%Y-%m-%d")
     res = {}
     
-    # 1. 外資期貨 (掃描 + 正確欄位)
+    # 1. 外資期貨 (TaiwanFuturesInstitutional)
+    # 使用正確的複數欄位 institutional_investors
     fut_candidates = ["TaiwanFuturesInstitutional", "TaiwanFuturesInstitutionalInvestors"]
     df_fut, fut_src = call_finmind_api_try_versions(fut_candidates, "TX", start_date, token)
     
     if df_fut.empty:
-        diagnosis.append(f"❌ 期貨: 掃描失敗 (最後: {fut_src})")
+        diagnosis.append(f"❌ 期貨: 掃描失敗 ({fut_src})")
     else:
         # 尋找外資
         col_name = None
@@ -218,18 +219,17 @@ def get_chips_data(token, target_date_str):
         
         if col_name:
             df_foreign = df_fut[df_fut[col_name].astype(str).str.contains('外資|Foreign', case=False)].sort_values('date')
+            
             if df_foreign.empty:
                 diagnosis.append("⚠️ 期貨: 找不到外資資料")
             else:
                 latest = df_foreign.iloc[-1]
                 prev = df_foreign.iloc[-2] if len(df_foreign) >= 2 else latest
                 
-                # 正確欄位計算: 多方未平倉 - 空方未平倉
                 try:
                     curr_long = float(latest.get('long_open_interest_balance_volume', 0))
                     curr_short = float(latest.get('short_open_interest_balance_volume', 0))
                     
-                    # 如果找不到長欄位，嘗試舊欄位
                     if curr_long == 0 and curr_short == 0 and 'open_interest' in latest:
                         res['fut_oi'] = int(latest['open_interest'])
                         prev_oi = int(prev.get('open_interest', 0))
@@ -246,9 +246,9 @@ def get_chips_data(token, target_date_str):
                 except:
                     diagnosis.append(f"❌ 期貨: 數值計算錯誤")
         else:
-            diagnosis.append(f"❌ 期貨: 找不到法人欄位 {list(df_fut.columns)}")
+            diagnosis.append(f"❌ 期貨: 找不到法人欄位")
 
-    # 2. 選擇權 (V4 OK)
+    # 2. 選擇權
     df_opt, opt_src = call_finmind_api_try_versions(["TaiwanOptionDaily"], "TXO", start_date, token)
     if not df_opt.empty:
         last_date = df_opt['date'].max()
@@ -261,17 +261,24 @@ def get_chips_data(token, target_date_str):
                 res['pc_ratio'] = round((put_oi / call_oi) * 100, 2)
                 diagnosis.append(f"✅ 選擇權: 成功 (PC={res['pc_ratio']}%)")
 
-    # 3. 融資維持率 (掃描嘗試，雖然大概率失敗)
-    maint_candidates = ["TaiwanStockMarginMaintenanceRatio", "TaiwanStockAverageMarginMaintenanceRatio"]
+    # 3. 融資維持率 (使用正確的大盤名稱: TaiwanTotalExchangeMarginMaintenance)
+    maint_candidates = ["TaiwanTotalExchangeMarginMaintenance"] # <--- 關鍵修正
     df_maint, maint_src = call_finmind_api_try_versions(maint_candidates, None, start_date, token)
+    
     if not df_maint.empty:
         latest = df_maint.iloc[-1]
-        col_maint = 'margin_maintenance_ratio' if 'margin_maintenance_ratio' in latest else 'MarginMaintenanceRatio'
+        col_maint = 'MarginMaintenanceRatio' # 通常官方大盤表是這個欄位
+        if col_maint not in latest: col_maint = 'margin_maintenance_ratio'
+        
         if col_maint in latest:
             res['margin_ratio'] = float(latest[col_maint])
-            diagnosis.append(f"✅ 維持率: 成功 ({res['margin_ratio']}%)")
+            diagnosis.append(f"✅ 維持率(官方): 成功 ({res['margin_ratio']}%)")
+        else:
+            diagnosis.append(f"❌ 維持率: 欄位異常 {list(latest.keys())}")
+    else:
+        diagnosis.append(f"❌ 維持率: 抓取失敗 (使用大盤餘額變動替代判斷)")
     
-    # 4. 融資餘額 (替代方案)
+    # 4. 融資餘額
     df_margin, margin_src = call_finmind_api_try_versions(["TaiwanStockTotalMarginPurchaseShortSale"], None, start_date, token)
     if not df_margin.empty:
         df_money = df_margin[df_margin['name'] == 'MarginPurchaseMoney'].sort_values('date')
@@ -292,37 +299,46 @@ def get_chip_strategy(ma5_slope, chips):
     fut_oi = chips.get('fut_oi', 0)
     fut_chg = chips.get('fut_oi_chg', 0)
     pc_ratio = chips.get('pc_ratio', 100)
+    margin_ratio = chips.get('margin_ratio', 0) # 如果有抓到就用
     margin_chg = chips.get('margin_chg', 0)
     
     sig = "籌碼中性"
     act = "觀察技術面為主"
     color = "info"
     
+    # 判斷邏輯
+    
     # 1. 殺盤 (空頭順勢)
     if ma5_slope <= 0 and fut_oi < -10000 and margin_chg > 0:
         sig = "📉 殺戮盤 (散戶接刀)"
         act = "主力殺、散戶接，籌碼極亂。全力放空，不要猜底。"
         color = "error"
+        
     # 2. 多頭燃料充足
     elif ma5_slope > 0 and fut_oi > 10000 and pc_ratio > 110:
         sig = "🚀 火力全開 (外資助攻)"
         act = "外資期現貨同步作多，支撐強勁。多單抱緊，甚至加碼。"
         color = "success"
-    # 3. 融資大減 (清洗籌碼)
-    elif ma5_slope < 0 and margin_chg < -15: 
-        sig = "💎 籌碼清洗 (融資大減)"
-        act = f"融資單日大減 {abs(margin_chg)} 億，浮額清洗中。留意止跌訊號。"
+        
+    # 3. 斷頭/籌碼清洗 (優先看維持率，沒有則看融資大減)
+    elif ma5_slope < 0 and ((margin_ratio > 0 and margin_ratio < 135) or margin_chg < -15):
+        sig = "💎 絕佳抄底 (斷頭清洗)"
+        reason = f"維持率{margin_ratio}%" if margin_ratio > 0 else f"融資大減{abs(margin_chg)}億"
+        act = f"{reason}，浮額清洗中。通常是波段低點，留意止跌訊號。"
         color = "primary"
+        
     # 4. 多頭力竭
     elif ma5_slope > 0 and fut_chg < -3000 and margin_chg > 5: 
         sig = "⚠️ 籌碼渙散 (拉高出貨)"
         act = "指數漲但外資大逃亡，散戶在接最後一棒。獲利了結，小心反轉。"
         color = "warning"
+        
     # 5. 潛伏期
     elif abs(ma5_slope) < 10 and fut_chg > 2000 and pc_ratio > 110:
         sig = "🟩 潛伏期 (主力吃貨)"
         act = "盤整中見外資偷佈局多單。建議提前建倉，等待噴出。"
         color = "success"
+        
     # 6. 假突破
     elif ma5_slope > 0 and fut_oi < -3000:
         sig = "🟨 假突破警戒"
@@ -644,7 +660,12 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("外資期貨淨OI", f"{d.get('fut_oi',0):,}", f"{d.get('fut_oi_chg',0):,}")
         c2.metric("P/C Ratio", f"{d.get('pc_ratio',0)}%")
-        c3.metric("融資餘額(億)", f"{d.get('margin_bal',0)}", f"{d.get('margin_chg',0)}")
+        
+        # 顯示維持率或融資餘額
+        if d.get('margin_ratio', 0) > 0:
+             c3.metric("融資維持率", f"{d.get('margin_ratio',0)}%")
+        else:
+             c3.metric("融資餘額(億)", f"{d.get('margin_bal',0)}", f"{d.get('margin_chg',0)}")
         
         sig = chip_strategy['sig']
         act = chip_strategy['act']
@@ -704,10 +725,9 @@ def plot_chart():
         # 使用今天日期作為標題
         base_d = datetime.now().strftime("%Y-%m-%d")
         
-        # 建立一個假的 09:00 - 13:30 時間序列 (只是為了撐開X軸)
+        # 建立一個假的 09:00 - 13:30 時間序列
         start = datetime.strptime(f"{base_d} 09:00", "%Y-%m-%d %H:%M")
         end = datetime.strptime(f"{base_d} 13:30", "%Y-%m-%d %H:%M")
-        # 這裡不需要填入數據，只要定義 Scale 即可
     else:
         start = pd.to_datetime(f"{base_d} 09:00:00")
         end = pd.to_datetime(f"{base_d} 13:30:00")
@@ -718,15 +738,14 @@ def plot_chart():
     
     # Y軸: 0 ~ 1 (0% ~ 100%), 每 0.1 一格
     y_vals = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-    y_axis = alt.Axis(format='%', values=y_vals, tickCount=11, title=None) # title=None 移除廣度文字
+    y_axis = alt.Axis(format='%', values=y_vals, tickCount=11, title=None)
     
     if chart_data.empty:
-        # 空圖表 (只顯示軸)
+        # 空圖表
         base = alt.Chart(pd.DataFrame({'DT': [start, end]})).mark_point(opacity=0).encode(
             x=alt.X('DT:T', title=None, axis=alt.Axis(format='%H:%M'), scale=x_scale),
             y=alt.Y('val:Q', axis=y_axis, scale=alt.Scale(domain=[0, 1]))
         )
-        # 加上紅綠虛線
         rule_r = alt.Chart(pd.DataFrame({'y':[BREADTH_THR]})).mark_rule(color='red', strokeDash=[5,5]).encode(y='y')
         rule_g = alt.Chart(pd.DataFrame({'y':[BREADTH_LOW]})).mark_rule(color='green', strokeDash=[5,5]).encode(y='y')
         return (base + rule_r + rule_g).properties(height=400, title=f"走勢對照 - {base_d} (等待開盤)")
@@ -737,7 +756,7 @@ def plot_chart():
             x=alt.X('DT:T', title=None, axis=alt.Axis(format='%H:%M'), scale=x_scale)
         )
         
-        # 廣度: 黃色線 + 黃色點 (#ffc107)
+        # 廣度: 黃色線 + 黃色點
         l_b = base.mark_line(color='#ffc107').encode(
             y=alt.Y('Breadth', title=None, scale=alt.Scale(domain=[0,1], nice=False), axis=y_axis)
         )
@@ -746,7 +765,7 @@ def plot_chart():
             tooltip=['DT', alt.Tooltip('Breadth', format='.1%')]
         )
         
-        # 大盤: 藍色虛線 + 藍色點 (#007bff)
+        # 大盤: 藍色虛線 + 藍色點
         l_t = base.mark_line(color='#007bff', strokeDash=[4,4]).encode(
             y=alt.Y('T_S', scale=alt.Scale(domain=[0,1]))
         )
@@ -755,7 +774,6 @@ def plot_chart():
             tooltip=['DT', alt.Tooltip('Taiex_Change', format='.2%')]
         )
         
-        # 警戒線
         rule_r = alt.Chart(pd.DataFrame({'y':[BREADTH_THR]})).mark_rule(color='red', strokeDash=[5,5]).encode(y='y')
         rule_g = alt.Chart(pd.DataFrame({'y':[BREADTH_LOW]})).mark_rule(color='green', strokeDash=[5,5]).encode(y='y')
         
@@ -1180,7 +1198,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (期貨修復+圖表強制顯示版)...")
+        print("正在啟動 Streamlit 介面 (最終完美欄位修正版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
