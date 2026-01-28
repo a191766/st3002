@@ -18,9 +18,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.2 (籌碼戰略整合版)
+# 設定區 v9.55.3 (籌碼診斷修復版)
 # ==========================================
-APP_VER = "v9.55.2 (籌碼戰略整合版)"
+APP_VER = "v9.55.3 (籌碼診斷修復版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -156,90 +156,92 @@ def get_api():
         return None, str(e)
 
 # ==========================================
-# 籌碼面資料處理 (Sponsor)
+# 籌碼面資料處理 (Sponsor) - 診斷版
 # ==========================================
-@st.cache_data(ttl=43200) # 12小時快取，確保一天只抓一次
+@st.cache_data(ttl=43200) # 12小時快取
 def get_chips_data(token, target_date_str):
-    """
-    抓取關鍵籌碼數據：
-    1. 外資台指期淨未平倉 (TaiwanFuturesDaily)
-    2. 選擇權 P/C Ratio (TaiwanOptionDaily)
-    3. 大盤融資維持率 (TaiwanStockMarginMaintenanceRatio)
-    4. 大盤融資餘額 (TaiwanStockMarginPurchaseShortSale)
-    """
-    if not token: return None
+    diagnosis = [] # 診斷日誌
+    
+    if not token:
+        diagnosis.append("❌ 錯誤: 未設定 FinMind Token")
+        return None, diagnosis
     
     api = DataLoader()
     api.login_by_token(token)
     
-    # 往前抓 10 天以確保有資料 (避開假日)
+    # 往前抓 10 天
     start_date = (datetime.strptime(target_date_str, "%Y-%m-%d") - timedelta(days=10)).strftime("%Y-%m-%d")
     
     res = {}
     
+    # 1. 外資期貨
     try:
-        # 1. 外資期貨 (TX)
         df_fut = api.taiwan_futures_daily(futures_id="TX", start_date=start_date)
-        if not df_fut.empty:
-            # 篩選外資
+        if df_fut.empty:
+            diagnosis.append(f"⚠️ 期貨: 抓取成功但無資料 (日期: {start_date} ~ {target_date_str})")
+        else:
             df_foreign = df_fut[df_fut['institutional_investor'] == '外資'].sort_values('date')
-            if not df_foreign.empty:
+            if df_foreign.empty:
+                diagnosis.append("⚠️ 期貨: 有資料但找不到 '外資' 欄位")
+            else:
                 latest = df_foreign.iloc[-1]
                 prev = df_foreign.iloc[-2] if len(df_foreign) >= 2 else latest
-                
-                res['fut_oi'] = int(latest['open_interest']) # 淨未平倉 (雖然欄位叫 open_interest，但在法人表中通常指淨額或持有部位，視 API 而定，此處假設為 FinMind 格式)
-                # FinMind 的 institutional_investor 表格，open_interest 通常是「未平倉口數」(持有部位)
-                # 需注意：多空是用 buy_volume - sell_volume 累計，或是直接給 Net OI
-                # 由於 FinMind 結構，這裡取 'open_interest' 若是分開多空需另外處理。
-                # 簡化邏輯：FinMind 期貨日報表如果是法人統計，通常給的是 Net OI (多空淨額) 或是 Long/Short 分開
-                # 若抓到的是 TaiwanFuturesDaily 且有法人欄位，open_interest 通常是該法人的留倉部位 (有正負)
-                
+                res['fut_oi'] = int(latest['open_interest'])
                 res['fut_oi_chg'] = res['fut_oi'] - int(prev['open_interest'])
                 res['fut_date'] = latest['date']
-    except: pass
+                diagnosis.append(f"✅ 期貨: 成功 (資料日: {latest['date']}, OI: {res['fut_oi']})")
+    except Exception as e:
+        diagnosis.append(f"❌ 期貨錯誤: {str(e)}")
 
+    # 2. 選擇權 P/C Ratio
     try:
-        # 2. 選擇權 P/C Ratio (TXO)
         df_opt = api.taiwan_option_daily(option_id="TXO", start_date=start_date)
-        if not df_opt.empty:
+        if df_opt.empty:
+            diagnosis.append("⚠️ 選擇權: 抓取成功但無資料")
+        else:
             last_date = df_opt['date'].max()
             df_today = df_opt[df_opt['date'] == last_date]
-            
-            # 計算 Put OI 總和 / Call OI 總和
             put_oi = df_today[df_today['call_put'] == 'Put']['open_interest'].sum()
             call_oi = df_today[df_today['call_put'] == 'Call']['open_interest'].sum()
-            
             if call_oi > 0:
                 res['pc_ratio'] = round((put_oi / call_oi) * 100, 2)
-    except: pass
+                diagnosis.append(f"✅ 選擇權: 成功 (資料日: {last_date}, PC: {res['pc_ratio']}%)")
+            else:
+                diagnosis.append("⚠️ 選擇權: Call OI 為 0，無法計算")
+    except Exception as e:
+        diagnosis.append(f"❌ 選擇權錯誤: {str(e)}")
 
+    # 3. 融資維持率 (Sponsor 獨家)
     try:
-        # 3. 融資維持率 (Sponsor)
         df_maint = api.taiwan_stock_margin_maintenance_ratio(start_date=start_date)
-        if not df_maint.empty:
+        if df_maint.empty:
+            diagnosis.append("⚠️ 維持率: 無資料 (可能是權限不足或尚未更新)")
+        else:
             latest = df_maint.iloc[-1]
             res['margin_ratio'] = float(latest['margin_maintenance_ratio'])
-    except: pass
+            diagnosis.append(f"✅ 維持率: 成功 (資料日: {latest['date']}, {res['margin_ratio']}%)")
+    except Exception as e:
+        diagnosis.append(f"❌ 維持率錯誤: {str(e)}") # 這裡最容易出 403 Forbidden
     
+    # 4. 融資餘額
     try:
-        # 4. 融資餘額 (TSE) - 用來判斷散戶動向
-        # 注意: FinMind 抓 TSE 融資有時需用 '0000' 或 'TSE'，若失敗則忽略
-        df_margin = api.taiwan_stock_margin_purchase_short_sale(stock_id="TSE", start_date=start_date) # 嘗試抓大盤
-        if df_margin.empty: # 備案：抓 0050 代表
+        df_margin = api.taiwan_stock_margin_purchase_short_sale(stock_id="TSE", start_date=start_date)
+        if df_margin.empty:
              df_margin = api.taiwan_stock_margin_purchase_short_sale(stock_id="0050", start_date=start_date)
              
-        if not df_margin.empty:
+        if df_margin.empty:
+            diagnosis.append("⚠️ 融資餘額: 無資料")
+        else:
             latest = df_margin.iloc[-1]
             prev = df_margin.iloc[-2] if len(df_margin) >= 2 else latest
-            
-            # 融資餘額 (Money)
             curr_bal = float(latest['margin_purchase_money']) if 'margin_purchase_money' in latest else 0
             prev_bal = float(prev['margin_purchase_money']) if 'margin_purchase_money' in prev else 0
-            
-            res['margin_chg'] = curr_bal - prev_bal # 正值代表散戶進場，負值代表散戶退場
-    except: pass
+            res['margin_chg'] = curr_bal - prev_bal
+            diagnosis.append(f"✅ 融資餘額: 成功 (資料日: {latest['date']})")
+    except Exception as e:
+        diagnosis.append(f"❌ 融資餘額錯誤: {str(e)}")
 
-    return res
+    return res, diagnosis
 
 def get_chip_strategy(ma5_slope, chips):
     if not chips: return None
@@ -250,50 +252,34 @@ def get_chip_strategy(ma5_slope, chips):
     margin_ratio = chips.get('margin_ratio', 160)
     margin_chg = chips.get('margin_chg', 0)
     
-    # 預設
     sig = "籌碼中性"
     act = "觀察技術面為主"
-    color = "info" # blue
+    color = "info"
     
-    # 邏輯判斷 (優先順序：轉折 > 順勢 > 震盪)
-    
-    # 1. 殺盤前兆 (空頭順勢/轉折) - 融資死不退
     if ma5_slope <= 0 and fut_oi < -10000 and margin_chg > 0:
         sig = "📉 殺戮盤 (散戶接刀)"
         act = "主力殺、散戶接，籌碼極亂。全力放空，不要猜底。"
-        color = "error" # red
-        
-    # 2. 多頭燃料充足 (多頭順勢)
+        color = "error"
     elif ma5_slope > 0 and fut_oi > 10000 and pc_ratio > 110:
         sig = "🚀 火力全開 (外資助攻)"
         act = "外資期現貨同步作多，支撐強勁。多單抱緊，甚至加碼。"
-        color = "success" # green
-        
-    # 3. 絕佳抄底機會 (空頭反轉) - 斷頭
-    elif ma5_slope < 0 and margin_ratio < 135: # 130~135 為警戒區
+        color = "success"
+    elif ma5_slope < 0 and margin_ratio < 135: 
         sig = "💎 遍地黃金 (斷頭止跌)"
         act = "融資斷頭多殺多，通常是波段最低點。大膽分批買進。"
-        color = "primary" # special blue
-        
-    # 4. 多頭力竭/拉高出貨 (多頭警示)
-    elif ma5_slope > 0 and fut_chg < -3000 and margin_chg > 0: # 外資跑、散戶進
+        color = "primary"
+    elif ma5_slope > 0 and fut_chg < -3000 and margin_chg > 0: 
         sig = "⚠️ 籌碼渙散 (拉高出貨)"
         act = "指數漲但外資大逃亡，散戶在接最後一棒。獲利了結，小心反轉。"
-        color = "warning" # yellow
-        
-    # 5. 震盪盤 - 潛伏期 (準備噴出)
+        color = "warning"
     elif abs(ma5_slope) < 10 and fut_chg > 2000 and pc_ratio > 110:
         sig = "🟩 潛伏期 (主力吃貨)"
         act = "盤整中見外資偷佈局多單。建議提前建倉，等待噴出。"
         color = "success"
-    
-    # 6. 震盪盤 - 殺盤前兆
     elif abs(ma5_slope) < 10 and margin_ratio < 145:
         sig = "🟥 溫水煮青蛙 (瀕臨斷頭)"
         act = "盤整但維持率過低，隨時引發多殺多。空手觀望。"
         color = "error"
-        
-    # 7. 假突破警戒
     elif ma5_slope > 0 and fut_oi < -3000:
         sig = "🟨 假突破警戒"
         act = "現貨漲但期貨空單留倉。可能是假突破，多單要設緊停損。"
@@ -324,7 +310,6 @@ def get_days(token):
     now = datetime.now(timezone(timedelta(hours=8)))
     today_str = now.strftime("%Y-%m-%d")
     
-    # [修正] 移除 8 點限制，只要過了 00:00 且是平日，就視為新的一天
     if 0 <= now.weekday() <= 4: 
         if not dates or today_str > dates[-1]:
             dates.append(today_str)
@@ -416,7 +401,7 @@ def get_prices_twse_mis(codes, info_map):
         return {}, {c: "初始化失敗" for c in codes}
 
     req_strs = []
-    chunk_size = 50 # 維持高速設定
+    chunk_size = 50 
     results = {}
     debug_log = {}
 
@@ -546,7 +531,7 @@ def save_rec(d, t, b, tc, t_cur, t_prev, intra, total_v):
                 row.to_csv(HIST_FILE, mode='a', header=False, index=False)
     except: row.to_csv(HIST_FILE, index=False)
 
-def display_strategy_panel(slope, open_br, br, n_state, chip_strategy):
+def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag):
     st.subheader("♟️ 戰略指揮所")
     strategies = []
     
@@ -608,20 +593,23 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy):
             if s["type"] == "success": st.success(f"**{title}**\n\n{body}")
             elif s["type"] == "error": st.error(f"**{title}**\n\n{body}")
             elif s["type"] == "warning": st.warning(f"**{title}**\n\n{body}")
-            elif s["type"] == "primary": st.info(f"**{title}**\n\n{body}") # 使用 blue
+            elif s["type"] == "primary": st.info(f"**{title}**\n\n{body}")
             else: st.info(f"**{title}**\n\n{body}")
     
     # 4. 籌碼氣象站 (Sponsor)
     st.markdown("---")
     st.subheader("♟️ 籌碼氣象站 (Sponsor)")
-    if chip_strategy:
-        c1, c2, c3, c4 = st.columns(4)
+    
+    if chip_strategy and chip_strategy['data']:
         d = chip_strategy['data']
+        # 檢查是否有 0 的情況
+        has_missing = (d.get('fut_oi',0) == 0) or (d.get('margin_ratio',0) == 0)
+        
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("外資期貨淨OI", f"{d.get('fut_oi',0):,}", f"{d.get('fut_oi_chg',0):,}")
         c2.metric("P/C Ratio", f"{d.get('pc_ratio',0)}%")
         c3.metric("融資維持率", f"{d.get('margin_ratio',0)}%")
         
-        # 顯示籌碼戰略
         sig = chip_strategy['sig']
         act = chip_strategy['act']
         color = chip_strategy['color']
@@ -632,8 +620,23 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy):
             elif color == 'warning': st.warning(f"**{sig}**\n\n{act}")
             elif color == 'primary': st.info(f"**{sig}**\n\n{act}", icon="💎")
             else: st.info(f"**{sig}**\n\n{act}")
+            
+        if has_missing:
+             with st.expander("⚠️ 部分數據缺失 (點擊查看原因)", expanded=True):
+                 for msg in chip_diag:
+                     if "⚠️" in msg or "❌" in msg:
+                         st.error(msg)
+                     else:
+                         st.caption(msg)
+        else:
+             with st.expander("查看詳細數據來源"):
+                 for msg in chip_diag:
+                     st.text(msg)
     else:
-        st.info("尚無籌碼資料，請確認 FinMind Token 或等待盤後更新。")
+        st.error("⚠️ 無籌碼資料，請展開查看診斷報告")
+        with st.expander("🔍 連線診斷報告", expanded=True):
+            for msg in chip_diag:
+                st.write(msg)
 
 def plot_chart():
     if not os.path.exists(HIST_FILE): return None
@@ -680,17 +683,13 @@ def fetch_all():
     allow_live_fetch = (0<=now.weekday()<=4) and (now.time() >= time(8,45))
     
     # [核心修改: 雙軌排名邏輯]
-    
-    # 1. 鎖定「昨日」排名日期
     if len(days) > 1:
         date_prev = days[-2]
     else:
         date_prev = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
     
-    # 2. 獲取「昨日」排名名單
     ranks_prev, _ = get_ranks_strict(ft, date_prev) 
     
-    # 3. 獲取「今日」排名名單
     ranks_curr = ranks_prev 
     msg_src = f"名單:{date_prev}(昨日/盤中)"
     
@@ -700,7 +699,6 @@ def fetch_all():
             ranks_curr = ranks_today
             msg_src = f"名單:{today_str}(今日完整)"
     
-    # 4. 合併名單
     all_targets = list(set(ranks_curr + ranks_prev))
 
     pmap = {}
@@ -719,7 +717,7 @@ def fetch_all():
             try:
                 usage = sj_api.usage(); sj_usage_info = str(usage) if usage else "無法取得"
                 contracts = []
-                for c in all_targets: # 改查合併名單
+                for c in all_targets: 
                     if c in sj_api.Contracts.Stocks: contracts.append(sj_api.Contracts.Stocks[c])
                 
                 if contracts:
@@ -754,7 +752,6 @@ def fetch_all():
                 last_t = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
                 api_status_code = 2
 
-    # [測試修改]: 即使是盤後，如果 MIS 有抓到資料，就保留 "證交所MIS" 這個標籤，不強制改成 "FinMind盤後"
     if is_post_market:
         if data_source == "歷史": 
              data_source = "FinMind盤後"
@@ -762,7 +759,7 @@ def fetch_all():
 
     s_dt = (datetime.now()-timedelta(days=40)).strftime("%Y-%m-%d")
     
-    # --- 計算今日廣度 (使用 ranks_curr) ---
+    # --- 計算今日廣度 ---
     h_c, v_c = 0, 0
     dtls = []
     
@@ -775,13 +772,6 @@ def fetch_all():
         curr_p = info.get('z', info.get('price', 0)) 
         real_y = info.get('y', info.get('y_close', 0)) 
         
-        # [測試修改]: 註解掉下方程式碼，禁止在盤後用 FinMind 覆蓋 MIS 的即時價
-        # if is_post_market and not df.empty:
-        #     if df.iloc[-1]['date'] == today_str:
-        #         curr_p = float(df.iloc[-1]['close'])
-        #         if len(df) >= 2: real_y = float(df.iloc[-2]['close'])
-        #     if 'note' in info: del info['note']
-
         p_price = 0
         if real_y > 0: 
             p_price = real_y
@@ -794,7 +784,6 @@ def fetch_all():
         p_ma5 = 0
         p_stt = "-"
         
-        # 昨收相關
         if not df.empty and p_price > 0:
             closes = []
             if df.iloc[-1]['date'] == today_str:
@@ -815,9 +804,6 @@ def fetch_all():
             reason = ""
             if not allow_live_fetch: 
                 reason = "非交易時間"
-            # [測試修改]: 註解掉這行，讓它不要預設顯示 "盤後資料缺失"，而是顯示 MIS 的錯誤
-            # elif is_post_market:
-            #     reason = "盤後資料缺失"
             else:
                 if c in mis_debug_map:
                     reason = mis_debug_map[c] 
@@ -852,7 +838,7 @@ def fetch_all():
             "備註": note
         })
 
-    # --- 計算昨日廣度 (使用 ranks_prev) ---
+    # --- 計算昨日廣度 ---
     h_p, v_p = 0, 0
     for c in ranks_prev:
         df = get_hist(ft, c, s_dt)
@@ -915,8 +901,8 @@ def fetch_all():
     
     save_rec(d_cur, rec_t, br_c, t_chg, t_cur, t_pre, is_intra, v_c)
     
-    # 籌碼面處理 (Sponsor)
-    chips_data = get_chips_data(ft, d_cur) # 每日快取一次
+    # 籌碼面處理 (Sponsor) - 帶回診斷日誌
+    chips_data, chips_diag = get_chips_data(ft, d_cur)
     chip_strategy = get_chip_strategy(slope, chips_data)
     
     return {
@@ -926,7 +912,8 @@ def fetch_all():
         "t":last_t, "tc":t_chg, "slope":slope, "src_type": data_source,
         "raw":{'Date':d_cur,'Time':rec_t,'Breadth':br_c}, "src":msg_src,
         "api_status": api_status_code, "sj_err": sj_err, "sj_usage": sj_usage_info,
-        "chip_strat": chip_strategy
+        "chip_strat": chip_strategy,
+        "chip_diag": chips_diag # 新增傳回診斷
     }
 
 def run_app():
@@ -1045,7 +1032,8 @@ def run_app():
             
                 save_notify_state(n_state)
             
-            display_strategy_panel(data['slope'], open_br, br, n_state, data['chip_strat'])
+            # 將診斷日誌傳入 UI
+            display_strategy_panel(data['slope'], open_br, br, n_state, data['chip_strat'], data['chip_diag'])
 
             st.subheader(f"📅 {data['d']}")
             st.caption(f"名單基準日: {data['d_prev']}") 
@@ -1098,7 +1086,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (籌碼戰略整合版)...")
+        print("正在啟動 Streamlit 介面 (籌碼診斷修復版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
