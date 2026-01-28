@@ -18,9 +18,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.10 (自動掃描修復版)
+# 設定區 v9.55.11 (自動掃描+語法修復版)
 # ==========================================
-APP_VER = "v9.55.10 (自動掃描修復版)"
+APP_VER = "v9.55.11 (自動掃描+語法修復版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -204,7 +204,6 @@ def get_chips_data(token, target_date_str):
     res = {}
     
     # 1. 外資期貨 (掃描所有可能的名稱)
-    # 候選名單: 舊版名稱, 複數名稱, 單數名稱
     fut_candidates = [
         "TaiwanFuturesInstitutional", 
         "TaiwanFuturesInstitutionalInvestors",
@@ -215,10 +214,8 @@ def get_chips_data(token, target_date_str):
     if df_fut.empty:
         diagnosis.append(f"❌ 期貨: 掃描失敗 (最後錯誤: {fut_src})")
     else:
-        # 處理欄位
         col_name = 'name' if 'name' in df_fut.columns else 'institutional_investor'
         if col_name in df_fut.columns:
-            # 嘗試找 "外資" 或 "Foreign_Investor"
             df_foreign = df_fut[df_fut[col_name].astype(str).str.contains('外資|Foreign', case=False)].sort_values('date')
             
             if df_foreign.empty:
@@ -226,8 +223,6 @@ def get_chips_data(token, target_date_str):
             else:
                 latest = df_foreign.iloc[-1]
                 prev = df_foreign.iloc[-2] if len(df_foreign) >= 2 else latest
-                
-                # 處理 OI 欄位 (open_interest / open_interest_long?)
                 oi_col = 'open_interest' if 'open_interest' in latest else None
                 
                 if oi_col:
@@ -240,7 +235,7 @@ def get_chips_data(token, target_date_str):
         else:
             diagnosis.append(f"❌ 期貨: 找不到法人欄位 {list(df_fut.columns)}")
 
-    # 2. 選擇權 P/C Ratio (已知 TaiwanOptionDaily V4 可用)
+    # 2. 選擇權 P/C Ratio
     try:
         df_opt, opt_src = call_finmind_api_try_versions(["TaiwanOptionDaily"], "TXO", start_date, token)
         if df_opt.empty:
@@ -257,7 +252,7 @@ def get_chips_data(token, target_date_str):
                     diagnosis.append(f"✅ 選擇權: 成功 (PC={res['pc_ratio']}%)")
     except: pass
 
-    # 3. 融資維持率 (掃描名稱)
+    # 3. 融資維持率
     maint_candidates = [
         "TaiwanStockMarginMaintenanceRatio",
         "TaiwanStockAverageMarginMaintenanceRatio"
@@ -268,7 +263,6 @@ def get_chips_data(token, target_date_str):
         diagnosis.append(f"❌ 維持率: 掃描失敗 ({maint_src})")
     else:
         latest = df_maint.iloc[-1]
-        # 欄位可能是 margin_maintenance_ratio 或 MarginMaintenanceRatio
         col_maint = 'margin_maintenance_ratio' if 'margin_maintenance_ratio' in latest else 'MarginMaintenanceRatio'
         if col_maint in latest:
             res['margin_ratio'] = float(latest[col_maint])
@@ -276,7 +270,7 @@ def get_chips_data(token, target_date_str):
         else:
             diagnosis.append(f"❌ 維持率: 欄位異常 {list(latest.keys())}")
     
-    # 4. 融資餘額 (已知 TaiwanStockTotalMarginPurchaseShortSale V4 可用)
+    # 4. 融資餘額
     try:
         df_margin, margin_src = call_finmind_api_try_versions(["TaiwanStockTotalMarginPurchaseShortSale"], None, start_date, token)
         if not df_margin.empty:
@@ -1105,6 +1099,22 @@ def run_app():
             c3.metric("大盤MA5斜率", f"{sl:.2f}", icon)
             
             st.dataframe(data['df'], use_container_width=True, hide_index=True)
+        else: st.warning("⚠️ 無資料")
+    except Exception as e: 
+        st.error(f"Error: {e}")
+        st.text(traceback.format_exc())
+
+    if auto:
+        now = datetime.now(timezone(timedelta(hours=8)))
+        is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
+        if is_intra:
+            sec = 120
+            with st.sidebar:
+                t = st.empty()
+                for i in range(sec, 0, -1):
+                    t.info(f"⏳ {i}s")
+                    time_module.sleep(1)
+            st.rerun()
         else: st.sidebar.warning("⏸ 休市")
 
 if __name__ == "__main__":
@@ -1119,7 +1129,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (自動掃描修復版)...")
+        print("正在啟動 Streamlit 介面 (自動掃描+語法修復版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
