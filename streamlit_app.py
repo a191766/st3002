@@ -11,9 +11,9 @@ import time as time_module
 import random
 
 # ==========================================
-# 設定區 v9.39.0 (證交所連線終極修復版)
+# 設定區 v9.40.0 (證交所連線強化修復版)
 # ==========================================
-APP_VER = "v9.39.0 (證交所連線終極修復版)"
+APP_VER = "v9.40.0 (證交所連線強化修復版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -114,7 +114,7 @@ def get_opening_breadth(d_cur):
         df = pd.read_csv(HIST_FILE)
         if df.empty: return None
         if 'Total' not in df.columns: df['Total'] = 0
-        
+    
         df['Date'] = df['Date'].astype(str)
         df_today = df[df['Date'] == str(d_cur)].copy()
         if df_today.empty: return None
@@ -244,34 +244,43 @@ def get_hist(token, code, start):
 # [核心修復] 
 def get_prices_twse_mis(codes, info_map):
     """
-    V2 修正版：嚴格區分 TSE/OTC，禁止混合錯誤查詢
+    V3 終極修復版：
+    1. 增加 Headers 偽裝
+    2. 增加 Session 初始化 (取得 Cookie)
+    3. 嚴格區分 TSE/OTC
+    4. 增加除錯 Print
     """
     if not codes: return {}
     
+    print(f"DEBUG: 準備從 MIS 抓取 {len(codes)} 檔股票...")
+
     # Session 初始化
     session = requests.Session()
+    # 使用最新的 User-Agent
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/123.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
         "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
         "Connection": "keep-alive",
         "Referer": "https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw",
+        "Host": "mis.twse.com.tw",
         "X-Requested-With": "XMLHttpRequest",
     }
     session.headers.update(headers)
     
-    # 1. 取得 Cookie
+    # 1. 取得 Cookie (重要步驟，這是大部分抓不到的主因)
     try:
         ts_now = int(time_module.time() * 1000)
-        session.get(f"https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw&_={ts_now}", timeout=5)
-    except:
+        # 先訪問首頁建立 Session
+        session.get(f"https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw&_={ts_now}", timeout=10)
+        time_module.sleep(1) # 給一點時間種 Cookie
+    except Exception as e:
+        print(f"DEBUG: Session 初始化失敗 - {e}")
         return {}
     
-    time_module.sleep(random.uniform(0.5, 0.8))
-
-    # 2. 構建查詢字串 - [關鍵修正]
+    # 2. 構建查詢字串
     req_strs = []
-    chunk_size = 5 # 保持安全距離
+    chunk_size = 5 # 安全距離
     
     for i in range(0, len(codes), chunk_size):
         chunk = codes[i:i+chunk_size]
@@ -280,14 +289,12 @@ def get_prices_twse_mis(codes, info_map):
             c = str(c).strip()
             if not c: continue
             
-            # [重要] 這裡不再亂猜。如果不在 map 裡，預設為 tse (因為大多數熱門股都是上市)
-            # 絕對不能同時送出 tse_X 和 otc_X
+            # [重要] 判斷市場別，預設上市
             m_type = info_map.get(c, "twse").lower()
             
             if "tpex" in m_type or "otc" in m_type:
                 q_list.append(f"otc_{c}.tw")
             else:
-                # 預設上市
                 q_list.append(f"tse_{c}.tw")
                  
         if q_list:
@@ -296,29 +303,32 @@ def get_prices_twse_mis(codes, info_map):
     results = {}
     base_url = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
     
-    for q_str in req_strs:
+    print(f"DEBUG: 將送出 {len(req_strs)} 個請求...")
+
+    for idx, q_str in enumerate(req_strs):
         ts = int(time_module.time() * 1000)
         params = {"json": "1", "delay": "0", "_": ts, "ex_ch": q_str}
         
         try:
-            time_module.sleep(random.uniform(0.3, 0.5))
-            r = session.get(base_url, params=params, timeout=8)
+            time_module.sleep(random.uniform(0.5, 1.0)) # 稍微放慢速度避免被 Ban
+            r = session.get(base_url, params=params, timeout=10)
             
             if r.status_code == 200:
                 try:
                     data = r.json()
-                    # 證交所 API 有時回傳 msgArray，有時是空
-                    if 'msgArray' not in data: continue
+                    if 'msgArray' not in data: 
+                        print(f"DEBUG: 請求成功但無 msgArray (可能休市或被擋): {q_str}")
+                        continue
                     
                     for item in data['msgArray']:
                         c = item.get('c', '') 
-                        # 處理各種價格欄位
                         z = item.get('z', '-') # 最近成交
                         y = item.get('y', '-') # 昨收
                         
                         val = {}
                         if y != '-' and y != '':
-                            val['y'] = float(y)
+                            try: val['y'] = float(y)
+                            except: pass
                         
                         price = 0
                         # 嘗試解析成交價
@@ -339,10 +349,14 @@ def get_prices_twse_mis(codes, info_map):
                         if price > 0: val['z'] = price
                         
                         if c and val: results[c] = val
-
-                except: pass
-        except: pass
-            
+                except: 
+                    print(f"DEBUG: JSON 解析錯誤")
+            else:
+                print(f"DEBUG: 請求失敗 Status: {r.status_code}")
+        except Exception as e:
+             print(f"DEBUG: 連線例外 - {e}")
+        
+    print(f"DEBUG: 總共取得 {len(results)} 檔即時報價")
     return results
 
 def save_rec(d, t, b, tc, t_cur, t_prev, intra, total_v):
@@ -458,7 +472,7 @@ def plot_chart():
         
         start_t = pd.to_datetime(f"{base_d} 09:00:00")
         end_t = pd.to_datetime(f"{base_d} 13:30:00")
-        
+         
         base = alt.Chart(chart_data).encode(x=alt.X('DT:T', title='時間', axis=alt.Axis(format='%H:%M'), scale=alt.Scale(domain=[start_t, end_t])))
         y_ax = alt.Axis(format='%', values=[i/10 for i in range(11)], tickCount=11, labelOverlap=False)
         l_b = base.mark_line(color='#007bff').encode(y=alt.Y('Breadth', title=None, scale=alt.Scale(domain=[0,1], nice=False), axis=y_ax))
@@ -714,7 +728,7 @@ def run_app():
             hist_max, hist_min = get_intraday_extremes(data['d'])
             today_max = br if hist_max is None else max(hist_max, br)
             today_min = br if hist_min is None else min(hist_min, br)
-       
+        
             n_state = load_notify_state(data['d']) 
 
             if open_br is not None and n_state['intraday_trend'] is None:
@@ -735,12 +749,12 @@ def run_app():
                     if msg: send_tg(tg_tok, tg_id, msg)
                 
                 n_state['last_stt'] = stt 
-                 
+                
                 rap_msg, rid = check_rapid(data['raw'])
                 if rap_msg and rid != n_state['last_rap']:
                     send_tg(tg_tok, tg_id, rap_msg)
                     n_state['last_rap'] = rid
-                 
+                
                 if open_br is not None:
                     is_dev_high = (br >= open_br + OPEN_DEV_THR)
                     is_dev_low = (br <= open_br - OPEN_DEV_THR)
@@ -778,7 +792,7 @@ def run_app():
                         n_state['notified_rise_low'] = True
                 else:
                     n_state['notified_rise_low'] = False
-                 
+            
                 save_notify_state(n_state)
             
             display_strategy_panel(data['slope'], open_br, br, n_state)
