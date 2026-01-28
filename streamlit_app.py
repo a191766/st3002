@@ -18,9 +18,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.7 (API名稱校正版)
+# 設定區 v9.55.8 (鎖定V3修復版)
 # ==========================================
-APP_VER = "v9.55.7 (API名稱校正版)"
+APP_VER = "v9.55.8 (鎖定V3修復版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -156,12 +156,11 @@ def get_api():
         return None, str(e)
 
 # ==========================================
-# 籌碼面資料處理 (Smart Request)
+# 籌碼面資料處理 (Direct API - V3 Fixed)
 # ==========================================
 def call_finmind_api(dataset, data_id, start_date, token, use_v3=False):
     """
     智慧呼叫：自動切換 V4/V3 端點
-    有些 Sponsor 資料集(如維持率)可能還在 V3
     """
     version = "v3" if use_v3 else "v4"
     url = f"https://api.finmindtrade.com/api/{version}/data"
@@ -186,7 +185,7 @@ def call_finmind_api(dataset, data_id, start_date, token, use_v3=False):
             else:
                 return "Unknown Response Format"
         else:
-            return f"HTTP {r.status_code}: {r.text[:100]}"
+            return f"HTTP {r.status_code} ({version}): {r.text[:100]}"
             
     except Exception as e:
         return f"Exception: {str(e)}"
@@ -204,19 +203,15 @@ def get_chips_data(token, target_date_str):
     
     res = {}
     
-    # 1. 外資期貨 (優先嘗試 V4，失敗轉 V3)
-    # dataset 名稱: TaiwanFuturesInstitutional
+    # 1. 外資期貨 (TaiwanFuturesInstitutional) -> 強制 V3
     try:
-        df_fut = call_finmind_api("TaiwanFuturesInstitutional", "TX", start_date, token)
+        # 直接指定 use_v3=True
+        df_fut = call_finmind_api("TaiwanFuturesInstitutional", "TX", start_date, token, use_v3=True)
         
-        # 如果 V4 失敗 (422)，嘗試 V3
-        if isinstance(df_fut, str) and "422" in df_fut:
-             df_fut = call_finmind_api("TaiwanFuturesInstitutional", "TX", start_date, token, use_v3=True)
-             
         if isinstance(df_fut, str):
             diagnosis.append(f"❌ 期貨API失敗: {df_fut}")
         elif df_fut.empty:
-            diagnosis.append(f"⚠️ 期貨: 無資料")
+            diagnosis.append(f"⚠️ 期貨: 無資料 (日期: {start_date} ~ {target_date_str})")
         else:
             col_name = 'name' if 'name' in df_fut.columns else 'institutional_investor'
             if col_name in df_fut.columns:
@@ -226,7 +221,7 @@ def get_chips_data(token, target_date_str):
                 else:
                     latest = df_foreign.iloc[-1]
                     prev = df_foreign.iloc[-2] if len(df_foreign) >= 2 else latest
-                    # FinMind open_interest 通常是未平倉口數
+                    
                     res['fut_oi'] = int(latest.get('open_interest', 0))
                     prev_oi = int(prev.get('open_interest', 0))
                     res['fut_oi_chg'] = res['fut_oi'] - prev_oi
@@ -237,9 +232,9 @@ def get_chips_data(token, target_date_str):
     except Exception as e:
         diagnosis.append(f"❌ 期貨程式錯誤: {str(e)}")
 
-    # 2. 選擇權 P/C Ratio (TaiwanOptionDaily) - 這個是成功的，保持原樣
+    # 2. 選擇權 P/C Ratio (TaiwanOptionDaily) -> V4 OK
     try:
-        df_opt = call_finmind_api("TaiwanOptionDaily", "TXO", start_date, token)
+        df_opt = call_finmind_api("TaiwanOptionDaily", "TXO", start_date, token, use_v3=False)
         if isinstance(df_opt, str):
             diagnosis.append(f"❌ 選擇權API失敗: {df_opt}")
         elif df_opt.empty:
@@ -259,17 +254,14 @@ def get_chips_data(token, target_date_str):
     except Exception as e:
         diagnosis.append(f"❌ 選擇權程式錯誤: {str(e)}")
 
-    # 3. 融資維持率 (TaiwanStockMarginMaintenanceRatio)
-    # 這個很大機率在 V3，優先試 V3
+    # 3. 融資維持率 (TaiwanStockMarginMaintenanceRatio) -> 強制 V3
     try:
         df_maint = call_finmind_api("TaiwanStockMarginMaintenanceRatio", None, start_date, token, use_v3=True)
-        if isinstance(df_maint, str) and "422" in df_maint: # 如果 V3 也沒，試試 V4
-             df_maint = call_finmind_api("TaiwanStockMarginMaintenanceRatio", None, start_date, token, use_v3=False)
-
+        
         if isinstance(df_maint, str):
             diagnosis.append(f"❌ 維持率API失敗: {df_maint}")
         elif df_maint.empty:
-            diagnosis.append("⚠️ 維持率: 無資料")
+            diagnosis.append("⚠️ 維持率: 無資料 (Sponsor權限?)")
         else:
             latest = df_maint.iloc[-1]
             res['margin_ratio'] = float(latest['margin_maintenance_ratio'])
@@ -277,31 +269,24 @@ def get_chips_data(token, target_date_str):
     except Exception as e:
         diagnosis.append(f"❌ 維持率程式錯誤: {str(e)}")
     
-    # 4. 融資餘額 (修正: 改用 TaiwanStockTotalMarginPurchaseShortSale)
-    # 這是抓「大盤整體」的，不需要 data_id
+    # 4. 融資餘額 (TaiwanStockTotalMarginPurchaseShortSale) -> V4 OK
     try:
-        df_margin = call_finmind_api("TaiwanStockTotalMarginPurchaseShortSale", None, start_date, token)
+        df_margin = call_finmind_api("TaiwanStockTotalMarginPurchaseShortSale", None, start_date, token, use_v3=False)
         if isinstance(df_margin, str):
             diagnosis.append(f"❌ 融資API失敗: {df_margin}")
         elif df_margin.empty:
             diagnosis.append("⚠️ 融資餘額: 無資料")
         else:
-            # 篩選 MarginPurchaseMoney (融資金額)
-            # 欄位: TodayBalance, YesBalance, buy, sell, date, name (MarginPurchaseMoney)
             df_money = df_margin[df_margin['name'] == 'MarginPurchaseMoney'].sort_values('date')
-            
             if not df_money.empty:
                 latest = df_money.iloc[-1]
                 prev = df_money.iloc[-2] if len(df_money) >= 2 else latest
-                
-                # 單位是元，轉成億比較好讀
                 curr_bal = float(latest['TodayBalance'])
                 prev_bal = float(prev['TodayBalance'])
-                
-                res['margin_chg'] = round((curr_bal - prev_bal) / 100000000, 2) # 變動(億)
+                res['margin_chg'] = round((curr_bal - prev_bal) / 100000000, 2) 
                 diagnosis.append(f"✅ 大盤融資餘額: 成功 ({latest['date']} 變動:{res['margin_chg']}億)")
             else:
-                diagnosis.append(f"⚠️ 融資餘額: 找不到 MarginPurchaseMoney 項目")
+                diagnosis.append(f"⚠️ 融資餘額: 找不到 MarginPurchaseMoney")
     except Exception as e:
         diagnosis.append(f"❌ 融資餘額程式錯誤: {str(e)}")
 
@@ -320,43 +305,30 @@ def get_chip_strategy(ma5_slope, chips):
     act = "觀察技術面為主"
     color = "info"
     
-    # 1. 殺盤前兆 (空頭順勢/轉折) - 融資死不退 (margin_chg > 0 代表增加)
     if ma5_slope <= 0 and fut_oi < -10000 and margin_chg > 0:
         sig = "📉 殺戮盤 (散戶接刀)"
         act = "主力殺、散戶接，籌碼極亂。全力放空，不要猜底。"
         color = "error"
-        
-    # 2. 多頭燃料充足 (多頭順勢)
     elif ma5_slope > 0 and fut_oi > 10000 and pc_ratio > 110:
         sig = "🚀 火力全開 (外資助攻)"
         act = "外資期現貨同步作多，支撐強勁。多單抱緊，甚至加碼。"
         color = "success"
-        
-    # 3. 絕佳抄底機會 (空頭反轉) - 斷頭
     elif ma5_slope < 0 and margin_ratio < 135: 
         sig = "💎 遍地黃金 (斷頭止跌)"
         act = "融資斷頭多殺多，通常是波段最低點。大膽分批買進。"
         color = "primary"
-        
-    # 4. 多頭力竭/拉高出貨 (多頭警示)
-    elif ma5_slope > 0 and fut_chg < -3000 and margin_chg > 5: # 融資大增 5億
+    elif ma5_slope > 0 and fut_chg < -3000 and margin_chg > 5: 
         sig = "⚠️ 籌碼渙散 (拉高出貨)"
         act = "指數漲但外資大逃亡，散戶在接最後一棒。獲利了結，小心反轉。"
         color = "warning"
-        
-    # 5. 震盪盤 - 潛伏期 (準備噴出)
     elif abs(ma5_slope) < 10 and fut_chg > 2000 and pc_ratio > 110:
         sig = "🟩 潛伏期 (主力吃貨)"
         act = "盤整中見外資偷佈局多單。建議提前建倉，等待噴出。"
         color = "success"
-    
-    # 6. 震盪盤 - 殺盤前兆
     elif abs(ma5_slope) < 10 and margin_ratio < 145:
         sig = "🟥 溫水煮青蛙 (瀕臨斷頭)"
         act = "盤整但維持率過低，隨時引發多殺多。空手觀望。"
         color = "error"
-        
-    # 7. 假突破警戒
     elif ma5_slope > 0 and fut_oi < -3000:
         sig = "🟨 假突破警戒"
         act = "現貨漲但期貨空單留倉。可能是假突破，多單要設緊停損。"
@@ -1163,7 +1135,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (API名稱校正版)...")
+        print("正在啟動 Streamlit 介面 (鎖定V3修復版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
