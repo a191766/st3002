@@ -11,9 +11,9 @@ import time as time_module
 import random
 
 # ==========================================
-# 設定區 v9.33.0 (真實連線修正版)
+# 設定區 v9.34.0 (語法修復與真實連線版)
 # ==========================================
-APP_VER = "v9.33.0 (真實連線修正版)"
+APP_VER = "v9.34.0 (語法修復與真實連線版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -227,30 +227,38 @@ def get_hist(token, code, start):
     try: return api.taiwan_stock_daily(stock_id=code, start_date=start)
     except: return pd.DataFrame()
 
-# [關鍵修正] 使用 Session 進行持久化連線，並預先獲取 Cookie
+# [核心升級] 動態 User-Agent 與 Session 管理
+def get_random_agent():
+    agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0"
+    ]
+    return random.choice(agents)
+
 def get_prices_twse_mis(codes, info_map):
     if not codes: return {}
     
-    # 1. 取得或建立 Session (這能確保我們像個真人一樣有餅乾)
+    # 1. 取得或初始化 Session (這能確保我們拿到 Cookie)
     if 'mis_session' not in st.session_state:
         session = requests.Session()
         session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": get_random_agent(),
             "Accept": "application/json, text/javascript, */*; q=0.01",
             "Referer": "https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw",
             "X-Requested-With": "XMLHttpRequest"
         })
-        # [最重要的一步] 先去首頁拿 Cookie，不然直接戳 API 會被擋
+        # [關鍵步驟] 訪問首頁取得 Cookie
         try:
             session.get("https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw", timeout=5)
         except:
-            pass # 這裡失敗的話後面可能也會掛，但先不管
+            pass
         st.session_state['mis_session'] = session
     
     session = st.session_state['mis_session']
     
     req_strs = []
-    chunk_size = 35 # 保守一點
+    chunk_size = 35
     
     for i in range(0, len(codes), chunk_size):
         chunk = codes[i:i+chunk_size]
@@ -268,7 +276,6 @@ def get_prices_twse_mis(codes, info_map):
     for q_str in req_strs:
         try:
             url = base_url + q_str
-            # 使用已經有 Cookie 的 session 發請求
             time_module.sleep(random.uniform(0.1, 0.4))
             r = session.get(url, timeout=5)
             
@@ -293,12 +300,12 @@ def get_prices_twse_mis(codes, info_map):
                              try: price = float(item.get('a').split('_')[0])
                              except: pass
                         
-                        # [修正] 如果 price 是 0，就讓它 0，不要用昨收補，這樣才知道是真的沒抓到
+                        # 只回傳大於 0 的價格，不補昨收，確保真實性
                         if price > 0: val['z'] = price
                         
                         if c and val: results[c] = val
         except: 
-            # 如果 Session 過期或失敗，清除它以便下次重建
+            # 如果連線失敗，清除 Session 下次重來
             if 'mis_session' in st.session_state:
                 del st.session_state['mis_session']
             pass
@@ -448,7 +455,11 @@ def fetch_all():
     else:
         msg_src = f"名單:{target_date_for_ranks} {'(硬碟)' if from_disk else '(新抓)'}"
 
-    pmap = {}
+    # 快取機制: 只要抓到過就存起來，避免下一次連線失敗變 0
+    if 'price_cache' not in st.session_state:
+        st.session_state['price_cache'] = {}
+    
+    pmap = st.session_state['price_cache']
     data_source = "歷史"
     last_t = "無即時資料"
     api_status_code = 0 
@@ -477,23 +488,27 @@ def fetch_all():
                                 }
                         time_module.sleep(0.2)
                     
-                    if len(pmap) > 0:
-                        data_source = "永豐API"
-                        last_t = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
-                        api_status_code = 2
+                    data_source = "永豐API"
+                    last_t = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
+                    api_status_code = 2
             except: pass
         
-        # 2. MIS (Shioaji 沒抓到的補)
+        # 2. MIS (只補快取沒有的，或全部更新)
         missing_codes = [c for c in final_codes if c not in pmap]
-        if missing_codes:
-            mis_data = get_prices_twse_mis(missing_codes, info_map)
+        # 如果缺很多，或者永豐沒通，就全抓
+        target_codes = final_codes if (len(missing_codes) > 10 or api_status_code != 2) else missing_codes
+
+        if target_codes:
+            mis_data = get_prices_twse_mis(target_codes, info_map)
             for c, val in mis_data.items():
                 pmap[c] = val
             
-            if len(mis_data) > 0 and data_source == "歷史":
+            if api_status_code != 2 and len(mis_data) > 0:
                 data_source = "證交所MIS"
                 last_t = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
                 api_status_code = 2
+
+        st.session_state['price_cache'] = pmap
 
     elif is_post_market:
         data_source = "FinMind盤後資料"
@@ -510,19 +525,16 @@ def fetch_all():
         
         info = pmap.get(c, {})
         curr_p = info.get('price', 0)
-        real_y = info.get('y_close', 0) # 優先使用即時源的昨收
+        real_y = info.get('y_close', 0)
         
         if is_post_market and not df.empty:
             if df.iloc[-1]['date'] == today_str:
                 curr_p = float(df.iloc[-1]['close'])
                 if len(df) >= 2: real_y = float(df.iloc[-2]['close'])
 
-        # 昨收與昨 MA5
         p_price = 0
-        if real_y > 0: 
-            p_price = real_y
-        elif not df.empty:
-            p_price = float(df.iloc[-1]['close']) 
+        if real_y > 0: p_price = real_y
+        elif not df.empty: p_price = float(df.iloc[-1]['close'])
 
         p_ma5 = 0
         p_stt = "-"
@@ -530,11 +542,8 @@ def fetch_all():
         if not df.empty and p_price > 0:
             last_date_db = df.iloc[-1]['date']
             closes = []
-            if last_date_db == today_str:
-                 closes = df['close'].tail(6).tolist()[:-1] 
-            else:
-                 closes = df['close'].tail(4).tolist()
-                 closes.append(p_price) 
+            if last_date_db == today_str: closes = df['close'].tail(6).tolist()[:-1] 
+            else: closes = df['close'].tail(4).tolist(); closes.append(p_price)
             
             if len(closes) >= 5:
                 p_ma5 = sum(closes[-5:]) / 5
@@ -546,10 +555,11 @@ def fetch_all():
         c_stt = "-"
         note = ""
         
-        # [絕對不補] 沒報價就沒報價，不補昨收
+        # [邏輯修正] 如果有快取，這裡就不會是 0
+        # 如果還是 0，且有昨收，也不補，直接顯示 0 (真實呈現)
         if curr_p == 0: 
             c_stt = "⚠️無報價"
-            if p_price > 0: note = f"昨收{p_price} "
+            if p_price > 0: note = f"昨收{p_price}"
 
         if curr_p > 0 and p_price > 0 and not df.empty:
             hist_closes = df['close'].tail(4).tolist()
@@ -576,7 +586,6 @@ def fetch_all():
     try:
         tw = get_hist(ft, "TAIEX", s_dt)
         if not tw.empty:
-            # 大盤也用 MIS
             mis_tw = get_prices_twse_mis(["t00"], {"t00":"twse"}) 
             t_curr = mis_tw.get("t00", {}).get("z", 0)
             t_y = mis_tw.get("t00", {}).get("y", 0)
@@ -615,6 +624,160 @@ def fetch_all():
         "raw":{'Date':d_cur,'Time':rec_t,'Breadth':br_c}, "src":msg_src,
         "api_status": api_status_code, "sj_err": sj_err, "sj_usage": sj_usage_info
     }
+
+def run_app():
+    st.title(f"📈 {APP_VER}")
+    
+    with st.sidebar:
+        st.subheader("設定")
+        auto = st.checkbox("自動更新", value=False)
+        fin_ok = "🟢" if get_finmind_token() else "🔴"
+        st.caption(f"FinMind Token: {fin_ok}")
+        tg_tok = st.text_input("TG Token", value=st.secrets.get("telegram",{}).get("token",""), type="password")
+        tg_id = st.text_input("Chat ID", value=st.secrets.get("telegram",{}).get("chat_id",""))
+        if tg_tok and tg_id: st.success("TG Ready")
+        
+        st.write("---")
+        if st.button("⚡ 強制清除快取 (重抓名單)", type="primary"):
+            st.cache_data.clear()
+            if os.path.exists(RANK_FILE): os.remove(RANK_FILE)
+            st.toast("快取已清除，正在重新抓取名單...", icon="🚀")
+            time_module.sleep(1)
+            st.rerun()
+            
+        if st.button("🗑️ 重置圖表資料"):
+            if os.path.exists(HIST_FILE):
+                os.remove(HIST_FILE)
+                st.toast("歷史資料已刪除，請重新整理", icon="🗑️")
+                time_module.sleep(1)
+                st.rerun()
+
+    if st.button("🔄 刷新"): st.rerun()
+
+    try:
+        data = fetch_all()
+        if isinstance(data, str): st.error(f"❌ {data}")
+        elif data:
+            st.sidebar.info(f"報價來源: {data['src_type']}")
+            st.sidebar.caption(f"永豐API額度: {data.get('sj_usage', '未知')}")
+            
+            status_code = data['api_status']
+            if status_code == 2: st.sidebar.success("🟢 永豐連線正常")
+            elif status_code == 1: st.sidebar.warning("🟠 流量/連線異常 (忙線)")
+            else:
+                if data['sj_err']: st.sidebar.error(f"🔴 連線失敗: {data['sj_err']}")
+                else: st.sidebar.error("🔴 未連線")
+            
+            br = data['br']
+            open_br = get_opening_breadth(data['d'])
+            
+            hist_max, hist_min = get_intraday_extremes(data['d'])
+            today_max = br if hist_max is None else max(hist_max, br)
+            today_min = br if hist_min is None else min(hist_min, br)
+            
+            n_state = load_notify_state(data['d']) 
+
+            if open_br is not None and n_state['intraday_trend'] is None:
+                if br >= (open_br + 0.05):
+                    n_state['intraday_trend'] = 'up'
+                    if tg_tok and tg_id: send_tg(tg_tok, tg_id, f"🔒 <b>【趨勢鎖定】</b>\n廣度先達開盤+5% (目前{br:.1%})，今日確認偏多！")
+                elif br <= (open_br - 0.05):
+                    n_state['intraday_trend'] = 'down'
+                    if tg_tok and tg_id: send_tg(tg_tok, tg_id, f"🔒 <b>【趨勢鎖定】</b>\n廣度先達開盤-5% (目前{br:.1%})，今日確認偏空！")
+
+            if tg_tok and tg_id:
+                stt = 'normal'
+                if br >= BREADTH_THR: stt = 'hot'
+                elif br <= BREADTH_LOW: stt = 'cold'
+                
+                if stt != n_state['last_stt']:
+                    msg = f"🔥 過熱: {br:.1%}" if stt=='hot' else (f"❄️ 冰點: {br:.1%}" if stt=='cold' else "")
+                    if msg: send_tg(tg_tok, tg_id, msg)
+                    n_state['last_stt'] = stt 
+                
+                rap_msg, rid = check_rapid(data['raw'])
+                if rap_msg and rid != n_state['last_rap']:
+                    send_tg(tg_tok, tg_id, rap_msg)
+                    n_state['last_rap'] = rid
+                
+                if open_br is not None:
+                    is_dev_high = (br >= open_br + OPEN_DEV_THR)
+                    is_dev_low = (br <= open_br - OPEN_DEV_THR)
+                    
+                    if is_dev_high and not n_state['was_dev_high']:
+                        n_state['was_dev_high'] = True
+                    
+                    if is_dev_low and not n_state['was_dev_low']:
+                        n_state['was_dev_low'] = True
+                
+                if br <= (today_max - 0.05):
+                    if not n_state['notified_drop_high']:
+                        should_notify = False
+                        if data['slope'] > 0 and n_state['intraday_trend'] == 'up': should_notify = True
+                        if data['slope'] < 0 and n_state['intraday_trend'] == 'up': should_notify = True
+                        
+                        if should_notify:
+                            msg = f"📉 <b>【高點回落】</b>\n今日高點: {today_max:.1%}\n目前廣度: {br:.1%}\n已回檔 5%"
+                            send_tg(tg_tok, tg_id, msg)
+                            
+                        n_state['notified_drop_high'] = True
+                else:
+                    n_state['notified_drop_high'] = False
+                
+                if br >= (today_min + 0.05):
+                    if not n_state['notified_rise_low']:
+                        should_notify = False
+                        if data['slope'] < 0 and n_state['intraday_trend'] == 'down': should_notify = True
+                        if data['slope'] > 0 and n_state['intraday_trend'] == 'down': should_notify = True
+                        
+                        if should_notify:
+                            msg = f"🚀 <b>【低點反彈】</b>\n今日低點: {today_min:.1%}\n目前廣度: {br:.1%}\n已反彈 5%"
+                            send_tg(tg_tok, tg_id, msg)
+
+                        n_state['notified_rise_low'] = True
+                else:
+                    n_state['notified_rise_low'] = False
+                
+                save_notify_state(n_state)
+            
+            display_strategy_panel(data['slope'], open_br, br, n_state)
+
+            st.subheader(f"📅 {data['d']}")
+            st.caption(f"名單基準日: {data['d_prev']}") 
+            st.info(f"{data['src']} | 更新: {data['t']}")
+            chart = plot_chart()
+            if chart: st.altair_chart(chart, use_container_width=True)
+            
+            c1,c2,c3 = st.columns(3)
+            c1.metric("今日廣度", f"{br:.1%}", f"{data['h']}/{data['v']}")
+            
+            caption_str = f"昨日廣度: {data['br_p']:.1%} ({data['h_p']}/{data['v_p']})"
+            if open_br:
+                caption_str += f" | 開盤: {open_br:.1%}"
+            else:
+                caption_str += " | 開盤: 等待中..."
+            c1.caption(caption_str)
+            
+            c2.metric("大盤漲跌", f"{data['tc']:.2%}")
+            sl = data['slope']; icon = "📈 正" if sl > 0 else "📉 負"
+            c3.metric("大盤MA5斜率", f"{sl:.2f}", icon)
+            
+            st.dataframe(data['df'], use_container_width=True, hide_index=True)
+        else: st.warning("⚠️ 無資料")
+    except Exception as e: st.error(f"Error: {e}")
+
+    if auto:
+        now = datetime.now(timezone(timedelta(hours=8)))
+        is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
+        if is_intra:
+            sec = 120
+            with st.sidebar:
+                t = st.empty()
+                for i in range(sec, 0, -1):
+                    t.info(f"⏳ {i}s")
+                    time_module.sleep(1)
+            st.rerun()
+        else: st.sidebar.warning("⏸ 休市")
 
 if __name__ == "__main__":
     if 'streamlit' in sys.modules: run_app()
