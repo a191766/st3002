@@ -18,9 +18,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.5 (終極直連版)
+# 設定區 v9.55.6 (深度除錯版)
 # ==========================================
-APP_VER = "v9.55.5 (終極直連版)"
+APP_VER = "v9.55.6 (深度除錯版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -156,10 +156,10 @@ def get_api():
         return None, str(e)
 
 # ==========================================
-# 籌碼面資料處理 (Direct API)
+# 籌碼面資料處理 (Direct API + Debug)
 # ==========================================
 def call_finmind_api(dataset, data_id, start_date, token):
-    """直接呼叫 FinMind REST API，避開 SDK 版本問題"""
+    """直接呼叫 FinMind REST API，回傳詳細錯誤代碼"""
     url = "https://api.finmindtrade.com/api/v4/data"
     params = {
         "dataset": dataset,
@@ -171,16 +171,23 @@ def call_finmind_api(dataset, data_id, start_date, token):
         
     try:
         # 使用 impersonate 避免被擋
-        r = cffi_requests.get(url, params=params, impersonate="chrome", timeout=10)
+        r = cffi_requests.get(url, params=params, impersonate="chrome", timeout=15)
+        
         if r.status_code == 200:
             res_json = r.json()
             if "data" in res_json:
                 return pd.DataFrame(res_json["data"])
             elif "msg" in res_json:
-                return f"API Error: {res_json['msg']}"
-        return "HTTP Error"
+                return f"API Msg: {res_json['msg']}"
+            else:
+                return "Unknown Response Format"
+        else:
+            # [修正] 回傳詳細的 HTTP 狀態碼與錯誤訊息
+            err_msg = r.text[:200] if r.text else "No content"
+            return f"HTTP {r.status_code}: {err_msg}"
+            
     except Exception as e:
-        return str(e)
+        return f"Exception: {str(e)}"
 
 @st.cache_data(ttl=43200) # 12小時快取
 def get_chips_data(token, target_date_str):
@@ -203,9 +210,7 @@ def get_chips_data(token, target_date_str):
         elif df_fut.empty:
             diagnosis.append(f"⚠️ 期貨: 無資料 (日期: {start_date}~)")
         else:
-            # 確保欄位名稱 (name/institutional_investor)
             col_name = 'name' if 'name' in df_fut.columns else 'institutional_investor'
-            
             if col_name in df_fut.columns:
                 df_foreign = df_fut[df_fut[col_name] == '外資'].sort_values('date')
                 if df_foreign.empty:
@@ -213,7 +218,6 @@ def get_chips_data(token, target_date_str):
                 else:
                     latest = df_foreign.iloc[-1]
                     prev = df_foreign.iloc[-2] if len(df_foreign) >= 2 else latest
-                    
                     res['fut_oi'] = int(latest.get('open_interest', 0))
                     prev_oi = int(prev.get('open_interest', 0))
                     res['fut_oi_chg'] = res['fut_oi'] - prev_oi
@@ -234,13 +238,9 @@ def get_chips_data(token, target_date_str):
         else:
             last_date = df_opt['date'].max()
             df_today = df_opt[df_opt['date'] == last_date]
-            
-            # FinMind 欄位通常是 'CallPut' 或 'call_put'，且值為 'Call'/'Put'
-            # 這裡做自動偵測
             cp_col = 'call_put' if 'call_put' in df_today.columns else 'CallPut'
             
             if cp_col in df_today.columns:
-                # 轉小寫比較比較保險
                 put_oi = df_today[df_today[cp_col].str.lower() == 'put']['open_interest'].sum()
                 call_oi = df_today[df_today[cp_col].str.lower() == 'call']['open_interest'].sum()
                 
@@ -251,13 +251,11 @@ def get_chips_data(token, target_date_str):
                     diagnosis.append("⚠️ 選擇權: Call OI 為 0")
             else:
                 diagnosis.append(f"❌ 選擇權: 找不到買賣權欄位 {list(df_today.columns)}")
-                
     except Exception as e:
         diagnosis.append(f"❌ 選擇權程式錯誤: {str(e)}")
 
     # 3. 融資維持率 (TaiwanStockMarginMaintenanceRatio)
     try:
-        # 這是全市場數據，不需要 data_id
         df_maint = call_finmind_api("TaiwanStockMarginMaintenanceRatio", None, start_date, token)
         if isinstance(df_maint, str):
             diagnosis.append(f"❌ 維持率API失敗: {df_maint}")
@@ -272,7 +270,6 @@ def get_chips_data(token, target_date_str):
     
     # 4. 融資餘額 (TaiwanStockMarginPurchaseShortSale)
     try:
-        # 用 0050 當作散戶指標 (因為 TSE 常常抓不到)
         df_margin = call_finmind_api("TaiwanStockMarginPurchaseShortSale", "0050", start_date, token)
         if isinstance(df_margin, str):
             diagnosis.append(f"❌ 融資API失敗: {df_margin}")
@@ -284,9 +281,7 @@ def get_chips_data(token, target_date_str):
             
             # 使用 MarginPurchaseTodayBalance (今日融資餘額張數)
             col_bal = 'MarginPurchaseTodayBalance'
-            if col_bal not in latest:
-                # 嘗試找全小寫
-                col_bal = 'margin_purchase_today_balance'
+            if col_bal not in latest: col_bal = 'margin_purchase_today_balance'
             
             if col_bal in latest:
                 curr_bal = float(latest[col_bal])
@@ -659,7 +654,6 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
     
     if chip_strategy and chip_strategy['data']:
         d = chip_strategy['data']
-        # 檢查是否有 0 的情況
         has_missing = (d.get('fut_oi',0) == 0) or (d.get('margin_ratio',0) == 0)
         
         c1, c2, c3, c4 = st.columns(4)
@@ -681,7 +675,7 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
         if has_missing:
              with st.expander("⚠️ 部分數據缺失 (點擊查看原因)", expanded=True):
                  for msg in chip_diag:
-                     if "⚠️" in msg or "❌" in msg:
+                     if "⚠️" in msg or "❌" in msg or "HTTP" in msg:
                          st.error(msg)
                      else:
                          st.caption(msg)
@@ -1143,7 +1137,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (終極直連版)...")
+        print("正在啟動 Streamlit 介面 (深度除錯版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
