@@ -18,9 +18,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.18 (維持率欄位修正+圖表防呆版)
+# 設定區 v9.55.19 (圖表崩潰修復版)
 # ==========================================
-APP_VER = "v9.55.18 (維持率欄位修正+圖表防呆版)"
+APP_VER = "v9.55.19 (圖表崩潰修復版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -272,7 +272,7 @@ def get_chips_data(token, target_date_str):
             res['margin_ratio'] = float(latest[col_maint])
             diagnosis.append(f"✅ 維持率(官方): 成功 ({res['margin_ratio']}%)")
         else:
-            # 如果找不到，嘗試其他變體 (雖然不太可能)
+            # 如果找不到，嘗試其他變體
             alt_cols = [c for c in latest.index if 'Margin' in c]
             if alt_cols:
                  res['margin_ratio'] = float(latest[alt_cols[0]])
@@ -707,23 +707,22 @@ def plot_chart():
                 df_today = df[df['Time'] >= "09:00"].copy()
                 
                 if not df_today.empty:
-                    # 如果今天有資料，就用今天
                     df_today = df_today.sort_values(['Date', 'Time'])
                     last_date = df_today.iloc[-1]['Date']
                     
-                    # 檢查這一天是否為「今天」
-                    # 如果今天還沒開盤，則使用最近一個交易日
                     chart_data = df_today[df_today['Date'] == last_date].copy()
                     base_d = last_date
         except: pass
 
-    # 如果還是沒資料 (完全沒歷史檔或盤前)，建立空圖表
+    # [關鍵修正]: 確保 scale domain 也是 Pandas Timestamp
     if chart_data.empty or base_d == "":
         base_d = datetime.now().strftime("%Y-%m-%d")
-        start = datetime.strptime(f"{base_d} 09:00", "%Y-%m-%d %H:%M")
-        end = datetime.strptime(f"{base_d} 13:30", "%Y-%m-%d %H:%M")
+        # 使用 pd.to_datetime 產生 scale 需要的 Timestamp
+        start = pd.to_datetime(f"{base_d} 09:00:00")
+        end = pd.to_datetime(f"{base_d} 13:30:00")
         chart_data = pd.DataFrame() # 確保是空 DataFrame
     else:
+        # 使用 pd.to_datetime 產生 scale 需要的 Timestamp
         start = pd.to_datetime(f"{base_d} 09:00:00")
         end = pd.to_datetime(f"{base_d} 13:30:00")
         
@@ -731,15 +730,15 @@ def plot_chart():
         chart_data = chart_data.dropna(subset=['DT'])
         chart_data['T_S'] = (chart_data['Taiex_Change']*10)+0.5
 
-    # --- Altair 圖表設定 (嚴格遵守使用者要求) ---
-    
-    # 1. 座標軸設定
+    # Altair Chart Definition
+    # X軸: 固定 09:00 ~ 13:30
     x_scale = alt.Scale(domain=[start, end])
     y_vals = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0] # 10%一格
     y_axis = alt.Axis(format='%', values=y_vals, tickCount=11, title=None) # 取消"廣度"文字
     
     if chart_data.empty:
         # 空底圖: 只畫框線與警戒線
+        # 這裡的 DT 只是為了給 Altair 一個欄位參考，數值不會顯示
         base = alt.Chart(pd.DataFrame({'DT': [start, end]})).mark_point(opacity=0).encode(
             x=alt.X('DT:T', title=None, axis=alt.Axis(format='%H:%M'), scale=x_scale),
             y=alt.Y('val:Q', axis=y_axis, scale=alt.Scale(domain=[0, 1]))
@@ -1200,7 +1199,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (維持率欄位修正+圖表防呆版)...")
+        print("正在啟動 Streamlit 介面 (圖表崩潰修復版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
