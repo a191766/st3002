@@ -18,9 +18,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.44.0 (興櫃修正+價格補全)
+# 設定區 v9.45.0 (價格來源透明版)
 # ==========================================
-APP_VER = "v9.44.0 (興櫃修正+價格補全)"
+APP_VER = "v9.45.0 (價格來源透明版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -242,7 +242,7 @@ def get_hist(token, code, start):
     try: return api.taiwan_stock_daily(stock_id=code, start_date=start)
     except: return pd.DataFrame()
 
-# [核心功能: 查詢 MIS] 
+# [核心功能: 查詢 MIS - 強化價格來源判斷] 
 def get_prices_twse_mis(codes, info_map):
     if not codes: return {}, {}
     
@@ -299,7 +299,6 @@ def get_prices_twse_mis(codes, info_map):
             
             m_type = info_map.get(c, "twse").lower()
             
-            # [修正1] 興櫃 (emerging) 也要走 otc 查詢
             if "tpex" in m_type or "otc" in m_type or "emerging" in m_type:
                 q_list.append(f"otc_{c}.tw")
             else:
@@ -345,41 +344,44 @@ def get_prices_twse_mis(codes, info_map):
                             except: pass
                         
                         price = 0
-                        status_note = ""
+                        source_note = "" # 價格來源說明
 
-                        # [修正2] 價格抓取邏輯增強
-                        # 優先抓 z (成交價)
+                        # [優先級 1] z: 最近成交
                         if z != '-' and z != '':
-                            try: price = float(z)
+                            try: 
+                                price = float(z)
+                                source_note = "來源:成交"
                             except: pass
                         
-                        # 如果 z 沒抓到，但有開盤價 o (代表今天有成交，只是剛好當下 z 是空)
+                        # [優先級 2] o: 開盤價 (若z遺失)
                         if price == 0 and o != '-' and o != '':
-                            try: price = float(o)
-                            except: pass
-                            
-                        # 如果還是 0，試試看 h (最高價)
-                        if price == 0 and h != '-' and h != '':
-                            try: price = float(h)
+                            try: 
+                                price = float(o)
+                                source_note = "來源:開盤(補)"
                             except: pass
 
-                        # 最後手段：最佳買賣價
+                        # [優先級 3] b/a: 最佳買賣價 (無成交時的替代方案)
                         if price == 0:
                             try:
                                 b = item.get('b', '-').split('_')[0]
-                                if b != '-' and b: price = float(b)
+                                if b != '-' and b: 
+                                    price = float(b)
+                                    source_note = "來源:委買(無量)"
                                 else:
                                     a = item.get('a', '-').split('_')[0]
-                                    if a != '-' and a: price = float(a)
+                                    if a != '-' and a: 
+                                        price = float(a)
+                                        source_note = "來源:委賣(無量)"
                             except: pass
                             
                             if price == 0:
-                                status_note = "MIS有資料但無價(未成交)"
+                                source_note = "無成交也無掛單"
                         
                         if price > 0: 
                             val['z'] = price
-                        elif status_note:
-                            debug_log[c] = status_note
+                            val['note'] = source_note # 傳遞來源資訊
+                        elif source_note:
+                            debug_log[c] = source_note
                         
                         if c and val: results[c] = val
                     
@@ -671,6 +673,11 @@ def fetch_all():
                 note = f"⚠️{reason} | 昨收{p_price}"
             else:
                 note = f"昨收{p_price}"
+        
+        # 顯示價格來源 (如果有)
+        source_note = info.get('note', '')
+        if source_note:
+            note = f"📝{source_note} " + note
 
         if curr_p > 0 and p_price > 0 and not df.empty:
             hist_closes = df['close'].tail(4).tolist()
@@ -905,7 +912,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (興櫃修正+價格補全)...")
+        print("正在啟動 Streamlit 介面 (價格來源透明版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
