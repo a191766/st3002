@@ -18,9 +18,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.46.0 (移除開盤價補全+興櫃修正)
+# 設定區 v9.47.0 (漲跌停/試撮價強力補全)
 # ==========================================
-APP_VER = "v9.46.0 (移除開盤價補全+興櫃修正)"
+APP_VER = "v9.47.0 (漲跌停/試撮價強力補全)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -242,7 +242,7 @@ def get_hist(token, code, start):
     try: return api.taiwan_stock_daily(stock_id=code, start_date=start)
     except: return pd.DataFrame()
 
-# [核心功能: 查詢 MIS - 興櫃前綴修正 + 價格邏輯優化] 
+# [核心功能: 查詢 MIS - 增加 pz 試撮價檢查] 
 def get_prices_twse_mis(codes, info_map):
     if not codes: return {}, {}
     
@@ -299,7 +299,6 @@ def get_prices_twse_mis(codes, info_map):
             
             m_type = info_map.get(c, "twse").lower()
             
-            # [修正1] 興櫃要用 emg_ 前綴，不是 otc_
             if "emerging" in m_type:
                 q_list.append(f"emg_{c}.tw")
             elif "tpex" in m_type or "otc" in m_type:
@@ -337,6 +336,7 @@ def get_prices_twse_mis(codes, info_map):
                         returned_codes.add(c)
                         
                         z = item.get('z', '-') # 最近成交
+                        pz = item.get('pz', '-') # [關鍵] 試算/模擬成交價 (漲跌停或緩撮時用)
                         y = item.get('y', '-') # 昨收
                         
                         val = {}
@@ -347,17 +347,24 @@ def get_prices_twse_mis(codes, info_map):
                         price = 0
                         source_note = ""
 
-                        # [修正2] 嚴格價格邏輯：只抓成交價或買賣價，不抓開盤/最高
+                        # [修復邏輯: 優先順序調整]
                         
-                        # A. 優先抓 z (成交價)
+                        # 1. 嘗試成交價 (z)
                         if z != '-' and z != '':
                             try: 
                                 price = float(z)
                                 source_note = "來源:成交"
                             except: pass
                         
-                        # B. 如果沒有成交價，直接嘗試最佳買賣價
-                        # (移除了抓 'o' 和 'h' 的邏輯，避免拿早上的開盤價誤導)
+                        # 2. 如果沒有 z，嘗試 pz (試撮價/漲跌停鎖死價)
+                        # 這就是漲停股會用到的欄位
+                        if price == 0 and pz != '-' and pz != '':
+                            try:
+                                price = float(pz)
+                                source_note = "來源:試撮(漲跌停?)"
+                            except: pass
+
+                        # 3. 如果連試撮都沒有，嘗試最佳買賣價 (b/a)
                         if price == 0:
                             try:
                                 b = item.get('b', '-').split('_')[0]
@@ -909,7 +916,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (移除開盤價補全+興櫃修正)...")
+        print("正在啟動 Streamlit 介面 (漲跌停/試撮價強力補全)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
