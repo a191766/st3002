@@ -11,9 +11,9 @@ import time as time_module
 import random
 
 # ==========================================
-# 設定區 v9.38.0 (證交所連線強化修復版)
+# 設定區 v9.39.0 (證交所連線終極修復版)
 # ==========================================
-APP_VER = "v9.38.0 (證交所連線強化修復版)"
+APP_VER = "v9.39.0 (證交所連線終極修復版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -177,14 +177,26 @@ def get_days(token):
 
 @st.cache_data(ttl=86400)
 def get_stock_info_map(token):
+    """
+    建立股票代號 -> 市場別(tse/otc) 的對照表
+    """
+    # 內建一些常見的，防止 API 失敗時全軍覆沒
+    base_map = {
+        "2330":"twse", "2317":"twse", "2454":"twse", "2303":"twse", "2308":"twse",
+        "0050":"twse", "0056":"twse", "00878":"twse", "t00": "twse"
+    }
+    
     api = DataLoader()
     if token: api.login_by_token(token)
     try:
         df = api.taiwan_stock_info()
-        if df.empty: return {}
+        if df.empty: return base_map
         df['stock_id'] = df['stock_id'].astype(str)
-        return dict(zip(df['stock_id'], df['type']))
-    except: return {}
+        # 合併內建清單與 API 清單
+        api_map = dict(zip(df['stock_id'], df['type']))
+        base_map.update(api_map)
+        return base_map
+    except: return base_map
 
 def get_ranks_strict(token, target_date_str):
     if os.path.exists(RANK_FILE):
@@ -229,70 +241,54 @@ def get_hist(token, code, start):
     try: return api.taiwan_stock_daily(stock_id=code, start_date=start)
     except: return pd.DataFrame()
 
-# [核心升級] 真正的瀏覽器偽裝與 Session 管理
+# [核心修復] 
 def get_prices_twse_mis(codes, info_map):
     """
-    強化版：針對證交所擋爬蟲機制進行優化
-    修復重點：
-    1. 每次都重新建立 Session 以確保 Cookie 新鮮 (解決總是為0的問題)
-    2. 增加 Referer 檢查
-    3. 優化查詢邏輯
+    V2 修正版：嚴格區分 TSE/OTC，禁止混合錯誤查詢
     """
     if not codes: return {}
     
-    # 建立全新的 Session (不使用快取，確保乾淨)
+    # Session 初始化
     session = requests.Session()
-    
-    # 設置跟真實瀏覽器完全一樣的 Headers
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/123.0.0.0 Safari/537.36",
         "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8",
         "Connection": "keep-alive",
         "Referer": "https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw",
         "X-Requested-With": "XMLHttpRequest",
     }
     session.headers.update(headers)
     
-    # 1. 訪問首頁取得 Cookie (關鍵步驟)
+    # 1. 取得 Cookie
     try:
         ts_now = int(time_module.time() * 1000)
-        # 加上隨機參數避免被快取
-        r_home = session.get(f"https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw&_={ts_now}", timeout=5)
-        if r_home.status_code != 200:
-            print(f"Warning: 無法訪問首頁，Status Code: {r_home.status_code}")
-    except Exception as e:
-        print(f"Session 初始化失敗: {e}")
-        return {} # 如果連首頁都連不上，直接回傳空
+        session.get(f"https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw&_={ts_now}", timeout=5)
+    except:
+        return {}
     
-    # 稍作休息，模擬人類
-    time_module.sleep(random.uniform(0.5, 1.0))
+    time_module.sleep(random.uniform(0.5, 0.8))
 
-    # 準備查詢字串
+    # 2. 構建查詢字串 - [關鍵修正]
     req_strs = []
-    chunk_size = 5 # 保持小批次
+    chunk_size = 5 # 保持安全距離
     
     for i in range(0, len(codes), chunk_size):
         chunk = codes[i:i+chunk_size]
         q_list = []
         for c in chunk:
-            m_type = info_map.get(c, "")
-            # 如果知道市場別，精準查詢
-            if m_type == "tpex":
+            c = str(c).strip()
+            if not c: continue
+            
+            # [重要] 這裡不再亂猜。如果不在 map 裡，預設為 tse (因為大多數熱門股都是上市)
+            # 絕對不能同時送出 tse_X 和 otc_X
+            m_type = info_map.get(c, "twse").lower()
+            
+            if "tpex" in m_type or "otc" in m_type:
                 q_list.append(f"otc_{c}.tw")
-            elif m_type == "twse":
-                q_list.append(f"tse_{c}.tw")
             else:
-                # [優化] 如果不知道市場別，且代號長度為4
-                # 為了避免同時送出 tse_X 和 otc_X 導致整批失敗，
-                # 我們只查詢 TSE (大多數股票)，或者大盤指數(t00)
-                if c == "t00": 
-                    q_list.append("tse_t00.tw")
-                else:
-                    # 還是嘗試雙查，但分開處理比較安全，這裡維持原樣但依靠 Session 修復
-                    q_list.append(f"tse_{c}.tw")
-                    q_list.append(f"otc_{c}.tw")
+                # 預設上市
+                q_list.append(f"tse_{c}.tw")
                  
         if q_list:
             req_strs.append("|".join(q_list))
@@ -300,81 +296,52 @@ def get_prices_twse_mis(codes, info_map):
     results = {}
     base_url = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
     
-    print(f"開始抓取 {len(codes)} 檔股票報價 (Batch Size: {chunk_size})...")
-    
-    for idx, q_str in enumerate(req_strs):
+    for q_str in req_strs:
         ts = int(time_module.time() * 1000)
-        params = {
-            "json": "1",
-            "delay": "0",
-            "_": ts,
-            "ex_ch": q_str
-        }
+        params = {"json": "1", "delay": "0", "_": ts, "ex_ch": q_str}
         
         try:
-            # 隨機延遲
-            time_module.sleep(random.uniform(0.3, 0.6))
-            # 這裡必須再次帶上 Referer
-            r = session.get(base_url, params=params, timeout=10, headers=headers)
+            time_module.sleep(random.uniform(0.3, 0.5))
+            r = session.get(base_url, params=params, timeout=8)
             
             if r.status_code == 200:
                 try:
                     data = r.json()
-                    if 'msgArray' not in data:
-                        continue
+                    # 證交所 API 有時回傳 msgArray，有時是空
+                    if 'msgArray' not in data: continue
                     
-                    if not data['msgArray']:
-                         # 可能是空回應
-                         pass
-
                     for item in data['msgArray']:
-                        try:
-                            c = item.get('c', '') 
-                            z = item.get('z', '-') 
-                            y = item.get('y', '-') 
-                            
-                            val = {}
-                            if y != '-' and y != '': 
-                                try: val['y'] = float(y)
-                                except: pass
-                            
-                            price = 0
-                            # 優先抓最近成交價 (z)
-                            if z != '-' and z != '': 
-                                try: price = float(z)
-                                except: pass
-                            
-                            # 如果 z 抓不到或為 0，改抓最佳買價 (b)
-                            if price == 0:
-                                b_str = item.get('b', '-')
-                                if b_str != '-' and b_str != '':
-                                    try: price = float(b_str.split('_')[0])
-                                    except: pass
-                            
-                            # 如果 b 也抓不到，改抓最佳賣價 (a)
-                            if price == 0:
-                                a_str = item.get('a', '-')
-                                if a_str != '-' and a_str != '':
-                                    try: price = float(a_str.split('_')[0])
-                                    except: pass
-                            
-                            # 只要有價格或有昨收，就存入
-                            if price > 0: val['z'] = price
-                            
-                            if c and val: results[c] = val
-                        except:
-                            continue
-                except json.JSONDecodeError:
-                    print(f"JSON 解析失敗: {r.text[:50]}...")
-            else:
-                print(f"請求失敗: Status {r.status_code}")
-                # 如果 403 Forbidden，通常代表 Session 失效
-                if r.status_code in [403, 401]:
-                    # 遇到 403 就放棄這一輪，等待下次重啟 Session
-                    break
-        except Exception as e: 
-            print(f"連線例外: {e}")
-            pass
+                        c = item.get('c', '') 
+                        # 處理各種價格欄位
+                        z = item.get('z', '-') # 最近成交
+                        y = item.get('y', '-') # 昨收
+                        
+                        val = {}
+                        if y != '-' and y != '':
+                            val['y'] = float(y)
+                        
+                        price = 0
+                        # 嘗試解析成交價
+                        if z != '-' and z != '':
+                            try: price = float(z)
+                            except: pass
+                        
+                        # 如果沒有成交價，試試看最佳買賣價 (針對剛開盤或冷門股)
+                        if price == 0:
+                            try:
+                                b = item.get('b', '-').split('_')[0]
+                                if b != '-' and b: price = float(b)
+                                else:
+                                    a = item.get('a', '-').split('_')[0]
+                                    if a != '-' and a: price = float(a)
+                            except: pass
+                        
+                        if price > 0: val['z'] = price
+                        
+                        if c and val: results[c] = val
+
+                except: pass
+        except: pass
             
     return results
 
@@ -505,11 +472,9 @@ def plot_chart():
 
 def fetch_all():
     ft = get_finmind_token()
-    # 就算 FinMind Token 錯誤，也要能往下執行 (為了測試爬蟲)
-    
     sj_api, sj_err = get_api() 
     days = get_days(ft)
-    # 如果沒抓到日期，手動補今天，確保程式不會因為沒日期就掛掉
+    
     now = datetime.now(timezone(timedelta(hours=8)))
     today_str = now.strftime("%Y-%m-%d")
     if not days: days = [today_str]
@@ -540,7 +505,7 @@ def fetch_all():
     is_post_market = (now.time() >= time(14, 0))
     
     if allow_live_fetch and not is_post_market:
-        # 1. Shioaji
+        # 1. Shioaji (優先)
         if sj_api:
             try:
                 usage = sj_api.usage(); sj_usage_info = str(usage) if usage else "無法取得"
@@ -592,7 +557,8 @@ def fetch_all():
         m_display = {"twse":"上市", "tpex":"上櫃", "emerging":"興櫃"}.get(m_type, "未知")
         
         info = pmap.get(c, {})
-        curr_p = info.get('price', 0)
+        curr_p = info.get('z', info.get('price', 0)) # MIS 用 z, SJ 用 price
+        
         # 如果 MIS 只抓到 z (價格) 沒抓到 y (昨收)，嘗試用 FinMind 昨收補
         real_y = info.get('y', info.get('y_close', 0)) 
         
@@ -630,7 +596,6 @@ def fetch_all():
         c_stt = "-"
         note = ""
         
-        # [絕對不補] 沒報價就沒報價，不補昨收
         if curr_p == 0: 
             c_stt = "⚠️無報價"
             if p_price > 0: note = f"昨收{p_price} "
@@ -660,7 +625,7 @@ def fetch_all():
     try:
         tw = get_hist(ft, "TAIEX", s_dt)
         if not tw.empty:
-            # 大盤也用 MIS
+            # 大盤 t00 一定是 twse
             mis_tw = get_prices_twse_mis(["t00"], {"t00":"twse"}) 
             t_curr = mis_tw.get("t00", {}).get("z", 0)
             t_y = mis_tw.get("t00", {}).get("y", 0)
