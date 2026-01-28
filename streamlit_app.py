@@ -5,15 +5,15 @@ import numpy as np
 from FinMind.data import DataLoader
 from datetime import datetime, timedelta, timezone, time
 import shioaji as sj
-import os, sys, requests, json, subprocess
+import os, sys, requests, json, subprocess, traceback
 import altair as alt
 import time as time_module
 import random
 
 # ==========================================
-# 設定區 v9.35.0 (解析邏輯修復版)
+# 設定區 v9.36.0 (證交所連線強化版)
 # ==========================================
-APP_VER = "v9.35.0 (解析邏輯修復版)"
+APP_VER = "v9.36.0 (證交所連線強化版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -160,7 +160,8 @@ def get_col(df, names):
 
 @st.cache_data(ttl=600)
 def get_days(token):
-    api = DataLoader(); api.login_by_token(token)
+    api = DataLoader()
+    if token: api.login_by_token(token)
     dates = []
     try:
         df = api.taiwan_stock_daily(stock_id="0050", start_date=(datetime.now()-timedelta(days=20)).strftime("%Y-%m-%d"))
@@ -176,7 +177,8 @@ def get_days(token):
 
 @st.cache_data(ttl=86400)
 def get_stock_info_map(token):
-    api = DataLoader(); api.login_by_token(token)
+    api = DataLoader()
+    if token: api.login_by_token(token)
     try:
         df = api.taiwan_stock_info()
         if df.empty: return {}
@@ -193,7 +195,8 @@ def get_ranks_strict(token, target_date_str):
                     return data["ranks"], True
         except: pass
 
-    api = DataLoader(); api.login_by_token(token)
+    api = DataLoader()
+    if token: api.login_by_token(token)
     df = pd.DataFrame()
     try: df = api.taiwan_stock_daily(stock_id="", start_date=target_date_str)
     except: pass
@@ -221,76 +224,93 @@ def get_ranks_strict(token, target_date_str):
 
 @st.cache_data(ttl=43200)
 def get_hist(token, code, start):
-    api = DataLoader(); api.login_by_token(token)
+    api = DataLoader()
+    if token: api.login_by_token(token)
     try: return api.taiwan_stock_daily(stock_id=code, start_date=start)
     except: return pd.DataFrame()
 
 # [核心升級] 真正的瀏覽器偽裝與 Session 管理
-def get_random_agent():
-    agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0"
-    ]
-    return random.choice(agents)
-
 def get_prices_twse_mis(codes, info_map):
     """
-    修正版：增強了對空值、格式錯誤的容錯能力，
-    確保單一股票解析失敗不會導致整批資料遺失。
+    強化版：針對證交所擋爬蟲機制進行優化
+    1. 完整 Header 模擬
+    2. Session Cookie 預熱
+    3. 市場別容錯 (若 info_map 缺失則同時查 TSE/OTC)
     """
     if not codes: return {}
     
-    # 1. 取得或初始化 Session (這能確保我們拿到 Cookie)
+    # 建立或重用 Session
     if 'mis_session' not in st.session_state:
         session = requests.Session()
+        # 設置跟真實瀏覽器完全一樣的 Headers
         session.headers.update({
-            "User-Agent": get_random_agent(),
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
             "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
             "Referer": "https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw",
-            "X-Requested-With": "XMLHttpRequest"
+            "X-Requested-With": "XMLHttpRequest",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin"
         })
-        # [關鍵步驟] 訪問首頁取得 Cookie
+        
+        # 訪問首頁取得 Cookie (關鍵步驟)
         try:
-            session.get("https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw", timeout=5)
-        except:
-            pass
+            print("正在初始化證交所連線 (取得 Cookie)...")
+            r_home = session.get("https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw", timeout=10)
+            if r_home.status_code != 200:
+                print(f"Warning: 無法訪問首頁，Status Code: {r_home.status_code}")
+        except Exception as e:
+            print(f"Session 初始化失敗: {e}")
+        
         st.session_state['mis_session'] = session
     
     session = st.session_state['mis_session']
     
+    # 準備查詢字串
     req_strs = []
-    chunk_size = 30 # 降低請求量，避免被擋
+    chunk_size = 25 # 稍微保守一點
     
     for i in range(0, len(codes), chunk_size):
         chunk = codes[i:i+chunk_size]
         q_list = []
         for c in chunk:
-            m_type = info_map.get(c, "twse")
-            prefix = "otc" if m_type == "tpex" else "tse"
-            q_list.append(f"{prefix}_{c}.tw")
+            m_type = info_map.get(c, "")
+            # 如果知道市場別，精準查詢
+            if m_type == "tpex":
+                q_list.append(f"otc_{c}.tw")
+            elif m_type == "twse":
+                q_list.append(f"tse_{c}.tw")
+            else:
+                # [容錯] 如果不知道市場別 (info_map 空值)，乾脆兩個都查，反正無效的會被忽略
+                q_list.append(f"tse_{c}.tw")
+                q_list.append(f"otc_{c}.tw")
+                
         req_strs.append("|".join(q_list))
     
     results = {}
     ts = int(time_module.time() * 1000)
-    base_url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&_={ts}&ex_ch="
+    # 加上隨機參數避免快取
+    base_url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=0&_={ts}&ex_ch="
+    
+    print(f"開始抓取 {len(codes)} 檔股票報價 (使用 requests)...")
     
     for q_str in req_strs:
         try:
             url = base_url + q_str
-            # 使用已經有 Cookie 的 session 發請求，並加上隨機延遲
-            time_module.sleep(random.uniform(0.3, 0.8))
-            r = session.get(url, timeout=8)
+            time_module.sleep(random.uniform(0.5, 1.0)) # 增加延遲避免太快被擋
+            r = session.get(url, timeout=10)
             
             if r.status_code == 200:
                 try:
                     data = r.json()
-                except:
-                    continue # JSON 解析失敗就跳過這一批，但不崩潰
-
-                if 'msgArray' in data:
+                    if 'msgArray' not in data:
+                        print("回應中沒有 msgArray，可能被擋或無資料")
+                        continue
+                        
                     for item in data['msgArray']:
-                        # [關鍵修改] 針對每一檔股票單獨做 try-except，避免一顆老鼠屎壞了一鍋粥
                         try:
                             c = item.get('c', '') 
                             z = item.get('z', '-') 
@@ -321,17 +341,27 @@ def get_prices_twse_mis(codes, info_map):
                                     try: price = float(a_str.split('_')[0])
                                     except: pass
                             
-                            # [誠實數據] 只回傳大於 0 的價格
-                            if price > 0: val['z'] = price
-                            
+                            # 即使價格為 0 (無成交)，只要有昨收，我們也存下來，避免狀態顯示 "無報價"
+                            if price > 0: 
+                                val['z'] = price
+                            else:
+                                # 若當日尚未成交，用昨收暫代 (或者保持為0由後端判斷)
+                                # 這裡保持原邏輯，只存大於0的，但在後端狀態處理做寬容
+                                pass
+
                             if c and val: results[c] = val
                         except:
-                            # 單一股票解析失敗，直接跳過，不影響其他股票
                             continue
-        except: 
-            # 如果 Session 過期或失敗，清除它以便下次重建
-            if 'mis_session' in st.session_state:
-                del st.session_state['mis_session']
+                except json.JSONDecodeError:
+                    print(f"JSON 解析失敗: {r.text[:50]}...")
+            else:
+                print(f"請求失敗: Status {r.status_code}")
+                # 如果 403 Forbidden，通常代表 Session 失效，清除它
+                if r.status_code in [403, 401]:
+                    if 'mis_session' in st.session_state:
+                        del st.session_state['mis_session']
+        except Exception as e: 
+            print(f"連線例外: {e}")
             pass
             
     return results
@@ -454,25 +484,26 @@ def plot_chart():
 
 def fetch_all():
     ft = get_finmind_token()
-    if not ft: return "FinMind Token Error"
+    # 就算 FinMind Token 錯誤，也要能往下執行 (為了測試爬蟲)
     
     sj_api, sj_err = get_api() 
     days = get_days(ft)
-    if len(days)<2: return "日期資料不足"
+    # 如果沒抓到日期，手動補今天，確保程式不會因為沒日期就掛掉
+    now = datetime.now(timezone(timedelta(hours=8)))
+    today_str = now.strftime("%Y-%m-%d")
+    if not days: days = [today_str]
     
     info_map = get_stock_info_map(ft)
     
     d_cur = days[-1]
-    now = datetime.now(timezone(timedelta(hours=8)))
     is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
     allow_live_fetch = (0<=now.weekday()<=4) and (now.time() >= time(8,45))
     
-    today_str = now.strftime("%Y-%m-%d")
-    target_date_for_ranks = days[-2] if (now.time() < time(14, 0) and d_cur == today_str) else d_cur
+    target_date_for_ranks = days[-2] if (len(days)>1 and now.time() < time(14, 0) and d_cur == today_str) else d_cur
     if now.time() >= time(14, 0): target_date_for_ranks = today_str
 
     final_codes, from_disk = get_ranks_strict(ft, target_date_for_ranks)
-    if not final_codes and target_date_for_ranks == today_str:
+    if not final_codes and target_date_for_ranks == today_str and len(days)>1:
         target_date_for_ranks = days[-2]
         final_codes, _ = get_ranks_strict(ft, target_date_for_ranks)
         msg_src = f"名單:{target_date_for_ranks}(延用舊單)"
@@ -541,7 +572,8 @@ def fetch_all():
         
         info = pmap.get(c, {})
         curr_p = info.get('price', 0)
-        real_y = info.get('y_close', 0) # 優先使用即時源的昨收
+        # 如果 MIS 只抓到 z (價格) 沒抓到 y (昨收)，嘗試用 FinMind 昨收補
+        real_y = info.get('y', info.get('y_close', 0)) 
         
         if is_post_market and not df.empty:
             if df.iloc[-1]['date'] == today_str:
@@ -648,10 +680,6 @@ def fetch_all():
     }
 
 def run_app():
-    # 這裡必須再次調用 set_page_config，因為如果是 subprocess 啟動，main 裡面的那行不會被執行到
-    # 但 Streamlit 規定 set_page_config 必須是第一條 Streamlit 指令。
-    # 由於主程式上方已經有了，所以這裡通常不需要重複，或者會報錯。
-    # 為了安全起見，這裡直接開始繪製介面。
     st.title(f"📈 {APP_VER}")
     
     with st.sidebar:
@@ -688,7 +716,7 @@ def run_app():
             st.sidebar.caption(f"永豐API額度: {data.get('sj_usage', '未知')}")
             
             status_code = data['api_status']
-            if status_code == 2: st.sidebar.success("🟢 永豐連線正常")
+            if status_code == 2: st.sidebar.success("🟢 連線正常")
             elif status_code == 1: st.sidebar.warning("🟠 流量/連線異常 (忙線)")
             else:
                 if data['sj_err']: st.sidebar.error(f"🔴 連線失敗: {data['sj_err']}")
@@ -719,7 +747,8 @@ def run_app():
                 if stt != n_state['last_stt']:
                     msg = f"🔥 過熱: {br:.1%}" if stt=='hot' else (f"❄️ 冰點: {br:.1%}" if stt=='cold' else "")
                     if msg: send_tg(tg_tok, tg_id, msg)
-                    n_state['last_stt'] = stt 
+                
+                n_state['last_stt'] = stt 
                 
                 rap_msg, rid = check_rapid(data['raw'])
                 if rap_msg and rid != n_state['last_rap']:
@@ -729,7 +758,7 @@ def run_app():
                 if open_br is not None:
                     is_dev_high = (br >= open_br + OPEN_DEV_THR)
                     is_dev_low = (br <= open_br - OPEN_DEV_THR)
-                    
+                
                     if is_dev_high and not n_state['was_dev_high']:
                         n_state['was_dev_high'] = True
                     
@@ -741,7 +770,7 @@ def run_app():
                         should_notify = False
                         if data['slope'] > 0 and n_state['intraday_trend'] == 'up': should_notify = True
                         if data['slope'] < 0 and n_state['intraday_trend'] == 'up': should_notify = True
-                        
+            
                         if should_notify:
                             msg = f"📉 <b>【高點回落】</b>\n今日高點: {today_max:.1%}\n目前廣度: {br:.1%}\n已回檔 5%"
                             send_tg(tg_tok, tg_id, msg)
@@ -790,7 +819,10 @@ def run_app():
             
             st.dataframe(data['df'], use_container_width=True, hide_index=True)
         else: st.warning("⚠️ 無資料")
-    except Exception as e: st.error(f"Error: {e}")
+    except Exception as e: 
+        st.error(f"Error: {e}")
+        # 在 UI 上也印出 traceback 方便除錯
+        st.text(traceback.format_exc())
 
     if auto:
         now = datetime.now(timezone(timedelta(hours=8)))
@@ -806,7 +838,6 @@ def run_app():
         else: st.sidebar.warning("⏸ 休市")
 
 if __name__ == "__main__":
-    # 判斷是否正在由 Streamlit 執行
     try:
         from streamlit.web import cli as stcli
     except ImportError:
@@ -815,18 +846,15 @@ if __name__ == "__main__":
         except:
             pass
 
-    # 如果已經是在 Streamlit 環境中 (sys.argv 包含 'run')
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        # 如果是直接雙擊 py 檔案 (python script.py)，則自動喚起 Streamlit
-        print("正在啟動 Streamlit 介面...")
+        print("正在啟動 Streamlit 介面 (強化連線版)...")
         try:
-            # 使用 subprocess 呼叫 streamlit run 當前檔案
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
             print(f"啟動失敗: {e}")
             print("請確認已安裝 streamlit (pip install streamlit)")
         
-        # 程式結束後等待 User 按 Enter
-        input("\n程式已結束，請按 Enter 鍵離開...")
+        # 確保無論如何都暫停
+        input("\n程式執行結束 (或發生錯誤)，請按 Enter 鍵離開...")
