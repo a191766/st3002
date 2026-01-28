@@ -18,9 +18,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.45.0 (價格來源透明版)
+# 設定區 v9.46.0 (移除開盤價補全+興櫃修正)
 # ==========================================
-APP_VER = "v9.45.0 (價格來源透明版)"
+APP_VER = "v9.46.0 (移除開盤價補全+興櫃修正)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -242,7 +242,7 @@ def get_hist(token, code, start):
     try: return api.taiwan_stock_daily(stock_id=code, start_date=start)
     except: return pd.DataFrame()
 
-# [核心功能: 查詢 MIS - 強化價格來源判斷] 
+# [核心功能: 查詢 MIS - 興櫃前綴修正 + 價格邏輯優化] 
 def get_prices_twse_mis(codes, info_map):
     if not codes: return {}, {}
     
@@ -299,7 +299,10 @@ def get_prices_twse_mis(codes, info_map):
             
             m_type = info_map.get(c, "twse").lower()
             
-            if "tpex" in m_type or "otc" in m_type or "emerging" in m_type:
+            # [修正1] 興櫃要用 emg_ 前綴，不是 otc_
+            if "emerging" in m_type:
+                q_list.append(f"emg_{c}.tw")
+            elif "tpex" in m_type or "otc" in m_type:
                 q_list.append(f"otc_{c}.tw")
             else:
                 q_list.append(f"tse_{c}.tw")
@@ -335,8 +338,6 @@ def get_prices_twse_mis(codes, info_map):
                         
                         z = item.get('z', '-') # 最近成交
                         y = item.get('y', '-') # 昨收
-                        o = item.get('o', '-') # 開盤
-                        h = item.get('h', '-') # 最高
                         
                         val = {}
                         if y != '-' and y != '':
@@ -344,23 +345,19 @@ def get_prices_twse_mis(codes, info_map):
                             except: pass
                         
                         price = 0
-                        source_note = "" # 價格來源說明
+                        source_note = ""
 
-                        # [優先級 1] z: 最近成交
+                        # [修正2] 嚴格價格邏輯：只抓成交價或買賣價，不抓開盤/最高
+                        
+                        # A. 優先抓 z (成交價)
                         if z != '-' and z != '':
                             try: 
                                 price = float(z)
                                 source_note = "來源:成交"
                             except: pass
                         
-                        # [優先級 2] o: 開盤價 (若z遺失)
-                        if price == 0 and o != '-' and o != '':
-                            try: 
-                                price = float(o)
-                                source_note = "來源:開盤(補)"
-                            except: pass
-
-                        # [優先級 3] b/a: 最佳買賣價 (無成交時的替代方案)
+                        # B. 如果沒有成交價，直接嘗試最佳買賣價
+                        # (移除了抓 'o' 和 'h' 的邏輯，避免拿早上的開盤價誤導)
                         if price == 0:
                             try:
                                 b = item.get('b', '-').split('_')[0]
@@ -379,7 +376,7 @@ def get_prices_twse_mis(codes, info_map):
                         
                         if price > 0: 
                             val['z'] = price
-                            val['note'] = source_note # 傳遞來源資訊
+                            val['note'] = source_note
                         elif source_note:
                             debug_log[c] = source_note
                         
@@ -912,7 +909,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (價格來源透明版)...")
+        print("正在啟動 Streamlit 介面 (移除開盤價補全+興櫃修正)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
