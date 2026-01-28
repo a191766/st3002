@@ -5,15 +5,15 @@ import numpy as np
 from FinMind.data import DataLoader
 from datetime import datetime, timedelta, timezone, time
 import shioaji as sj
-import os, sys, requests, json
+import os, sys, requests, json, subprocess
 import altair as alt
 import time as time_module
 import random
 
 # ==========================================
-# 設定區 v9.34.0 (真實連線修正版)
+# 設定區 v9.35.0 (解析邏輯修復版)
 # ==========================================
-APP_VER = "v9.34.0 (真實連線修正版)"
+APP_VER = "v9.35.0 (解析邏輯修復版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -25,8 +25,6 @@ EXCL_PFX = ["00", "91"]
 HIST_FILE = "breadth_history_v3.csv"
 RANK_FILE = "ranking_cache.json"
 NOTIFY_FILE = "notify_state.json" 
-
-st.set_page_config(page_title="盤中權證進場判斷", layout="wide")
 
 # ==========================================
 # 基礎函式
@@ -237,6 +235,10 @@ def get_random_agent():
     return random.choice(agents)
 
 def get_prices_twse_mis(codes, info_map):
+    """
+    修正版：增強了對空值、格式錯誤的容錯能力，
+    確保單一股票解析失敗不會導致整批資料遺失。
+    """
     if not codes: return {}
     
     # 1. 取得或初始化 Session (這能確保我們拿到 Cookie)
@@ -281,30 +283,51 @@ def get_prices_twse_mis(codes, info_map):
             r = session.get(url, timeout=8)
             
             if r.status_code == 200:
-                data = r.json()
+                try:
+                    data = r.json()
+                except:
+                    continue # JSON 解析失敗就跳過這一批，但不崩潰
+
                 if 'msgArray' in data:
                     for item in data['msgArray']:
-                        c = item.get('c', '') 
-                        z = item.get('z', '-') 
-                        y = item.get('y', '-') 
-                        
-                        val = {}
-                        if y != '-': val['y'] = float(y)
-                        
-                        price = 0
-                        if z != '-': 
-                            price = float(z)
-                        elif item.get('b', '-') != '-': 
-                             try: price = float(item.get('b').split('_')[0])
-                             except: pass
-                        elif item.get('a', '-') != '-': 
-                             try: price = float(item.get('a').split('_')[0])
-                             except: pass
-                        
-                        # [誠實數據] 只回傳大於 0 的價格
-                        if price > 0: val['z'] = price
-                        
-                        if c and val: results[c] = val
+                        # [關鍵修改] 針對每一檔股票單獨做 try-except，避免一顆老鼠屎壞了一鍋粥
+                        try:
+                            c = item.get('c', '') 
+                            z = item.get('z', '-') 
+                            y = item.get('y', '-') 
+                            
+                            val = {}
+                            if y != '-' and y != '': 
+                                try: val['y'] = float(y)
+                                except: pass
+                            
+                            price = 0
+                            # 優先抓最近成交價 (z)
+                            if z != '-' and z != '': 
+                                try: price = float(z)
+                                except: pass
+                            
+                            # 如果 z 抓不到或為 0，改抓最佳買價 (b)
+                            if price == 0:
+                                b_str = item.get('b', '-')
+                                if b_str != '-' and b_str != '':
+                                    try: price = float(b_str.split('_')[0])
+                                    except: pass
+                            
+                            # 如果 b 也抓不到，改抓最佳賣價 (a)
+                            if price == 0:
+                                a_str = item.get('a', '-')
+                                if a_str != '-' and a_str != '':
+                                    try: price = float(a_str.split('_')[0])
+                                    except: pass
+                            
+                            # [誠實數據] 只回傳大於 0 的價格
+                            if price > 0: val['z'] = price
+                            
+                            if c and val: results[c] = val
+                        except:
+                            # 單一股票解析失敗，直接跳過，不影響其他股票
+                            continue
         except: 
             # 如果 Session 過期或失敗，清除它以便下次重建
             if 'mis_session' in st.session_state:
@@ -539,7 +562,7 @@ def fetch_all():
             last_date_db = df.iloc[-1]['date']
             closes = []
             if last_date_db == today_str:
-                 closes = df['close'].tail(6).tolist()[:-1] 
+                closes = df['close'].tail(6).tolist()[:-1] 
             else:
                  closes = df['close'].tail(4).tolist()
                  closes.append(p_price) 
@@ -625,6 +648,10 @@ def fetch_all():
     }
 
 def run_app():
+    # 這裡必須再次調用 set_page_config，因為如果是 subprocess 啟動，main 裡面的那行不會被執行到
+    # 但 Streamlit 規定 set_page_config 必須是第一條 Streamlit 指令。
+    # 由於主程式上方已經有了，所以這裡通常不需要重複，或者會報錯。
+    # 為了安全起見，這裡直接開始繪製介面。
     st.title(f"📈 {APP_VER}")
     
     with st.sidebar:
@@ -649,7 +676,7 @@ def run_app():
                 os.remove(HIST_FILE)
                 st.toast("歷史資料已刪除，請重新整理", icon="🗑️")
                 time_module.sleep(1)
-                st.rerun()
+            st.rerun()
 
     if st.button("🔄 刷新"): st.rerun()
 
@@ -779,4 +806,27 @@ def run_app():
         else: st.sidebar.warning("⏸ 休市")
 
 if __name__ == "__main__":
-    if 'streamlit' in sys.modules: run_app()
+    # 判斷是否正在由 Streamlit 執行
+    try:
+        from streamlit.web import cli as stcli
+    except ImportError:
+        try:
+            import streamlit.cli as stcli
+        except:
+            pass
+
+    # 如果已經是在 Streamlit 環境中 (sys.argv 包含 'run')
+    if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
+        run_app()
+    else:
+        # 如果是直接雙擊 py 檔案 (python script.py)，則自動喚起 Streamlit
+        print("正在啟動 Streamlit 介面...")
+        try:
+            # 使用 subprocess 呼叫 streamlit run 當前檔案
+            subprocess.call(["streamlit", "run", __file__])
+        except Exception as e:
+            print(f"啟動失敗: {e}")
+            print("請確認已安裝 streamlit (pip install streamlit)")
+        
+        # 程式結束後等待 User 按 Enter
+        input("\n程式已結束，請按 Enter 鍵離開...")
