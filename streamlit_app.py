@@ -12,9 +12,9 @@ import time as time_module
 import random
 
 # ==========================================
-# 設定區 v9.30.0 (邏輯歸零重寫版)
+# 設定區 v9.30.1 (語法修正版)
 # ==========================================
-APP_VER = "v9.30.0 (邏輯歸零重寫版)"
+APP_VER = "v9.30.1 (語法修正版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -33,8 +33,10 @@ st.set_page_config(page_title="盤中權證進場判斷", layout="wide")
 # 基礎函式
 # ==========================================
 def get_finmind_token():
-    try: return st.secrets["finmind"]["token"]
-    except: return None
+    try:
+        return st.secrets["finmind"]["token"]
+    except:
+        return None
 
 def send_tg(token, chat_id, msg):
     if not token or not chat_id: return False
@@ -42,27 +44,41 @@ def send_tg(token, chat_id, msg):
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         r = requests.post(url, json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"})
         return r.status_code == 200
-    except: return False
+    except:
+        return False
 
 def load_notify_state(today_str):
     default_state = {
-        "date": today_str, "last_stt": "normal", "last_rap": "",
-        "was_dev_high": False, "was_dev_low": False,
-        "notified_drop_high": False, "notified_rise_low": False,
+        "date": today_str,
+        "last_stt": "normal",
+        "last_rap": "",
+        "was_dev_high": False,
+        "was_dev_low": False,
+        "notified_drop_high": False,
+        "notified_rise_low": False,
         "intraday_trend": None  
     }
-    if not os.path.exists(NOTIFY_FILE): return default_state
+    
+    if not os.path.exists(NOTIFY_FILE):
+        return default_state
+    
     try:
         with open(NOTIFY_FILE, 'r') as f:
             state = json.load(f)
-            if state.get("date") != today_str: return default_state
-            if "intraday_trend" not in state: state["intraday_trend"] = None
+            if state.get("date") != today_str:
+                return default_state
+            if "intraday_trend" not in state:
+                state["intraday_trend"] = None
             return state
-    except: return default_state
+    except:
+        return default_state
 
 def save_notify_state(state):
-    try: with open(NOTIFY_FILE, 'w') as f: json.dump(state, f)
-    except: pass
+    try:
+        with open(NOTIFY_FILE, 'w') as f:
+            json.dump(state, f)
+    except:
+        pass
 
 def check_rapid(row):
     if not os.path.exists(HIST_FILE): return None, None
@@ -72,13 +88,19 @@ def check_rapid(row):
         curr_dt = datetime.strptime(f"{row['Date']} {row['Time']}", "%Y-%m-%d %H:%M")
         curr_v = float(row['Breadth'])
         target = None
+        
         for i in range(2, min(15, len(df)+1)):
             r = df.iloc[-i]
-            try: r_t = r['Time'] if len(str(r['Time']))==5 else r['Time'][:5]
+            try: 
+                r_t = r['Time'] if len(str(r['Time']))==5 else r['Time'][:5]
             except: continue
+            
             r_dt = datetime.strptime(f"{r['Date']} {r_t}", "%Y-%m-%d %H:%M")
-            if 230 <= (curr_dt - r_dt).total_seconds() <= 250:
+            seconds_diff = (curr_dt - r_dt).total_seconds()
+            
+            if 230 <= seconds_diff <= 250:
                 target = r; break
+                
         if target is not None:
             prev_v = float(target['Breadth'])
             diff = curr_v - prev_v
@@ -95,12 +117,16 @@ def get_opening_breadth(d_cur):
         df = pd.read_csv(HIST_FILE)
         if df.empty: return None
         if 'Total' not in df.columns: df['Total'] = 0
+        
         df['Date'] = df['Date'].astype(str)
         df_today = df[df['Date'] == str(d_cur)].copy()
         if df_today.empty: return None
+        
         df_today = df_today[df_today['Time'] >= "09:00"]
         df_valid = df_today[df_today['Total'] >= OPEN_COUNT_THR].sort_values('Time')
-        if not df_valid.empty: return float(df_valid.iloc[0]['Breadth'])
+        
+        if not df_valid.empty:
+            return float(df_valid.iloc[0]['Breadth'])
     except: pass
     return None
 
@@ -242,18 +268,22 @@ def get_prices_twse_mis(codes, info_map):
                         z = item.get('z', '-') 
                         y = item.get('y', '-') 
                         
-                        # 只要有 y 就抓
                         val = {}
                         if y != '-': val['y'] = float(y)
                         
-                        # z (成交) > b (買價) > a (賣價)
                         price = 0
-                        if z != '-': price = float(z)
+                        if z != '-': 
+                            price = float(z)
                         elif item.get('b', '-') != '-': 
                              try: price = float(item.get('b').split('_')[0])
                              except: pass
+                        elif item.get('a', '-') != '-': 
+                             try: price = float(item.get('a').split('_')[0])
+                             except: pass
                         
                         if price > 0: val['z'] = price
+                        elif 'y' in val: val['z'] = val['y'] # 歸零防護
+                        
                         if c and val: results[c] = val
         except: pass
     return results
@@ -470,30 +500,22 @@ def fetch_all():
                 curr_p = float(df.iloc[-1]['close'])
                 if len(df) >= 2: real_y = float(df.iloc[-2]['close'])
 
-        # [關鍵修正] 昨收來源確認
         p_price = 0
         if real_y > 0: 
-            p_price = real_y # 優先用即時源的昨收
+            p_price = real_y 
         elif not df.empty:
-            # 資料庫 fallback: 直接拿最後一筆，不猜 -2
             p_price = float(df.iloc[-1]['close'])
 
         p_ma5 = 0
         p_stt = "-"
         
         if not df.empty and p_price > 0:
-            # 昨 MA5 = (昨日收盤 + 歷史前4天) / 5
-            # 注意: df.iloc[-1] 就是昨天 (如果 FinMind 更新正常)
-            # 萬一 FinMind 沒更新(最後一筆是前天)，那我們需要手動補 p_price 進去
-            
             last_date_db = df.iloc[-1]['date']
             closes = []
             
-            if last_date_db == today_str: # 這種情況很少見，除非 FinMind 盤中更新
-                 closes = df['close'].tail(6).tolist()[:-1] # 扣掉今天
+            if last_date_db == today_str:
+                 closes = df['close'].tail(6).tolist()[:-1] 
             elif last_date_db < today_str:
-                 # 資料庫最後一筆是昨天(或更早)
-                 # 為了保險，我們取最後 4 筆 + p_price (最準確的昨收)
                  closes = df['close'].tail(4).tolist()
                  closes.append(p_price)
             
@@ -507,33 +529,17 @@ def fetch_all():
         c_stt = "-"
         note = ""
         
-        # [關鍵修正] 即時價如果是 0，強制用昨收取代 (視為平盤)
         if curr_p == 0 and p_price > 0:
             curr_p = p_price 
             note = "即時價失效(用昨收) "
 
         if curr_p > 0 and p_price > 0 and not df.empty:
-            # 今 MA5 = (今日 + 昨日 + 前3天) ? 錯，是 (今日 + 前4天)
-            # 前4天來源: df.tail(4) + p_price 已經組成了「昨天為止的序列」
-            # 我們需要: [前3天] + [昨天] + [今天]
-            
-            # 正確邏輯:
-            # 1. 取得歷史最後 4 筆 (假設最後一筆是昨天? 不一定)
-            # 安全做法: 取 df.tail(4) 
-            # 如果 df 最後一筆是昨天，那 tail(4) 包含昨天
-            # 我們已經有 p_price (昨天)，所以取 df.tail(4) 之前的? 
-            
-            # 簡化: 
-            # 昨天序列 = df['close'].tail(4).tolist() + [p_price] (共5筆)
-            # 今天序列 = 昨天序列的後4筆 + [curr_p]
-            
             hist_closes = df['close'].tail(4).tolist()
-            hist_closes.append(p_price) # 補上確定的昨收
+            hist_closes.append(p_price) 
             
             if len(hist_closes) >= 5:
-                ma5_input = hist_closes[-4:] # 取出 (前3天 + 昨天)
-                ma5_input.append(curr_p)     # 加上今天
-                
+                ma5_input = hist_closes[-4:] 
+                ma5_input.append(curr_p)     
                 c_ma5 = sum(ma5_input) / 5
                 if curr_p > c_ma5: h_c += 1; c_stt="✅"
                 else: c_stt="📉"
@@ -557,21 +563,17 @@ def fetch_all():
             tw_curr = mis_tw.get("t00", {}).get("z", 0)
             tw_y = mis_tw.get("t00", {}).get("y", 0)
 
-            # 昨收與現價
             if tw_y > 0: t_pre = tw_y
             else: t_pre = float(tw.iloc[-1]['close'])
 
             if tw_curr > 0: t_cur = tw_curr
             else: t_cur = t_pre
 
-            # 斜率計算
-            # 昨天MA5
             hist_tw = tw['close'].tail(4).tolist()
             hist_tw.append(t_pre)
             ma5_yest = 0
             if len(hist_tw) >= 5: ma5_yest = sum(hist_tw[-5:]) / 5
             
-            # 今天MA5
             ma5_today = 0
             if ma5_yest > 0:
                 today_input = hist_tw[-4:]
