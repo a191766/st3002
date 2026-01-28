@@ -18,9 +18,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.14 (戰略重構+掃描回歸版)
+# 設定區 v9.55.15 (圖表顯示優化版)
 # ==========================================
-APP_VER = "v9.55.14 (戰略重構+掃描回歸版)"
+APP_VER = "v9.55.15 (圖表顯示優化版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -156,37 +156,28 @@ def get_api():
         return None, str(e)
 
 # ==========================================
-# 籌碼面資料處理 (Scanner + Fix)
+# 籌碼面資料處理 (Direct API + Fixed Columns)
 # ==========================================
-def call_finmind_api_try_versions(dataset_candidates, data_id, start_date, token):
-    """自動掃描版本與資料集名稱"""
-    versions = ["v4", "v3", "v2"]
-    last_error = ""
+def call_finmind_api(dataset, data_id, start_date, token, version="v4"):
+    url = f"https://api.finmindtrade.com/api/{version}/data"
+    params = {
+        "dataset": dataset,
+        "start_date": start_date,
+        "token": token
+    }
+    if data_id: params["data_id"] = data_id
     
-    for dataset in dataset_candidates:
-        for v in versions:
-            url = f"https://api.finmindtrade.com/api/{v}/data"
-            params = {
-                "dataset": dataset,
-                "start_date": start_date,
-                "token": token
-            }
-            if data_id: params["data_id"] = data_id
-            
-            try:
-                r = cffi_requests.get(url, params=params, impersonate="chrome", timeout=10)
-                if r.status_code == 200:
-                    res_json = r.json()
-                    if "data" in res_json and len(res_json["data"]) > 0:
-                        return pd.DataFrame(res_json["data"]), f"{dataset} ({v})"
-                    elif "msg" in res_json:
-                        last_error = f"{dataset} ({v}): {res_json['msg']}"
-                else:
-                    last_error = f"{dataset} ({v}) HTTP {r.status_code}"
-            except Exception as e:
-                last_error = str(e)
-                
-    return pd.DataFrame(), last_error
+    try:
+        r = cffi_requests.get(url, params=params, impersonate="chrome", timeout=10)
+        if r.status_code == 200:
+            res_json = r.json()
+            if "data" in res_json:
+                return pd.DataFrame(res_json["data"])
+            elif "msg" in res_json:
+                return f"API Msg: {res_json['msg']}"
+        return f"HTTP {r.status_code}"
+    except Exception as e:
+        return f"Err: {str(e)}"
 
 @st.cache_data(ttl=43200) 
 def get_chips_data(token, target_date_str):
@@ -198,79 +189,81 @@ def get_chips_data(token, target_date_str):
     start_date = (datetime.strptime(target_date_str, "%Y-%m-%d") - timedelta(days=10)).strftime("%Y-%m-%d")
     res = {}
     
-    # 1. 外資期貨 (掃描 + 正確欄位)
-    fut_candidates = ["TaiwanFuturesInstitutional", "TaiwanFuturesInstitutionalInvestors"]
-    df_fut, fut_src = call_finmind_api_try_versions(fut_candidates, "TX", start_date, token)
-    
-    if df_fut.empty:
-        diagnosis.append(f"❌ 期貨: 掃描失敗 ({fut_src})")
-    else:
-        # 尋找外資
-        col_name = None
-        for c in ['institutional_investors', 'name', 'institutional_investor']:
-            if c in df_fut.columns:
-                col_name = c
-                break
-        
-        if col_name:
-            df_foreign = df_fut[df_fut[col_name].astype(str).str.contains('外資|Foreign', case=False)].sort_values('date')
-            if df_foreign.empty:
-                diagnosis.append("⚠️ 期貨: 找不到外資資料")
-            else:
-                latest = df_foreign.iloc[-1]
-                prev = df_foreign.iloc[-2] if len(df_foreign) >= 2 else latest
-                
-                # 正確欄位計算
-                try:
-                    curr_long = float(latest.get('long_open_interest_balance_volume', 0))
-                    curr_short = float(latest.get('short_open_interest_balance_volume', 0))
-                    
-                    # 如果找不到長欄位，嘗試舊欄位
-                    if curr_long == 0 and curr_short == 0 and 'open_interest' in latest:
-                        res['fut_oi'] = int(latest['open_interest'])
-                        prev_oi = int(prev.get('open_interest', 0))
-                        res['fut_oi_chg'] = res['fut_oi'] - prev_oi
-                    else:
-                        prev_long = float(prev.get('long_open_interest_balance_volume', 0))
-                        prev_short = float(prev.get('short_open_interest_balance_volume', 0))
-                        
-                        res['fut_oi'] = int(curr_long - curr_short)
-                        prev_net_oi = int(prev_long - prev_short)
-                        res['fut_oi_chg'] = res['fut_oi'] - prev_net_oi
-                    
-                    diagnosis.append(f"✅ 期貨: 成功 (OI: {res['fut_oi']}, 變動: {res['fut_oi_chg']})")
-                except:
-                    diagnosis.append("❌ 期貨: 數值計算錯誤")
+    # 1. 外資期貨
+    try:
+        df_fut = call_finmind_api("TaiwanFuturesInstitutional", "TX", start_date, token, version="v4")
+        if isinstance(df_fut, str): 
+             df_fut = call_finmind_api("TaiwanFuturesInstitutional", "TX", start_date, token, version="v2")
+
+        if isinstance(df_fut, str) or df_fut.empty:
+            diagnosis.append(f"⚠️ 期貨: 無資料")
         else:
-            diagnosis.append(f"❌ 期貨: 欄位識別失敗 {list(df_fut.columns)}")
+            col_name = 'institutional_investors' 
+            if col_name not in df_fut.columns:
+                 col_name = 'name' if 'name' in df_fut.columns else 'institutional_investor'
+            
+            if col_name in df_fut.columns:
+                df_foreign = df_fut[df_fut[col_name].astype(str).str.contains('外資|Foreign', case=False)].sort_values('date')
+                
+                if df_foreign.empty:
+                    diagnosis.append("⚠️ 期貨: 找不到外資資料")
+                else:
+                    latest = df_foreign.iloc[-1]
+                    prev = df_foreign.iloc[-2] if len(df_foreign) >= 2 else latest
+                    
+                    try:
+                        curr_long = float(latest.get('long_open_interest_balance_volume', 0))
+                        curr_short = float(latest.get('short_open_interest_balance_volume', 0))
+                        
+                        if curr_long == 0 and curr_short == 0 and 'open_interest' in latest:
+                            res['fut_oi'] = int(latest['open_interest'])
+                            prev_oi = int(prev.get('open_interest', 0))
+                            res['fut_oi_chg'] = res['fut_oi'] - prev_oi
+                        else:
+                            prev_long = float(prev.get('long_open_interest_balance_volume', 0))
+                            prev_short = float(prev.get('short_open_interest_balance_volume', 0))
+                            
+                            res['fut_oi'] = int(curr_long - curr_short)
+                            prev_net_oi = int(prev_long - prev_short)
+                            res['fut_oi_chg'] = res['fut_oi'] - prev_net_oi
+                        
+                        diagnosis.append(f"✅ 期貨(外資): 成功 (OI: {res['fut_oi']}, 變動: {res['fut_oi_chg']})")
+                    except:
+                        diagnosis.append(f"❌ 期貨: 欄位計算錯誤")
+            else:
+                diagnosis.append(f"❌ 期貨: 找不到法人欄位 {list(df_fut.columns)}")
+    except Exception as e:
+        diagnosis.append(f"❌ 期貨程式錯誤: {str(e)}")
 
     # 2. 選擇權
-    df_opt, opt_src = call_finmind_api_try_versions(["TaiwanOptionDaily"], "TXO", start_date, token)
-    if not df_opt.empty:
-        last_date = df_opt['date'].max()
-        df_today = df_opt[df_opt['date'] == last_date]
-        cp_col = 'call_put' if 'call_put' in df_today.columns else 'CallPut'
-        if cp_col in df_today.columns:
-            put_oi = df_today[df_today[cp_col].str.lower() == 'put']['open_interest'].sum()
-            call_oi = df_today[df_today[cp_col].str.lower() == 'call']['open_interest'].sum()
-            if call_oi > 0:
-                res['pc_ratio'] = round((put_oi / call_oi) * 100, 2)
-                diagnosis.append(f"✅ 選擇權: 成功 ({res['pc_ratio']}%)")
+    try:
+        df_opt = call_finmind_api("TaiwanOptionDaily", "TXO", start_date, token, version="v4")
+        if not isinstance(df_opt, str) and not df_opt.empty:
+            last_date = df_opt['date'].max()
+            df_today = df_opt[df_opt['date'] == last_date]
+            cp_col = 'call_put' if 'call_put' in df_today.columns else 'CallPut'
+            if cp_col in df_today.columns:
+                put_oi = df_today[df_today[cp_col].str.lower() == 'put']['open_interest'].sum()
+                call_oi = df_today[df_today[cp_col].str.lower() == 'call']['open_interest'].sum()
+                if call_oi > 0:
+                    res['pc_ratio'] = round((put_oi / call_oi) * 100, 2)
+                    diagnosis.append(f"✅ 選擇權: 成功 (PC={res['pc_ratio']}%)")
+    except: pass
 
-    # 3. 融資餘額 (替代維持率)
-    df_margin, margin_src = call_finmind_api_try_versions(["TaiwanStockTotalMarginPurchaseShortSale"], None, start_date, token)
-    if not df_margin.empty:
-        df_money = df_margin[df_margin['name'] == 'MarginPurchaseMoney'].sort_values('date')
-        if not df_money.empty:
-            latest = df_money.iloc[-1]
-            prev = df_money.iloc[-2] if len(df_money) >= 2 else latest
-            curr_bal = float(latest['TodayBalance'])
-            prev_bal = float(prev['TodayBalance'])
-            res['margin_chg'] = round((curr_bal - prev_bal) / 100000000, 2) 
-            res['margin_bal'] = round(curr_bal / 100000000, 1)
-            diagnosis.append(f"✅ 融資餘額: 成功 ({res['margin_bal']}億, 變動:{res['margin_chg']}億)")
-    else:
-        diagnosis.append("⚠️ 融資餘額: 抓取失敗")
+    # 3. 融資餘額
+    try:
+        df_margin = call_finmind_api("TaiwanStockTotalMarginPurchaseShortSale", None, start_date, token, version="v4")
+        if not isinstance(df_margin, str) and not df_margin.empty:
+            df_money = df_margin[df_margin['name'] == 'MarginPurchaseMoney'].sort_values('date')
+            if not df_money.empty:
+                latest = df_money.iloc[-1]
+                prev = df_money.iloc[-2] if len(df_money) >= 2 else latest
+                curr_bal = float(latest['TodayBalance'])
+                prev_bal = float(prev['TodayBalance'])
+                res['margin_chg'] = round((curr_bal - prev_bal) / 100000000, 2) 
+                res['margin_bal'] = round(curr_bal / 100000000, 1)
+                diagnosis.append(f"✅ 大盤融資餘額: 成功 (總額:{res['margin_bal']}億, 變動:{res['margin_chg']}億)")
+    except: pass
 
     return res, diagnosis
 
@@ -280,45 +273,36 @@ def get_chip_strategy(ma5_slope, chips):
     fut_oi = chips.get('fut_oi', 0)
     fut_chg = chips.get('fut_oi_chg', 0)
     pc_ratio = chips.get('pc_ratio', 100)
-    # 改用融資變動量
     margin_chg = chips.get('margin_chg', 0)
     
     sig = "籌碼中性"
     act = "觀察技術面為主"
     color = "info"
     
-    # 1. 殺盤 (空頭順勢) - 融資死不退 (margin_chg > 0 代表增加)
     if ma5_slope <= 0 and fut_oi < -10000 and margin_chg > 0:
         sig = "📉 殺戮盤 (散戶接刀)"
         act = "主力殺、散戶接，籌碼極亂。全力放空，不要猜底。"
         color = "error"
-        
-    # 2. 多頭燃料充足 (多頭順勢)
     elif ma5_slope > 0 and fut_oi > 10000 and pc_ratio > 110:
         sig = "🚀 火力全開 (外資助攻)"
         act = "外資期現貨同步作多，支撐強勁。多單抱緊，甚至加碼。"
         color = "success"
-        
-    # 3. 融資大減 (原:維持率低) -> 視為清洗籌碼
-    # 設定閥值：單日減少 15 億以上
     elif ma5_slope < 0 and margin_chg < -15: 
         sig = "💎 籌碼清洗 (融資大減)"
         act = f"融資單日大減 {abs(margin_chg)} 億，浮額清洗中。留意止跌訊號。"
         color = "primary"
-        
-    # 4. 多頭力竭/拉高出貨 (多頭警示)
     elif ma5_slope > 0 and fut_chg < -3000 and margin_chg > 5: 
         sig = "⚠️ 籌碼渙散 (拉高出貨)"
         act = "指數漲但外資大逃亡，散戶在接最後一棒。獲利了結，小心反轉。"
         color = "warning"
-        
-    # 5. 震盪盤 - 潛伏期
     elif abs(ma5_slope) < 10 and fut_chg > 2000 and pc_ratio > 110:
         sig = "🟩 潛伏期 (主力吃貨)"
         act = "盤整中見外資偷佈局多單。建議提前建倉，等待噴出。"
         color = "success"
-        
-    # 6. 假突破警戒
+    elif abs(ma5_slope) < 10 and margin_chg > 10: # 盤整融資大增
+        sig = "🟥 溫水煮青蛙 (散戶堆疊)"
+        act = "盤整中融資暴增，籌碼凌亂，易跌難漲。空手觀望。"
+        color = "error"
     elif ma5_slope > 0 and fut_oi < -3000:
         sig = "🟨 假突破警戒"
         act = "現貨漲但期貨空單留倉。可能是假突破，多單要設緊停損。"
@@ -641,6 +625,7 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
     
     if chip_strategy and chip_strategy['data']:
         d = chip_strategy['data']
+        # 檢查是否有 0 的情況
         has_missing = (d.get('fut_oi',0) == 0)
         
         c1, c2, c3, c4 = st.columns(4)
@@ -684,11 +669,29 @@ def plot_chart():
         df['Date'] = df['Date'].astype(str)
         df['Time'] = df['Time'].astype(str)
         df['Time'] = df['Time'].apply(lambda x: x[:5])
-        df['DT'] = pd.to_datetime(df['Date'] + ' ' + df['Time'], errors='coerce')
-        df = df.dropna(subset=['DT'])
-        df['T_S'] = (df['Taiex_Change']*10)+0.5
-        base_d = df.iloc[-1]['Date']
-        chart_data = df[df['Date'] == base_d].copy()
+        
+        # [Fix] Filter out pre-market data to prevent empty charts
+        # Only consider data after 09:00 for plotting context
+        df_valid = df[df['Time'] >= "09:00"].copy()
+        
+        if df_valid.empty:
+             return None
+
+        # Sort just in case
+        df_valid = df_valid.sort_values(['Date', 'Time'])
+        
+        # Get the last available trading date
+        base_d = df_valid.iloc[-1]['Date']
+        
+        # Now get all data for that date 
+        chart_data = df_valid[df_valid['Date'] == base_d].copy()
+        
+        # Construct DT column for Altair
+        chart_data['DT'] = pd.to_datetime(chart_data['Date'] + ' ' + chart_data['Time'], errors='coerce')
+        chart_data = chart_data.dropna(subset=['DT'])
+        
+        chart_data['T_S'] = (chart_data['Taiex_Change']*10)+0.5
+        
         if chart_data.empty: return None
         
         start_t = pd.to_datetime(f"{base_d} 09:00:00")
@@ -1111,7 +1114,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (戰略重構+掃描回歸版)...")
+        print("正在啟動 Streamlit 介面 (圖表顯示優化版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
