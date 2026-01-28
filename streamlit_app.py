@@ -146,7 +146,6 @@ def get_api():
         return api, None
     except Exception as e:
         return None, str(e)
-
 # ==========================================
 # 資料處理
 # ==========================================
@@ -224,6 +223,7 @@ def get_hist(token, code, start):
     api = DataLoader(); api.login_by_token(token)
     try: return api.taiwan_stock_daily(stock_id=code, start_date=start)
     except: return pd.DataFrame()
+
 # [核心修復] 強化版 MIS 爬蟲: 同時回傳 z(現價) 與 y(昨收)
 def get_prices_twse_mis(codes, info_map):
     if not codes: return {}
@@ -303,7 +303,6 @@ def save_rec(d, t, b, tc, t_cur, t_prev, intra, total_v):
             elif last_t != str(t_short): 
                 row.to_csv(HIST_FILE, mode='a', header=False, index=False)
     except: row.to_csv(HIST_FILE, index=False)
-
 def display_strategy_panel(slope, open_br, br, n_state):
     st.subheader("♟️ 戰略指揮所")
     strategies = []
@@ -467,9 +466,6 @@ def fetch_all():
         curr_p = curr_info.get('z', 0) 
         mis_y = curr_info.get('y', 0)  
         
-        if not df.empty and mis_y > 0 and not is_post_market:
-            pass 
-
         p_price, p_ma5, p_stt = 0, 0, "-"
         
         if not df.empty:
@@ -563,166 +559,6 @@ def fetch_all():
         "raw":{'Date':d_cur,'Time':rec_t,'Breadth':br_c}, "src":msg_src,
         "api_status": api_status_code, "sj_err": sj_err, "sj_usage": sj_usage_info
     }
-
-if __name__ == "__main__":
-    if 'streamlit' in sys.modules: run_app()
-def run_app():
-    st.title(f"📈 {APP_VER}")
-    
-    with st.sidebar:
-        st.subheader("設定")
-        auto = st.checkbox("自動更新", value=False)
-        fin_ok = "🟢" if get_finmind_token() else "🔴"
-        st.caption(f"FinMind Token: {fin_ok}")
-        tg_tok = st.text_input("TG Token", value=st.secrets.get("telegram",{}).get("token",""), type="password")
-        tg_id = st.text_input("Chat ID", value=st.secrets.get("telegram",{}).get("chat_id",""))
-        if tg_tok and tg_id: st.success("TG Ready")
-        
-        st.write("---")
-        if st.button("⚡ 強制清除快取 (重抓名單)", type="primary"):
-            st.cache_data.clear()
-            if os.path.exists(RANK_FILE): os.remove(RANK_FILE)
-            st.toast("快取已清除，正在重新抓取名單...", icon="🚀")
-            time_module.sleep(1)
-            st.rerun()
-            
-        if st.button("🗑️ 重置圖表資料"):
-            if os.path.exists(HIST_FILE):
-                os.remove(HIST_FILE)
-                st.toast("歷史資料已刪除，請重新整理", icon="🗑️")
-                time_module.sleep(1)
-                st.rerun()
-
-    if st.button("🔄 刷新"): st.rerun()
-
-    try:
-        data = fetch_all()
-        if isinstance(data, str): st.error(f"❌ {data}")
-        elif data:
-            st.sidebar.info(f"報價來源: {data['src_type']}")
-            st.sidebar.caption(f"永豐API額度: {data.get('sj_usage', '未知')}")
-            
-            status_code = data['api_status']
-            if status_code == 2: st.sidebar.success("🟢 永豐連線正常")
-            elif status_code == 1: st.sidebar.warning("🟠 流量/連線異常 (忙線)")
-            else:
-                if data['sj_err']: st.sidebar.error(f"🔴 連線失敗: {data['sj_err']}")
-                else: st.sidebar.error("🔴 未連線")
-            
-            br = data['br']
-            open_br = get_opening_breadth(data['d'])
-            
-            hist_max, hist_min = get_intraday_extremes(data['d'])
-            today_max = br if hist_max is None else max(hist_max, br)
-            today_min = br if hist_min is None else min(hist_min, br)
-            
-            n_state = load_notify_state(data['d']) 
-
-            if open_br is not None and n_state['intraday_trend'] is None:
-                if br >= (open_br + 0.05):
-                    n_state['intraday_trend'] = 'up'
-                    if tg_tok and tg_id: send_tg(tg_tok, tg_id, f"🔒 <b>【趨勢鎖定】</b>\n廣度先達開盤+5% (目前{br:.1%})，今日確認偏多！")
-                elif br <= (open_br - 0.05):
-                    n_state['intraday_trend'] = 'down'
-                    if tg_tok and tg_id: send_tg(tg_tok, tg_id, f"🔒 <b>【趨勢鎖定】</b>\n廣度先達開盤-5% (目前{br:.1%})，今日確認偏空！")
-
-            if tg_tok and tg_id:
-                stt = 'normal'
-                if br >= BREADTH_THR: stt = 'hot'
-                elif br <= BREADTH_LOW: stt = 'cold'
-                
-                if stt != n_state['last_stt']:
-                    msg = f"🔥 過熱: {br:.1%}" if stt=='hot' else (f"❄️ 冰點: {br:.1%}" if stt=='cold' else "")
-                    if msg: send_tg(tg_tok, tg_id, msg)
-                    n_state['last_stt'] = stt 
-                
-                rap_msg, rid = check_rapid(data['raw'])
-                if rap_msg and rid != n_state['last_rap']:
-                    send_tg(tg_tok, tg_id, rap_msg)
-                    n_state['last_rap'] = rid
-                
-                if open_br is not None:
-                    is_dev_high = (br >= open_br + OPEN_DEV_THR)
-                    is_dev_low = (br <= open_br - OPEN_DEV_THR)
-                    
-                    if is_dev_high and not n_state['was_dev_high']:
-                        n_state['was_dev_high'] = True
-                    
-                    if is_dev_low and not n_state['was_dev_low']:
-                        n_state['was_dev_low'] = True
-                
-                if br <= (today_max - 0.05):
-                    if not n_state['notified_drop_high']:
-                        should_notify = False
-                        if data['slope'] > 0 and n_state['intraday_trend'] == 'up': should_notify = True
-                        if data['slope'] < 0 and n_state['intraday_trend'] == 'up': should_notify = True
-                        
-                        if should_notify:
-                            msg = f"📉 <b>【高點回落】</b>\n今日高點: {today_max:.1%}\n目前廣度: {br:.1%}\n已回檔 5%"
-                            send_tg(tg_tok, tg_id, msg)
-                            
-                        n_state['notified_drop_high'] = True
-                else:
-                    n_state['notified_drop_high'] = False
-                
-                if br >= (today_min + 0.05):
-                    if not n_state['notified_rise_low']:
-                        should_notify = False
-                        if data['slope'] < 0 and n_state['intraday_trend'] == 'down': should_notify = True
-                        if data['slope'] > 0 and n_state['intraday_trend'] == 'down': should_notify = True
-                        
-                        if should_notify:
-                            msg = f"🚀 <b>【低點反彈】</b>\n今日低點: {today_min:.1%}\n目前廣度: {br:.1%}\n已反彈 5%"
-                            send_tg(tg_tok, tg_id, msg)
-
-                        n_state['notified_rise_low'] = True
-                else:
-                    n_state['notified_rise_low'] = False
-                
-                save_notify_state(n_state)
-            
-            display_strategy_panel(data['slope'], open_br, br, n_state)
-
-            st.subheader(f"📅 {data['d']}")
-            st.caption(f"名單基準日: {data['d_prev']}") 
-            st.info(f"{data['src']} | 更新: {data['t']}")
-            chart = plot_chart()
-            if chart: st.altair_chart(chart, use_container_width=True)
-            
-            c1,c2,c3 = st.columns(3)
-            c1.metric("今日廣度", f"{br:.1%}", f"{data['h']}/{data['v']}")
-            
-            caption_str = f"昨日廣度: {data['br_p']:.1%} ({data['h_p']}/{data['v_p']})"
-            if open_br:
-                caption_str += f" | 開盤: {open_br:.1%}"
-            else:
-                caption_str += " | 開盤: 等待中..."
-            c1.caption(caption_str)
-            
-            c2.metric("大盤漲跌", f"{data['tc']:.2%}")
-            sl = data['slope']; icon = "📈 正" if sl > 0 else "📉 負"
-            c3.metric("大盤MA5斜率", f"{sl:.2f}", icon)
-            
-            st.dataframe(data['df'], use_container_width=True, hide_index=True)
-        else: st.warning("⚠️ 無資料")
-    except Exception as e: st.error(f"Error: {e}")
-
-    if auto:
-        now = datetime.now(timezone(timedelta(hours=8)))
-        is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
-        if is_intra:
-            sec = 120
-            with st.sidebar:
-                t = st.empty()
-                for i in range(sec, 0, -1):
-                    t.info(f"⏳ {i}s")
-                    time_module.sleep(1)
-            st.rerun()
-        else: st.sidebar.warning("⏸ 休市")
-
-if __name__ == "__main__":
-    if 'streamlit' in sys.modules: run_app()
-# [這是 Part 3，請貼在程式碼的最尾端]
 
 def run_app():
     st.title(f"📈 {APP_VER}")
