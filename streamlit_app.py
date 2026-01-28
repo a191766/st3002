@@ -232,7 +232,7 @@ def get_ranks_strict(token, target_date_str, min_count=0):
     df = df[df['ID'].str.len()==4]
     df = df[df['ID'].str.isdigit()]
     for p in EXCL_PFX: df = df[~df['ID'].str.startswith(p)]
-    
+     
     ranks = df.sort_values('Money', ascending=False).head(TOP_N)['ID'].tolist()
     
     # 只有資料完整時才寫入快取 (避免寫入殘缺名單)
@@ -274,7 +274,8 @@ def get_prices_twse_mis(codes, info_map):
         return {}, {c: "初始化失敗" for c in codes}
 
     req_strs = []
-    chunk_size = 3
+    # [修改] 提高批次數量以加快速度，50 是安全且高效的數值
+    chunk_size = 50
     results = {}
     debug_log = {}
 
@@ -291,7 +292,7 @@ def get_prices_twse_mis(codes, info_map):
                 q_list.append(f"tse_{c}.tw")
             else:
                 q_list.append(f"otc_{c}.tw")
-                
+                 
             current_batch_codes.append(c)
                  
         if q_list:
@@ -329,10 +330,10 @@ def get_prices_twse_mis(codes, info_map):
                         source_note = ""
 
                         if z != '-' and z != '':
-                            try: 
+                             try: 
                                 price = float(z)
                                 source_note = "來源:成交"
-                            except: pass
+                             except: pass
                         
                         if price == 0 and pz != '-' and pz != '':
                             try:
@@ -354,14 +355,14 @@ def get_prices_twse_mis(codes, info_map):
                             except: pass
                             
                             if price == 0:
-                                source_note = "無成交/無掛單"
+                                 source_note = "無成交/無掛單"
                         
                         if price > 0: 
                             val['z'] = price
                             val['note'] = source_note
                         elif source_note:
                             debug_log[c] = source_note
-                        
+                       
                         if c and val: results[c] = val
 
                 except: pass
@@ -482,7 +483,7 @@ def plot_chart():
         
         start_t = pd.to_datetime(f"{base_d} 09:00:00")
         end_t = pd.to_datetime(f"{base_d} 13:30:00")
-         
+        
         base = alt.Chart(chart_data).encode(x=alt.X('DT:T', title='時間', axis=alt.Axis(format='%H:%M'), scale=alt.Scale(domain=[start_t, end_t])))
         y_ax = alt.Axis(format='%', values=[i/10 for i in range(11)], tickCount=11, labelOverlap=False)
         l_b = base.mark_line(color='#007bff').encode(y=alt.Y('Breadth', title=None, scale=alt.Scale(domain=[0,1], nice=False), axis=y_ax))
@@ -615,7 +616,7 @@ def fetch_all():
             if df.iloc[-1]['date'] == today_str:
                 curr_p = float(df.iloc[-1]['close'])
                 if len(df) >= 2: real_y = float(df.iloc[-2]['close'])
-                if 'note' in info: del info['note']
+            if 'note' in info: del info['note']
 
         p_price = 0
         if real_y > 0: 
@@ -638,8 +639,8 @@ def fetch_all():
                 closes = df['close'].tail(5).tolist()
             if len(closes) >= 5:
                 p_ma5 = sum(closes[-5:]) / 5
-                if p_price > p_ma5: p_stt="✅"
-                else: p_stt="📉"
+            if p_price > p_ma5: p_stt="✅"
+            else: p_stt="📉"
 
         c_ma5 = 0
         c_stt = "-"
@@ -809,7 +810,7 @@ def run_app():
             
             br = data['br']
             open_br = get_opening_breadth(data['d'])
-            
+             
             hist_max, hist_min = get_intraday_extremes(data['d'])
             today_max = br if hist_max is None else max(hist_max, br)
             today_min = br if hist_min is None else min(hist_min, br)
@@ -821,8 +822,8 @@ def run_app():
                     n_state['intraday_trend'] = 'up'
                     if tg_tok and tg_id: send_tg(tg_tok, tg_id, f"🔒 <b>【趨勢鎖定】</b>\n廣度先達開盤+5% (目前{br:.1%})，今日確認偏多！")
                 elif br <= (open_br - 0.05):
-                    n_state['intraday_trend'] = 'down'
-                    if tg_tok and tg_id: send_tg(tg_tok, tg_id, f"🔒 <b>【趨勢鎖定】</b>\n廣度先達開盤-5% (目前{br:.1%})，今日確認偏空！")
+                     n_state['intraday_trend'] = 'down'
+                     if tg_tok and tg_id: send_tg(tg_tok, tg_id, f"🔒 <b>【趨勢鎖定】</b>\n廣度先達開盤-5% (目前{br:.1%})，今日確認偏空！")
 
             if tg_tok and tg_id:
                 stt = 'normal'
@@ -850,33 +851,33 @@ def run_app():
                     if is_dev_low and not n_state['was_dev_low']:
                         n_state['was_dev_low'] = True
                 
-                if br <= (today_max - 0.05):
-                    if not n_state['notified_drop_high']:
-                        should_notify = False
-                        if data['slope'] > 0 and n_state['intraday_trend'] == 'up': should_notify = True
-                        if data['slope'] < 0 and n_state['intraday_trend'] == 'up': should_notify = True
-            
-                        if should_notify:
-                            msg = f"📉 <b>【高點回落】</b>\n今日高點: {today_max:.1%}\n目前廣度: {br:.1%}\n已回檔 5%"
-                            send_tg(tg_tok, tg_id, msg)
-                            
-                        n_state['notified_drop_high'] = True
-                else:
-                    n_state['notified_drop_high'] = False
+                    if br <= (today_max - 0.05):
+                        if not n_state['notified_drop_high']:
+                            should_notify = False
+                            if data['slope'] > 0 and n_state['intraday_trend'] == 'up': should_notify = True
+                            if data['slope'] < 0 and n_state['intraday_trend'] == 'up': should_notify = True
                 
-                if br >= (today_min + 0.05):
-                    if not n_state['notified_rise_low']:
-                        should_notify = False
-                        if data['slope'] < 0 and n_state['intraday_trend'] == 'down': should_notify = True
-                        if data['slope'] > 0 and n_state['intraday_trend'] == 'down': should_notify = True
-                        
-                        if should_notify:
-                            msg = f"🚀 <b>【低點反彈】</b>\n今日低點: {today_min:.1%}\n目前廣度: {br:.1%}\n已反彈 5%"
-                            send_tg(tg_tok, tg_id, msg)
+                            if should_notify:
+                                msg = f"📉 <b>【高點回落】</b>\n今日高點: {today_max:.1%}\n目前廣度: {br:.1%}\n已回檔 5%"
+                                send_tg(tg_tok, tg_id, msg)
+                                
+                            n_state['notified_drop_high'] = True
+                    else:
+                        n_state['notified_drop_high'] = False
+                    
+                    if br >= (today_min + 0.05):
+                        if not n_state['notified_rise_low']:
+                            should_notify = False
+                            if data['slope'] < 0 and n_state['intraday_trend'] == 'down': should_notify = True
+                            if data['slope'] > 0 and n_state['intraday_trend'] == 'down': should_notify = True
+                            
+                            if should_notify:
+                                msg = f"🚀 <b>【低點反彈】</b>\n今日低點: {today_min:.1%}\n目前廣度: {br:.1%}\n已反彈 5%"
+                                send_tg(tg_tok, tg_id, msg)
 
-                        n_state['notified_rise_low'] = True
-                else:
-                    n_state['notified_rise_low'] = False
+                            n_state['notified_rise_low'] = True
+                    else:
+                        n_state['notified_rise_low'] = False
             
                 save_notify_state(n_state)
             
