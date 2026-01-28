@@ -18,9 +18,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.3 (籌碼診斷修復版)
+# 設定區 v9.55.4 (籌碼API底層重構版)
 # ==========================================
-APP_VER = "v9.55.3 (籌碼診斷修復版)"
+APP_VER = "v9.55.4 (籌碼API底層重構版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -156,11 +156,11 @@ def get_api():
         return None, str(e)
 
 # ==========================================
-# 籌碼面資料處理 (Sponsor) - 診斷版
+# 籌碼面資料處理 (Sponsor) - 底層通用版
 # ==========================================
 @st.cache_data(ttl=43200) # 12小時快取
 def get_chips_data(token, target_date_str):
-    diagnosis = [] # 診斷日誌
+    diagnosis = [] 
     
     if not token:
         diagnosis.append("❌ 錯誤: 未設定 FinMind Token")
@@ -174,46 +174,70 @@ def get_chips_data(token, target_date_str):
     
     res = {}
     
-    # 1. 外資期貨
+    # 1. 外資期貨 (改用 TaiwanFuturesInstitutional)
+    # 這裡抓的是「三大法人」表，才有 'name' 欄位
     try:
-        df_fut = api.taiwan_futures_daily(futures_id="TX", start_date=start_date)
+        df_fut = api.get_data(
+            dataset="TaiwanFuturesInstitutional",
+            data_id="TX",
+            start_date=start_date
+        )
         if df_fut.empty:
-            diagnosis.append(f"⚠️ 期貨: 抓取成功但無資料 (日期: {start_date} ~ {target_date_str})")
+            diagnosis.append(f"⚠️ 期貨(法人): 抓取成功但無資料 (日期: {start_date} ~ {target_date_str})")
         else:
-            df_foreign = df_fut[df_fut['institutional_investor'] == '外資'].sort_values('date')
+            # 欄位通常為: date, name, buy_volume, sell_volume, open_interest(多空淨額?)
+            # 需確認 FinMind 欄位，通常 name='外資'
+            df_foreign = df_fut[df_fut['name'] == '外資'].sort_values('date')
             if df_foreign.empty:
-                diagnosis.append("⚠️ 期貨: 有資料但找不到 '外資' 欄位")
+                diagnosis.append("⚠️ 期貨: 找不到 '外資' 資料 (欄位 name)")
             else:
                 latest = df_foreign.iloc[-1]
                 prev = df_foreign.iloc[-2] if len(df_foreign) >= 2 else latest
+                
+                # FinMind 期貨法人表的 open_interest 通常是「未平倉口數」(持有部位)
                 res['fut_oi'] = int(latest['open_interest'])
                 res['fut_oi_chg'] = res['fut_oi'] - int(prev['open_interest'])
                 res['fut_date'] = latest['date']
-                diagnosis.append(f"✅ 期貨: 成功 (資料日: {latest['date']}, OI: {res['fut_oi']})")
+                diagnosis.append(f"✅ 期貨: 成功 (資料日: {latest['date']}, 外資OI: {res['fut_oi']})")
     except Exception as e:
         diagnosis.append(f"❌ 期貨錯誤: {str(e)}")
 
-    # 2. 選擇權 P/C Ratio
+    # 2. 選擇權 P/C Ratio (改用 get_data)
     try:
-        df_opt = api.taiwan_option_daily(option_id="TXO", start_date=start_date)
+        df_opt = api.get_data(
+            dataset="TaiwanOptionDaily",
+            data_id="TXO",
+            start_date=start_date
+        )
         if df_opt.empty:
             diagnosis.append("⚠️ 選擇權: 抓取成功但無資料")
         else:
             last_date = df_opt['date'].max()
             df_today = df_opt[df_opt['date'] == last_date]
-            put_oi = df_today[df_today['call_put'] == 'Put']['open_interest'].sum()
-            call_oi = df_today[df_today['call_put'] == 'Call']['open_interest'].sum()
-            if call_oi > 0:
-                res['pc_ratio'] = round((put_oi / call_oi) * 100, 2)
-                diagnosis.append(f"✅ 選擇權: 成功 (資料日: {last_date}, PC: {res['pc_ratio']}%)")
+            
+            # 確保欄位名稱正確
+            if 'call_put' in df_today.columns:
+                put_oi = df_today[df_today['call_put'] == 'Put']['open_interest'].sum()
+                call_oi = df_today[df_today['call_put'] == 'Call']['open_interest'].sum()
+                
+                if call_oi > 0:
+                    res['pc_ratio'] = round((put_oi / call_oi) * 100, 2)
+                    diagnosis.append(f"✅ 選擇權: 成功 (資料日: {last_date}, PC: {res['pc_ratio']}%)")
+                else:
+                    diagnosis.append("⚠️ 選擇權: Call OI 為 0")
             else:
-                diagnosis.append("⚠️ 選擇權: Call OI 為 0，無法計算")
+                diagnosis.append(f"❌ 選擇權錯誤: 找不到 'call_put' 欄位，現有欄位: {list(df_today.columns)}")
+                
     except Exception as e:
         diagnosis.append(f"❌ 選擇權錯誤: {str(e)}")
 
-    # 3. 融資維持率 (Sponsor 獨家)
+    # 3. 融資維持率 (改用 get_data 通用方法)
+    # 這能解決 'DataLoader' object has no attribute 的問題
     try:
-        df_maint = api.taiwan_stock_margin_maintenance_ratio(start_date=start_date)
+        df_maint = api.get_data(
+            dataset="TaiwanStockMarginMaintenanceRatio",
+            start_date=start_date
+        )
         if df_maint.empty:
             diagnosis.append("⚠️ 維持率: 無資料 (可能是權限不足或尚未更新)")
         else:
@@ -221,23 +245,36 @@ def get_chips_data(token, target_date_str):
             res['margin_ratio'] = float(latest['margin_maintenance_ratio'])
             diagnosis.append(f"✅ 維持率: 成功 (資料日: {latest['date']}, {res['margin_ratio']}%)")
     except Exception as e:
-        diagnosis.append(f"❌ 維持率錯誤: {str(e)}") # 這裡最容易出 403 Forbidden
+        diagnosis.append(f"❌ 維持率錯誤: {str(e)}")
     
     # 4. 融資餘額
     try:
-        df_margin = api.taiwan_stock_margin_purchase_short_sale(stock_id="TSE", start_date=start_date)
+        # 嘗試抓加權指數融資
+        df_margin = api.get_data(
+            dataset="TaiwanStockMarginPurchaseShortSale",
+            data_id="TSE", # 有時候是 0000 或 TSE
+            start_date=start_date
+        )
         if df_margin.empty:
-             df_margin = api.taiwan_stock_margin_purchase_short_sale(stock_id="0050", start_date=start_date)
+             df_margin = api.get_data(
+                dataset="TaiwanStockMarginPurchaseShortSale",
+                data_id="0050", # 備案
+                start_date=start_date
+            )
              
         if df_margin.empty:
             diagnosis.append("⚠️ 融資餘額: 無資料")
         else:
             latest = df_margin.iloc[-1]
             prev = df_margin.iloc[-2] if len(df_margin) >= 2 else latest
-            curr_bal = float(latest['margin_purchase_money']) if 'margin_purchase_money' in latest else 0
-            prev_bal = float(prev['margin_purchase_money']) if 'margin_purchase_money' in prev else 0
-            res['margin_chg'] = curr_bal - prev_bal
-            diagnosis.append(f"✅ 融資餘額: 成功 (資料日: {latest['date']})")
+            
+            if 'margin_purchase_money' in latest:
+                curr_bal = float(latest['margin_purchase_money'])
+                prev_bal = float(prev['margin_purchase_money'])
+                res['margin_chg'] = curr_bal - prev_bal
+                diagnosis.append(f"✅ 融資餘額: 成功 (資料日: {latest['date']})")
+            else:
+                diagnosis.append("⚠️ 融資餘額: 找不到 margin_purchase_money 欄位")
     except Exception as e:
         diagnosis.append(f"❌ 融資餘額錯誤: {str(e)}")
 
@@ -1086,7 +1123,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (籌碼診斷修復版)...")
+        print("正在啟動 Streamlit 介面 (籌碼API底層重構版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
