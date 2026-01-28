@@ -11,9 +11,9 @@ import time as time_module
 import random
 
 # ==========================================
-# 設定區 v9.32.0 (終極快取鎖定版)
+# 設定區 v9.32.0 (記憶體鎖定修復版)
 # ==========================================
-APP_VER = "v9.32.0 (終極快取鎖定版)"
+APP_VER = "v9.32.0 (記憶體鎖定修復版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -32,8 +32,10 @@ st.set_page_config(page_title="盤中權證進場判斷", layout="wide")
 # 基礎函式
 # ==========================================
 def get_finmind_token():
-    try: return st.secrets["finmind"]["token"]
-    except: return None
+    try:
+        return st.secrets["finmind"]["token"]
+    except:
+        return None
 
 def send_tg(token, chat_id, msg):
     if not token or not chat_id: return False
@@ -41,7 +43,8 @@ def send_tg(token, chat_id, msg):
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         r = requests.post(url, json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"})
         return r.status_code == 200
-    except: return False
+    except:
+        return False
 
 def load_notify_state(today_str):
     default_state = {
@@ -50,18 +53,27 @@ def load_notify_state(today_str):
         "notified_drop_high": False, "notified_rise_low": False,
         "intraday_trend": None  
     }
-    if not os.path.exists(NOTIFY_FILE): return default_state
+    
+    if not os.path.exists(NOTIFY_FILE):
+        return default_state
+    
     try:
         with open(NOTIFY_FILE, 'r') as f:
             state = json.load(f)
-            if state.get("date") != today_str: return default_state
-            if "intraday_trend" not in state: state["intraday_trend"] = None
+            if state.get("date") != today_str:
+                return default_state
+            if "intraday_trend" not in state:
+                state["intraday_trend"] = None
             return state
-    except: return default_state
+    except:
+        return default_state
 
 def save_notify_state(state):
-    try: with open(NOTIFY_FILE, 'w') as f: json.dump(state, f)
-    except: pass
+    try:
+        with open(NOTIFY_FILE, 'w') as f:
+            json.dump(state, f)
+    except:
+        pass
 
 def check_rapid(row):
     if not os.path.exists(HIST_FILE): return None, None
@@ -71,13 +83,19 @@ def check_rapid(row):
         curr_dt = datetime.strptime(f"{row['Date']} {row['Time']}", "%Y-%m-%d %H:%M")
         curr_v = float(row['Breadth'])
         target = None
+        
         for i in range(2, min(15, len(df)+1)):
             r = df.iloc[-i]
-            try: r_t = r['Time'] if len(str(r['Time']))==5 else r['Time'][:5]
+            try: 
+                r_t = r['Time'] if len(str(r['Time']))==5 else r['Time'][:5]
             except: continue
+            
             r_dt = datetime.strptime(f"{r['Date']} {r_t}", "%Y-%m-%d %H:%M")
-            if 230 <= (curr_dt - r_dt).total_seconds() <= 250:
+            seconds_diff = (curr_dt - r_dt).total_seconds()
+            
+            if 230 <= seconds_diff <= 250:
                 target = r; break
+                
         if target is not None:
             prev_v = float(target['Breadth'])
             diff = curr_v - prev_v
@@ -94,12 +112,16 @@ def get_opening_breadth(d_cur):
         df = pd.read_csv(HIST_FILE)
         if df.empty: return None
         if 'Total' not in df.columns: df['Total'] = 0
+        
         df['Date'] = df['Date'].astype(str)
         df_today = df[df['Date'] == str(d_cur)].copy()
         if df_today.empty: return None
+        
         df_today = df_today[df_today['Time'] >= "09:00"]
         df_valid = df_today[df_today['Total'] >= OPEN_COUNT_THR].sort_values('Time')
-        if not df_valid.empty: return float(df_valid.iloc[0]['Breadth'])
+        
+        if not df_valid.empty:
+            return float(df_valid.iloc[0]['Breadth'])
     except: pass
     return None
 
@@ -145,7 +167,6 @@ def get_days(token):
     
     now = datetime.now(timezone(timedelta(hours=8)))
     today_str = now.strftime("%Y-%m-%d")
-    # 08:00 換日
     if 0 <= now.weekday() <= 4 and now.time() >= time(8,0):
         if not dates or today_str > dates[-1]:
             dates.append(today_str)
@@ -202,7 +223,7 @@ def get_hist(token, code, start):
     try: return api.taiwan_stock_daily(stock_id=code, start_date=start)
     except: return pd.DataFrame()
 
-# [核心升級] 動態 User-Agent 輪替，防止被證交所封鎖
+# [核心升級] 動態 User-Agent
 def get_random_agent():
     agents = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
@@ -230,7 +251,6 @@ def get_prices_twse_mis(codes, info_map):
     ts = int(time_module.time() * 1000)
     base_url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&_={ts}&ex_ch="
     
-    # 每次請求建立新的 header 偽裝
     headers = {
         "User-Agent": get_random_agent(),
         "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -241,7 +261,7 @@ def get_prices_twse_mis(codes, info_map):
     for q_str in req_strs:
         try:
             url = base_url + q_str
-            time_module.sleep(random.uniform(0.3, 0.7)) # 增加隨機延遲，降低被擋機率
+            time_module.sleep(random.uniform(0.3, 0.7)) 
             r = requests.get(url, headers=headers, timeout=5)
             if r.status_code == 200:
                 data = r.json()
@@ -255,11 +275,12 @@ def get_prices_twse_mis(codes, info_map):
                         if y != '-': val['y'] = float(y)
                         
                         price = 0
-                        if z != '-': price = float(z)
-                        elif item.get('b', '-') != '-': # 買進價救援
+                        if z != '-': 
+                            price = float(z)
+                        elif item.get('b', '-') != '-': 
                              try: price = float(item.get('b').split('_')[0])
                              except: pass
-                        elif item.get('a', '-') != '-': # 賣出價救援
+                        elif item.get('a', '-') != '-': 
                              try: price = float(item.get('a').split('_')[0])
                              except: pass
                         
@@ -412,13 +433,11 @@ def fetch_all():
     else:
         msg_src = f"名單:{target_date_for_ranks} {'(硬碟)' if from_disk else '(新抓)'}"
 
-    # === [終極快取機制] ===
-    # 從 session_state 讀取「最後有效報價表」
-    # 如果這次抓不到，就用上次的填補，確保分母不掉
+    # === [快取鎖定機制] ===
     if 'price_cache' not in st.session_state:
         st.session_state['price_cache'] = {}
     
-    pmap = st.session_state['price_cache'] # 先載入舊的
+    pmap = st.session_state['price_cache']
     data_source = "歷史"
     last_t = "無即時資料"
     api_status_code = 0 
@@ -453,23 +472,30 @@ def fetch_all():
                     api_status_code = 2
             except: pass
         
-        # 2. MIS (偽裝後的備援)
-        # 找出目前快取裡還缺誰 (或是快取太舊想更新)
-        # 這裡策略：只要快取裡有，就不一定要硬抓 MIS (避免被擋)
-        # 但為了更新價格，還是要抓，只是如果有舊的就不用怕 0
-        missing_or_stale = final_codes # 全抓更新
+        # 2. MIS (只抓快取裡還沒有的，或全部抓來更新)
+        # 這裡設定：若 API 狀態不是 2 (永豐掛了)，才去硬抓 MIS
+        # 或者每隔一段時間強制更新? 為求穩定，這裡做為「補漏 + 更新」
         
-        mis_data = get_prices_twse_mis(missing_or_stale, info_map)
-        for c, val in mis_data.items():
-            # 有抓到新的才更新，沒抓到就維持舊的 (Memory Lock)
-            pmap[c] = val
-            
-        if api_status_code != 2 and len(mis_data) > 0:
-            data_source = "證交所MIS"
-            last_t = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
-            api_status_code = 2
+        # 找出快取裡缺的
+        missing_codes = [c for c in final_codes if c not in pmap]
+        
+        # 如果缺很多，或者永豐沒通，就全抓
+        if len(missing_codes) > 10 or api_status_code != 2:
+            target_codes = final_codes
+        else:
+            target_codes = missing_codes
 
-        # 將更新後的 pmap 存回 session_state
+        if target_codes:
+            mis_data = get_prices_twse_mis(target_codes, info_map)
+            for c, val in mis_data.items():
+                pmap[c] = val
+            
+            if api_status_code != 2 and len(mis_data) > 0:
+                data_source = "證交所MIS"
+                last_t = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
+                api_status_code = 2
+
+        # 存回快取
         st.session_state['price_cache'] = pmap
 
     elif is_post_market:
@@ -485,7 +511,7 @@ def fetch_all():
         m_type = info_map.get(c, "未知")
         m_display = {"twse":"上市", "tpex":"上櫃", "emerging":"興櫃"}.get(m_type, "未知")
         
-        info = pmap.get(c, {}) # 這裡一定拿得到東西 (除非完全沒快取且沒抓到)
+        info = pmap.get(c, {}) # 從快取拿
         curr_p = info.get('price', 0)
         real_y = info.get('y_close', 0)
         
@@ -494,7 +520,6 @@ def fetch_all():
                 curr_p = float(df.iloc[-1]['close'])
                 if len(df) >= 2: real_y = float(df.iloc[-2]['close'])
 
-        # 昨收與昨 MA5
         p_price = 0
         if real_y > 0: p_price = real_y
         elif not df.empty: p_price = float(df.iloc[-1]['close'])
@@ -518,8 +543,8 @@ def fetch_all():
         c_stt = "-"
         note = ""
         
-        # 快取鎖定機制：只要 pmap 裡有值，curr_p 就不會是 0
-        # 萬一真的沒抓到 (session剛開)，用昨收補，避免 0
+        # 快取鎖定: 如果 curr_p 還是 0 (代表永豐沒抓到，MIS也沒抓到，快取也沒舊資料)
+        # 那就真的沒辦法，只好先用昨收補，避免 0
         if curr_p == 0 and p_price > 0:
             curr_p = p_price 
             note = "無報價(平盤) "
