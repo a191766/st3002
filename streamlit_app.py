@@ -5,15 +5,18 @@ import numpy as np
 from FinMind.data import DataLoader
 from datetime import datetime, timedelta, timezone, time
 import shioaji as sj
-import os, sys, requests, json, subprocess, traceback
+import os, sys, json, subprocess, traceback
 import altair as alt
 import time as time_module
 import random
 
+# [關鍵修改] 引入 curl_cffi 來偽裝瀏覽器指紋
+from curl_cffi import requests as cffi_requests
+
 # ==========================================
-# 設定區 v9.41.0 (報價診斷版)
+# 設定區 v9.43.0 (TLS指紋偽裝版)
 # ==========================================
-APP_VER = "v9.41.0 (報價診斷版)"
+APP_VER = "v9.43.0 (TLS指紋偽裝版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -38,8 +41,9 @@ def get_finmind_token():
 def send_tg(token, chat_id, msg):
     if not token or not chat_id: return False
     try:
+        # TG 機器人通常不需要偽裝，用一般 requests 即可，或沿用 cffi 也可以
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        r = requests.post(url, json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"})
+        r = cffi_requests.post(url, json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}, impersonate="chrome")
         return r.status_code == 200
     except:
         return False
@@ -235,7 +239,7 @@ def get_hist(token, code, start):
     try: return api.taiwan_stock_daily(stock_id=code, start_date=start)
     except: return pd.DataFrame()
 
-# [核心修復 + 診斷功能] 
+# [核心修復: 使用 curl_cffi 偽裝指紋] 
 def get_prices_twse_mis(codes, info_map):
     """
     回傳兩個值: 
@@ -244,39 +248,58 @@ def get_prices_twse_mis(codes, info_map):
     """
     if not codes: return {}, {}
     
-    print(f"DEBUG: 準備從 MIS 抓取 {len(codes)} 檔股票...")
+    print(f"DEBUG: 準備從 MIS 抓取 {len(codes)} 檔股票 (使用 curl_cffi 偽裝)...")
     
     results = {}
-    debug_log = {} # 記錄失敗原因
+    debug_log = {} 
 
-    session = requests.Session()
+    # [關鍵修改] 使用 curl_cffi 的 Session，並指定 impersonate="chrome"
+    # 這會讓證交所認為我們是真正的 Chrome 瀏覽器，而不是 Python 爬蟲
+    session = cffi_requests.Session(impersonate="chrome")
+    
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Connection": "keep-alive",
         "Referer": "https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw",
         "Host": "mis.twse.com.tw",
         "X-Requested-With": "XMLHttpRequest",
     }
     session.headers.update(headers)
     
-    # 1. 取得 Cookie
-    try:
-        ts_now = int(time_module.time() * 1000)
-        session.get(f"https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw&_={ts_now}", timeout=10)
-        time_module.sleep(1)
-    except Exception as e:
-        print(f"DEBUG: Session 初始化失敗 - {e}")
-        # 所有這些股票都標記為連線失敗
-        for c in codes: debug_log[c] = "MIS連線初始化失敗"
+    # 1. 取得 Cookie (加入自動重試機制)
+    cookie_ok = False
+    last_err = ""
+    
+    for attempt in range(1, 4):
+        try:
+            ts_now = int(time_module.time() * 1000)
+            print(f"DEBUG: 初始化 Session 連線中 (第 {attempt} 次)...")
+            
+            time_module.sleep(random.uniform(1.0, 2.0))
+            
+            # 使用 cffi 的 session
+            session.get(f"https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw&_={ts_now}", timeout=15)
+            
+            cookie_ok = True
+            print("DEBUG: Session 初始化成功 (Cookie Get)！")
+            break
+        except Exception as e:
+            last_err = str(e)
+            print(f"DEBUG: Session 初始化失敗 ({e})，等待重試...")
+            time_module.sleep(2)
+            
+    if not cookie_ok:
+        print(f"DEBUG: Session 初始化最終失敗: {last_err}")
+        fail_reason = "MIS連線失敗(指紋仍被擋?)"
+        if "Timeout" in last_err: fail_reason = "MIS連線逾時"
+        
+        for c in codes: debug_log[c] = fail_reason
         return {}, debug_log
     
     # 2. 構建查詢
     req_strs = []
     chunk_size = 5
-    
-    # 建立一個代碼對應表，用來追蹤哪些代碼在這次請求中
     batch_map = [] 
 
     for i in range(0, len(codes), chunk_size):
@@ -303,10 +326,12 @@ def get_prices_twse_mis(codes, info_map):
     for idx, q_str in enumerate(req_strs):
         ts = int(time_module.time() * 1000)
         params = {"json": "1", "delay": "0", "_": ts, "ex_ch": q_str}
-        batch_codes = batch_map[idx] # 這一批送出的股票代碼
+        batch_codes = batch_map[idx] 
 
         try:
-            time_module.sleep(random.uniform(0.5, 1.0))
+            time_module.sleep(random.uniform(0.5, 1.2))
+            
+            # 使用 cffi 的 session 發送請求
             r = session.get(base_url, params=params, timeout=10)
             
             if r.status_code == 200:
@@ -317,7 +342,6 @@ def get_prices_twse_mis(codes, info_map):
                         for c in batch_codes: debug_log[c] = "MIS回傳空值(可能被擋)"
                         continue
                     
-                    # 這一批回傳了哪些股票
                     returned_codes = set()
 
                     for item in data['msgArray']:
@@ -355,12 +379,10 @@ def get_prices_twse_mis(codes, info_map):
                         if price > 0: 
                             val['z'] = price
                         elif status_note:
-                            # 即使是0，也要把這個原因記下來，傳出去
                             debug_log[c] = status_note
                         
                         if c and val: results[c] = val
                     
-                    # 檢查這一批有沒有漏掉的股票 (明明送出請求，但 msgArray 沒回傳)
                     for bc in batch_codes:
                         if bc not in returned_codes:
                             debug_log[bc] = "MIS查無此股(市場別錯誤?)"
@@ -529,7 +551,7 @@ def fetch_all():
         msg_src = f"名單:{target_date_for_ranks} {'(硬碟)' if from_disk else '(新抓)'}"
 
     pmap = {}
-    mis_debug_map = {} # 用來存 MIS 的錯誤訊息
+    mis_debug_map = {} 
     
     data_source = "歷史"
     last_t = "無即時資料"
@@ -569,7 +591,7 @@ def fetch_all():
         missing_codes = [c for c in final_codes if c not in pmap]
         if missing_codes:
             mis_data, debug_log = get_prices_twse_mis(missing_codes, info_map)
-            mis_debug_map = debug_log # 儲存錯誤日誌
+            mis_debug_map = debug_log 
 
             for c, val in mis_data.items():
                 pmap[c] = val
@@ -633,23 +655,20 @@ def fetch_all():
         
         if curr_p == 0: 
             c_stt = "⚠️無報價"
-            # [診斷核心] 為什麼是0?
+            # [診斷核心]
             reason = ""
             if not allow_live_fetch and not is_post_market:
                 reason = "非盤中時間"
             elif is_post_market:
                 reason = "盤後資料缺失"
             else:
-                # 檢查 MIS debug log
                 if c in mis_debug_map:
-                    reason = mis_debug_map[c] # 直接取用錯誤原因 (例如: MIS HTTP錯誤)
+                    reason = mis_debug_map[c] 
                 elif c not in pmap:
-                    # 不在 pmap 也不在 debug log (理論上 get_prices_twse_mis 會填滿 debug_log)
-                    # 只有可能是 SJ 沒抓到 且 MIS 也沒抓到
                     if sj_api and c in sj_api.Contracts.Stocks:
                         reason = "SJ+MIS皆失敗"
                     else:
-                        reason = "MIS未回傳(連線/代號問題)"
+                        reason = "MIS未回傳"
             
             if reason:
                 note = f"⚠️{reason} | 昨收{p_price}"
@@ -889,11 +908,11 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (報價診斷版)...")
+        print("正在啟動 Streamlit 介面 (TLS指紋偽裝版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
             print(f"啟動失敗: {e}")
-            print("請確認已安裝 streamlit (pip install streamlit)")
+            print("請確認已安裝 streamlit (pip install streamlit) 和 curl_cffi (pip install curl_cffi)")
         
         input("\n程式執行結束 (或發生錯誤)，請按 Enter 鍵離開...")
