@@ -10,8 +10,7 @@ import altair as alt
 import time as time_module
 import random
 
-# [關鍵修改] 引入 curl_cffi 來偽裝瀏覽器指紋
-# 請務必確認 requirements.txt 已加入 curl_cffi
+# 引入 curl_cffi 
 try:
     from curl_cffi import requests as cffi_requests
 except ImportError:
@@ -19,9 +18,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.43.0 (TLS指紋偽裝版)
+# 設定區 v9.44.0 (興櫃修正+價格補全)
 # ==========================================
-APP_VER = "v9.43.0 (TLS指紋偽裝版)"
+APP_VER = "v9.44.0 (興櫃修正+價格補全)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -46,7 +45,6 @@ def get_finmind_token():
 def send_tg(token, chat_id, msg):
     if not token or not chat_id: return False
     try:
-        # TG 機器人通常不需要偽裝，用一般 requests 或 cffi 都可以
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         r = cffi_requests.post(url, json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}, impersonate="chrome")
         return r.status_code == 200
@@ -244,21 +242,15 @@ def get_hist(token, code, start):
     try: return api.taiwan_stock_daily(stock_id=code, start_date=start)
     except: return pd.DataFrame()
 
-# [核心修復: 使用 curl_cffi 偽裝指紋] 
+# [核心功能: 查詢 MIS] 
 def get_prices_twse_mis(codes, info_map):
-    """
-    回傳兩個值: 
-    1. results: {code: {z: price, y: close, ...}}
-    2. debug_log: {code: "失敗原因"} (用於診斷為什麼是0)
-    """
     if not codes: return {}, {}
     
-    print(f"DEBUG: 準備從 MIS 抓取 {len(codes)} 檔股票 (使用 curl_cffi 偽裝)...")
+    print(f"DEBUG: 準備從 MIS 抓取 {len(codes)} 檔股票 (curl_cffi)...")
     
     results = {}
     debug_log = {} 
 
-    # [關鍵修改] 使用 curl_cffi 的 Session，並指定 impersonate="chrome"
     session = cffi_requests.Session(impersonate="chrome")
     
     headers = {
@@ -271,33 +263,24 @@ def get_prices_twse_mis(codes, info_map):
     }
     session.headers.update(headers)
     
-    # 1. 取得 Cookie (加入自動重試機制)
+    # 1. 取得 Cookie
     cookie_ok = False
     last_err = ""
     
     for attempt in range(1, 4):
         try:
             ts_now = int(time_module.time() * 1000)
-            print(f"DEBUG: 初始化 Session 連線中 (第 {attempt} 次)...")
-            
             time_module.sleep(random.uniform(1.0, 2.0))
-            
-            # 使用 cffi 的 session
             session.get(f"https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw&_={ts_now}", timeout=15)
-            
             cookie_ok = True
-            print("DEBUG: Session 初始化成功 (Cookie Get)！")
             break
         except Exception as e:
             last_err = str(e)
-            print(f"DEBUG: Session 初始化失敗 ({e})，等待重試...")
             time_module.sleep(2)
             
     if not cookie_ok:
-        print(f"DEBUG: Session 初始化最終失敗: {last_err}")
-        fail_reason = "MIS連線失敗(指紋仍被擋?)"
+        fail_reason = "MIS連線失敗(指紋被擋)"
         if "Timeout" in last_err: fail_reason = "MIS連線逾時"
-        
         for c in codes: debug_log[c] = fail_reason
         return {}, debug_log
     
@@ -315,7 +298,9 @@ def get_prices_twse_mis(codes, info_map):
             if not c: continue
             
             m_type = info_map.get(c, "twse").lower()
-            if "tpex" in m_type or "otc" in m_type:
+            
+            # [修正1] 興櫃 (emerging) 也要走 otc 查詢
+            if "tpex" in m_type or "otc" in m_type or "emerging" in m_type:
                 q_list.append(f"otc_{c}.tw")
             else:
                 q_list.append(f"tse_{c}.tw")
@@ -334,15 +319,12 @@ def get_prices_twse_mis(codes, info_map):
 
         try:
             time_module.sleep(random.uniform(0.5, 1.2))
-            
-            # 使用 cffi 的 session 發送請求
             r = session.get(base_url, params=params, timeout=10)
             
             if r.status_code == 200:
                 try:
                     data = r.json()
                     if 'msgArray' not in data: 
-                        print(f"DEBUG: 請求成功但無 msgArray: {q_str}")
                         for c in batch_codes: debug_log[c] = "MIS回傳空值(可能被擋)"
                         continue
                     
@@ -352,8 +334,10 @@ def get_prices_twse_mis(codes, info_map):
                         c = item.get('c', '') 
                         returned_codes.add(c)
                         
-                        z = item.get('z', '-') 
-                        y = item.get('y', '-') 
+                        z = item.get('z', '-') # 最近成交
+                        y = item.get('y', '-') # 昨收
+                        o = item.get('o', '-') # 開盤
+                        h = item.get('h', '-') # 最高
                         
                         val = {}
                         if y != '-' and y != '':
@@ -363,11 +347,23 @@ def get_prices_twse_mis(codes, info_map):
                         price = 0
                         status_note = ""
 
+                        # [修正2] 價格抓取邏輯增強
+                        # 優先抓 z (成交價)
                         if z != '-' and z != '':
                             try: price = float(z)
                             except: pass
                         
-                        # 嘗試最佳買賣價
+                        # 如果 z 沒抓到，但有開盤價 o (代表今天有成交，只是剛好當下 z 是空)
+                        if price == 0 and o != '-' and o != '':
+                            try: price = float(o)
+                            except: pass
+                            
+                        # 如果還是 0，試試看 h (最高價)
+                        if price == 0 and h != '-' and h != '':
+                            try: price = float(h)
+                            except: pass
+
+                        # 最後手段：最佳買賣價
                         if price == 0:
                             try:
                                 b = item.get('b', '-').split('_')[0]
@@ -392,13 +388,10 @@ def get_prices_twse_mis(codes, info_map):
                             debug_log[bc] = "MIS查無此股(市場別錯誤?)"
 
                 except: 
-                    print(f"DEBUG: JSON 解析錯誤")
                     for c in batch_codes: debug_log[c] = "MIS回傳JSON錯誤"
             else:
-                print(f"DEBUG: 請求失敗 Status: {r.status_code}")
                 for c in batch_codes: debug_log[c] = f"MIS HTTP錯誤{r.status_code}"
         except Exception as e:
-             print(f"DEBUG: 連線例外 - {e}")
              for c in batch_codes: debug_log[c] = "MIS連線例外中止"
         
     return results, debug_log
@@ -912,7 +905,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (TLS指紋偽裝版)...")
+        print("正在啟動 Streamlit 介面 (興櫃修正+價格補全)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
