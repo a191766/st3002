@@ -18,9 +18,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.51.0 (盤後收盤價補全版)
+# 設定區 v9.52.0 (排名完整性檢核版)
 # ==========================================
-APP_VER = "v9.51.0 (盤後收盤價補全版)"
+APP_VER = "v9.52.0 (排名完整性檢核版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -199,8 +199,14 @@ def get_stock_info_map(token):
         return base_map
     except: return base_map
 
-def get_ranks_strict(token, target_date_str):
-    if os.path.exists(RANK_FILE):
+# [核心修改: 增加 min_count 參數]
+def get_ranks_strict(token, target_date_str, min_count=0):
+    """
+    獲取排名。
+    min_count: 如果抓到的總檔數低於此數，視為資料不全 (例如只有上市沒有上櫃)，返回失敗。
+    """
+    # 只有當不檢查數量時，才使用快取 (因為快取可能存了不完整的資料)
+    if min_count == 0 and os.path.exists(RANK_FILE):
         try:
             with open(RANK_FILE, 'r') as f:
                 data = json.load(f)
@@ -216,6 +222,12 @@ def get_ranks_strict(token, target_date_str):
     
     if df.empty: return [], False
 
+    # [關鍵檢查] 檢查資料完整性
+    # 台灣上市+上櫃通常有 1700+ 檔。如果只抓到 900 多檔，代表只有上市資料
+    if min_count > 0 and len(df) < min_count:
+        print(f"DEBUG: {target_date_str} 資料筆數 {len(df)} < {min_count}，判定為資料不全 (FinMind可能尚未更新上櫃)，跳過。")
+        return [], False
+
     df['ID'] = get_col(df, ['stock_id','code'])
     df['Money'] = get_col(df, ['Trading_money','turnover'])
     if df['ID'] is None or df['Money'] is None: return [], False
@@ -227,7 +239,8 @@ def get_ranks_strict(token, target_date_str):
     
     ranks = df.sort_values('Money', ascending=False).head(TOP_N)['ID'].tolist()
     
-    if ranks:
+    # 只有資料完整時才寫入快取
+    if ranks and (min_count == 0 or len(df) > 1500):
         try:
             with open(RANK_FILE, 'w') as f:
                 json.dump({"date": target_date_str, "ranks": ranks}, f)
@@ -535,16 +548,29 @@ def fetch_all():
     is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
     allow_live_fetch = (0<=now.weekday()<=4) and (now.time() >= time(8,45))
     
-    target_date_for_ranks = days[-2] if (len(days)>1 and now.time() < time(14, 0) and d_cur == today_str) else d_cur
-    if now.time() >= time(14, 0): target_date_for_ranks = today_str
-
-    final_codes, from_disk = get_ranks_strict(ft, target_date_for_ranks)
-    if not final_codes and target_date_for_ranks == today_str and len(days)>1:
-        target_date_for_ranks = days[-2]
-        final_codes, _ = get_ranks_strict(ft, target_date_for_ranks)
-        msg_src = f"名單:{target_date_for_ranks}(延用舊單)"
+    # [修正: 名單邏輯]
+    # 預設先抓「昨天」的名單，這是最保險的
+    target_rank_date = days[-2] if len(days) > 1 else today_str
+    
+    # 如果是下午 14:00 後，我們 *嘗試* 抓抓看今天的名單
+    if now.time() >= time(14, 0) and d_cur == today_str:
+        # 設定 min_count=1500，強迫 FinMind 必須吐出上市+上櫃的量才算數
+        codes_today, _ = get_ranks_strict(ft, today_str, min_count=1500)
+        
+        if codes_today:
+            # 成功抓到完整名單，就用今天的
+            target_rank_date = today_str
+            final_codes = codes_today
+            from_disk = False
+            msg_src = f"名單:{today_str}(今日完整)"
+        else:
+            # 沒抓到 (可能 FinMind 只更新了上市)，回退到昨天
+            final_codes, from_disk = get_ranks_strict(ft, target_rank_date)
+            msg_src = f"名單:{target_rank_date}(昨日/今日不全)"
     else:
-        msg_src = f"名單:{target_date_for_ranks} {'(硬碟)' if from_disk else '(新抓)'}"
+        # 盤中或早上，直接用昨天的
+        final_codes, from_disk = get_ranks_strict(ft, target_rank_date)
+        msg_src = f"名單:{target_rank_date} {'(硬碟)' if from_disk else '(新抓)'}"
 
     pmap = {}
     mis_debug_map = {} 
@@ -556,8 +582,6 @@ def fetch_all():
     
     is_post_market = (now.time() >= time(14, 0))
     
-    # [核心修改] 即使是盤後 (is_post_market)，也允許爬蟲 (allow_live_fetch)
-    # 用來填補 FinMind 資料庫更新前的空窗期
     if allow_live_fetch:
         # 1. Shioaji (優先)
         if sj_api:
@@ -599,9 +623,8 @@ def fetch_all():
                 last_t = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
                 api_status_code = 2
 
-    # 如果是盤後，嘗試使用 FinMind 覆蓋 (如果是最新的話)
     if is_post_market:
-        if data_source == "歷史": # 如果沒抓到 MIS，就標示為盤後歷史
+        if data_source == "歷史": 
              data_source = "FinMind盤後"
              last_t = "13:30:00"
 
@@ -615,17 +638,14 @@ def fetch_all():
         m_display = {"twse":"上市", "tpex":"上櫃", "emerging":"興櫃"}.get(m_type, "未知")
         
         info = pmap.get(c, {})
-        curr_p = info.get('z', info.get('price', 0)) # MIS 用 z, SJ 用 price
+        curr_p = info.get('z', info.get('price', 0)) 
         
         real_y = info.get('y', info.get('y_close', 0)) 
         
-        # [核心邏輯] 盤後處理：優先用 FinMind 歷史，如果沒有，就維持 MIS 爬到的價格
         if is_post_market and not df.empty:
-            # 只有當 FinMind 資料庫真的有"今天"的日期，才用它
             if df.iloc[-1]['date'] == today_str:
                 curr_p = float(df.iloc[-1]['close'])
                 if len(df) >= 2: real_y = float(df.iloc[-2]['close'])
-                # 如果有官方資料，就可以清掉 debug note
                 if 'note' in info: del info['note']
 
         # 昨收與昨 MA5
@@ -633,7 +653,6 @@ def fetch_all():
         if real_y > 0: 
             p_price = real_y
         elif not df.empty:
-            # 如果 FinMind 有今天，昨收是倒數第二筆；如果沒今天，昨收是最後一筆
             if df.iloc[-1]['date'] == today_str and len(df) >= 2:
                  p_price = float(df.iloc[-2]['close'])
             else:
@@ -644,12 +663,9 @@ def fetch_all():
         
         if not df.empty and p_price > 0:
             closes = []
-            # 計算昨 MA5 (需要昨收往前推4天)
             if df.iloc[-1]['date'] == today_str:
-                # df[-1] 是今天, df[-2] 是昨天
-                closes = df['close'].iloc[:-1].tail(5).tolist() # 拿昨天的前5筆
+                closes = df['close'].iloc[:-1].tail(5).tolist() 
             else:
-                # df[-1] 是昨天
                 closes = df['close'].tail(5).tolist()
             
             if len(closes) >= 5:
@@ -664,9 +680,8 @@ def fetch_all():
         
         if curr_p == 0: 
             c_stt = "⚠️無報價"
-            # [診斷核心]
             reason = ""
-            if not allow_live_fetch: # 深夜或假日
+            if not allow_live_fetch: 
                 reason = "非交易時間"
             elif is_post_market:
                 reason = "盤後資料缺失"
@@ -681,14 +696,11 @@ def fetch_all():
             else:
                 note = f"昨收{p_price}"
         
-        # 顯示價格來源 (如果有)
         source_note = info.get('note', '')
         if source_note:
             note = f"📝{source_note} " + note
 
         if curr_p > 0 and p_price > 0 and not df.empty:
-            # 計算今 MA5 (昨收往前推3天 + 昨收 + 今價)
-            # 這裡需要準確的歷史數據
             hist_closes = []
             if df.iloc[-1]['date'] == today_str:
                  hist_closes = df['close'].iloc[:-1].tail(4).tolist()
@@ -717,7 +729,6 @@ def fetch_all():
     try:
         tw = get_hist(ft, "TAIEX", s_dt)
         if not tw.empty:
-            # 大盤
             mis_tw, _ = get_prices_twse_mis(["t00"], {"t00":"twse"}) 
             t_curr = mis_tw.get("t00", {}).get("z", 0)
             
@@ -730,11 +741,9 @@ def fetch_all():
             if t_curr > 0: t_cur = t_curr
             else: t_cur = t_pre
 
-            # 斜率計算 (簡化)
             hist_tw = tw['close'].tail(5).tolist()
-            if len(hist_tw) >= 5:
-                # 這裡簡單抓，實際上盤後會有更精確的
-                pass
+            # 這裡簡化處理
+            pass
             
     except: pass
     
@@ -746,7 +755,7 @@ def fetch_all():
     save_rec(d_cur, rec_t, br_c, t_chg, t_cur, t_pre, is_intra, v_c)
     
     return {
-        "d":d_cur, "d_prev": target_date_for_ranks, 
+        "d":d_cur, "d_prev": target_rank_date, 
         "br":br_c, "br_p":br_p, "h":h_c, "v":v_c, "h_p":h_p, "v_p":v_p,
         "df":pd.DataFrame(dtls), 
         "t":last_t, "tc":t_chg, "slope":slope, "src_type": data_source,
@@ -923,7 +932,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (盤後收盤價補全版)...")
+        print("正在啟動 Streamlit 介面 (排名完整性檢核版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
