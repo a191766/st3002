@@ -11,7 +11,12 @@ import time as time_module
 import random
 
 # [關鍵修改] 引入 curl_cffi 來偽裝瀏覽器指紋
-from curl_cffi import requests as cffi_requests
+# 請務必確認 requirements.txt 已加入 curl_cffi
+try:
+    from curl_cffi import requests as cffi_requests
+except ImportError:
+    st.error("缺少 curl_cffi 套件！請在 requirements.txt 中加入 'curl_cffi'")
+    st.stop()
 
 # ==========================================
 # 設定區 v9.43.0 (TLS指紋偽裝版)
@@ -41,7 +46,7 @@ def get_finmind_token():
 def send_tg(token, chat_id, msg):
     if not token or not chat_id: return False
     try:
-        # TG 機器人通常不需要偽裝，用一般 requests 即可，或沿用 cffi 也可以
+        # TG 機器人通常不需要偽裝，用一般 requests 或 cffi 都可以
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         r = cffi_requests.post(url, json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}, impersonate="chrome")
         return r.status_code == 200
@@ -254,7 +259,6 @@ def get_prices_twse_mis(codes, info_map):
     debug_log = {} 
 
     # [關鍵修改] 使用 curl_cffi 的 Session，並指定 impersonate="chrome"
-    # 這會讓證交所認為我們是真正的 Chrome 瀏覽器，而不是 Python 爬蟲
     session = cffi_requests.Session(impersonate="chrome")
     
     headers = {
