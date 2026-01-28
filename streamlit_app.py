@@ -18,9 +18,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.11 (自動掃描+語法修復版)
+# 設定區 v9.55.9 (跨代鎖定版 V2/V4)
 # ==========================================
-APP_VER = "v9.55.11 (自動掃描+語法修復版)"
+APP_VER = "v9.55.9 (跨代鎖定版 V2/V4)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -156,41 +156,39 @@ def get_api():
         return None, str(e)
 
 # ==========================================
-# 籌碼面資料處理 (Auto-Discovery)
+# 籌碼面資料處理 (Direct API - Multi-Version)
 # ==========================================
-def call_finmind_api_try_versions(dataset_candidates, data_id, start_date, token):
+def call_finmind_api(dataset, data_id, start_date, token, version="v4"):
     """
-    自動掃描機制：
-    1. 嘗試不同的 dataset 名稱
-    2. 嘗試不同的 API 版本 (v4, v3)
+    指定 API 版本呼叫
     """
-    versions = ["v4", "v3"]
-    last_error = ""
+    url = f"https://api.finmindtrade.com/api/{version}/data"
     
-    for dataset in dataset_candidates:
-        for v in versions:
-            url = f"https://api.finmindtrade.com/api/{v}/data"
-            params = {
-                "dataset": dataset,
-                "start_date": start_date,
-                "token": token
-            }
-            if data_id: params["data_id"] = data_id
+    params = {
+        "dataset": dataset,
+        "start_date": start_date,
+        "token": token
+    }
+    if data_id:
+        params["data_id"] = data_id
+        
+    try:
+        r = cffi_requests.get(url, params=params, impersonate="chrome", timeout=15)
+        
+        if r.status_code == 200:
+            res_json = r.json()
+            if "data" in res_json:
+                return pd.DataFrame(res_json["data"])
+            elif "msg" in res_json:
+                return f"API Msg: {res_json['msg']}"
+            else:
+                return "Unknown Response Format"
+        else:
+            # 回傳狀態碼與部分錯誤訊息以便除錯
+            return f"HTTP {r.status_code} ({version}): {r.text[:200]}"
             
-            try:
-                r = cffi_requests.get(url, params=params, impersonate="chrome", timeout=10)
-                if r.status_code == 200:
-                    res_json = r.json()
-                    if "data" in res_json and len(res_json["data"]) > 0:
-                        return pd.DataFrame(res_json["data"]), f"{dataset} ({v})"
-                    elif "msg" in res_json:
-                        last_error = f"{dataset} ({v}): {res_json['msg']}"
-                else:
-                    last_error = f"{dataset} ({v}) HTTP {r.status_code}: {r.text[:50]}..."
-            except Exception as e:
-                last_error = str(e)
-                
-    return pd.DataFrame(), last_error
+    except Exception as e:
+        return f"Exception: {str(e)}"
 
 @st.cache_data(ttl=43200) # 12小時快取
 def get_chips_data(token, target_date_str):
@@ -200,45 +198,46 @@ def get_chips_data(token, target_date_str):
         diagnosis.append("❌ 錯誤: 未設定 FinMind Token")
         return None, diagnosis
     
+    # 往前抓 10 天
     start_date = (datetime.strptime(target_date_str, "%Y-%m-%d") - timedelta(days=10)).strftime("%Y-%m-%d")
+    
     res = {}
     
-    # 1. 外資期貨 (掃描所有可能的名稱)
-    fut_candidates = [
-        "TaiwanFuturesInstitutional", 
-        "TaiwanFuturesInstitutionalInvestors",
-        "TaiwanFuturesInstitutionalInvestor"
-    ]
-    df_fut, fut_src = call_finmind_api_try_versions(fut_candidates, "TX", start_date, token)
-    
-    if df_fut.empty:
-        diagnosis.append(f"❌ 期貨: 掃描失敗 (最後錯誤: {fut_src})")
-    else:
-        col_name = 'name' if 'name' in df_fut.columns else 'institutional_investor'
-        if col_name in df_fut.columns:
-            df_foreign = df_fut[df_fut[col_name].astype(str).str.contains('外資|Foreign', case=False)].sort_values('date')
-            
-            if df_foreign.empty:
-                diagnosis.append(f"⚠️ 期貨({fut_src}): 找不到外資資料")
-            else:
-                latest = df_foreign.iloc[-1]
-                prev = df_foreign.iloc[-2] if len(df_foreign) >= 2 else latest
-                oi_col = 'open_interest' if 'open_interest' in latest else None
-                
-                if oi_col:
-                    res['fut_oi'] = int(latest[oi_col])
-                    prev_oi = int(prev[oi_col])
-                    res['fut_oi_chg'] = res['fut_oi'] - prev_oi
-                    diagnosis.append(f"✅ 期貨: 成功 ({fut_src}, OI={res['fut_oi']})")
-                else:
-                    diagnosis.append(f"❌ 期貨: 找不到OI欄位 {list(latest.keys())}")
-        else:
-            diagnosis.append(f"❌ 期貨: 找不到法人欄位 {list(df_fut.columns)}")
-
-    # 2. 選擇權 P/C Ratio
+    # 1. 外資期貨 (TaiwanFuturesInstitutional) -> 改為 V4
+    # 原 V2 已被限制，改用 V4 嘗試
     try:
-        df_opt, opt_src = call_finmind_api_try_versions(["TaiwanOptionDaily"], "TXO", start_date, token)
-        if df_opt.empty:
+        df_fut = call_finmind_api("TaiwanFuturesInstitutional", "TX", start_date, token, version="v4")
+        
+        if isinstance(df_fut, str):
+            diagnosis.append(f"❌ 期貨API失敗: {df_fut}")
+        elif df_fut.empty:
+            diagnosis.append(f"⚠️ 期貨: 無資料 (日期: {start_date} ~ {target_date_str})")
+        else:
+            col_name = 'name' if 'name' in df_fut.columns else 'institutional_investor'
+            if col_name in df_fut.columns:
+                df_foreign = df_fut[df_fut[col_name] == '外資'].sort_values('date')
+                if df_foreign.empty:
+                    diagnosis.append("⚠️ 期貨: 找不到 '外資' 資料")
+                else:
+                    latest = df_foreign.iloc[-1]
+                    prev = df_foreign.iloc[-2] if len(df_foreign) >= 2 else latest
+                    
+                    res['fut_oi'] = int(latest.get('open_interest', 0))
+                    prev_oi = int(prev.get('open_interest', 0))
+                    res['fut_oi_chg'] = res['fut_oi'] - prev_oi
+                    res['fut_date'] = latest['date']
+                    diagnosis.append(f"✅ 期貨(V4): 成功 ({latest['date']} OI={res['fut_oi']})")
+            else:
+                diagnosis.append(f"❌ 期貨: 欄位異常 {list(df_fut.columns)}")
+    except Exception as e:
+        diagnosis.append(f"❌ 期貨程式錯誤: {str(e)}")
+
+    # 2. 選擇權 P/C Ratio (TaiwanOptionDaily) -> V4 OK
+    try:
+        df_opt = call_finmind_api("TaiwanOptionDaily", "TXO", start_date, token, version="v4")
+        if isinstance(df_opt, str):
+            diagnosis.append(f"❌ 選擇權API失敗: {df_opt}")
+        elif df_opt.empty:
             diagnosis.append("⚠️ 選擇權: 無資料")
         else:
             last_date = df_opt['date'].max()
@@ -249,31 +248,36 @@ def get_chips_data(token, target_date_str):
                 call_oi = df_today[df_today[cp_col].str.lower() == 'call']['open_interest'].sum()
                 if call_oi > 0:
                     res['pc_ratio'] = round((put_oi / call_oi) * 100, 2)
-                    diagnosis.append(f"✅ 選擇權: 成功 (PC={res['pc_ratio']}%)")
-    except: pass
+                    diagnosis.append(f"✅ 選擇權(V4): 成功 ({last_date} PC={res['pc_ratio']}%)")
+                else:
+                    diagnosis.append("⚠️ 選擇權: Call OI 為 0")
+    except Exception as e:
+        diagnosis.append(f"❌ 選擇權程式錯誤: {str(e)}")
 
-    # 3. 融資維持率
-    maint_candidates = [
-        "TaiwanStockMarginMaintenanceRatio",
-        "TaiwanStockAverageMarginMaintenanceRatio"
-    ]
-    df_maint, maint_src = call_finmind_api_try_versions(maint_candidates, None, start_date, token)
-    
-    if df_maint.empty:
-        diagnosis.append(f"❌ 維持率: 掃描失敗 ({maint_src})")
-    else:
-        latest = df_maint.iloc[-1]
-        col_maint = 'margin_maintenance_ratio' if 'margin_maintenance_ratio' in latest else 'MarginMaintenanceRatio'
-        if col_maint in latest:
-            res['margin_ratio'] = float(latest[col_maint])
-            diagnosis.append(f"✅ 維持率: 成功 ({maint_src}, {res['margin_ratio']}%)")
-        else:
-            diagnosis.append(f"❌ 維持率: 欄位異常 {list(latest.keys())}")
-    
-    # 4. 融資餘額
+    # 3. 融資維持率 (TaiwanStockMarginMaintenanceRatio) -> 改為 V4
+    # 原 V2 已被限制，改用 V4 嘗試
     try:
-        df_margin, margin_src = call_finmind_api_try_versions(["TaiwanStockTotalMarginPurchaseShortSale"], None, start_date, token)
-        if not df_margin.empty:
+        df_maint = call_finmind_api("TaiwanStockMarginMaintenanceRatio", None, start_date, token, version="v4")
+        
+        if isinstance(df_maint, str):
+            diagnosis.append(f"❌ 維持率API失敗: {df_maint}")
+        elif df_maint.empty:
+            diagnosis.append("⚠️ 維持率: 無資料 (Sponsor權限?)")
+        else:
+            latest = df_maint.iloc[-1]
+            res['margin_ratio'] = float(latest['margin_maintenance_ratio'])
+            diagnosis.append(f"✅ 維持率(V4): 成功 ({latest['date']} {res['margin_ratio']}%)")
+    except Exception as e:
+        diagnosis.append(f"❌ 維持率程式錯誤: {str(e)}")
+    
+    # 4. 融資餘額 (TaiwanStockTotalMarginPurchaseShortSale) -> V4 OK
+    try:
+        df_margin = call_finmind_api("TaiwanStockTotalMarginPurchaseShortSale", None, start_date, token, version="v4")
+        if isinstance(df_margin, str):
+            diagnosis.append(f"❌ 融資API失敗: {df_margin}")
+        elif df_margin.empty:
+            diagnosis.append("⚠️ 融資餘額: 無資料")
+        else:
             df_money = df_margin[df_margin['name'] == 'MarginPurchaseMoney'].sort_values('date')
             if not df_money.empty:
                 latest = df_money.iloc[-1]
@@ -281,8 +285,11 @@ def get_chips_data(token, target_date_str):
                 curr_bal = float(latest['TodayBalance'])
                 prev_bal = float(prev['TodayBalance'])
                 res['margin_chg'] = round((curr_bal - prev_bal) / 100000000, 2) 
-                diagnosis.append(f"✅ 大盤融資餘額: 成功 (變動:{res['margin_chg']}億)")
-    except: pass
+                diagnosis.append(f"✅ 大盤融資餘額(V4): 成功 ({latest['date']} 變動:{res['margin_chg']}億)")
+            else:
+                diagnosis.append(f"⚠️ 融資餘額: 找不到 MarginPurchaseMoney")
+    except Exception as e:
+        diagnosis.append(f"❌ 融資餘額程式錯誤: {str(e)}")
 
     return res, diagnosis
 
@@ -307,7 +314,7 @@ def get_chip_strategy(ma5_slope, chips):
         sig = "🚀 火力全開 (外資助攻)"
         act = "外資期現貨同步作多，支撐強勁。多單抱緊，甚至加碼。"
         color = "success"
-    elif ma5_slope < 0 and margin_ratio < 135 and margin_ratio > 0: 
+    elif ma5_slope < 0 and margin_ratio < 135: 
         sig = "💎 遍地黃金 (斷頭止跌)"
         act = "融資斷頭多殺多，通常是波段最低點。大膽分批買進。"
         color = "primary"
@@ -319,7 +326,7 @@ def get_chip_strategy(ma5_slope, chips):
         sig = "🟩 潛伏期 (主力吃貨)"
         act = "盤整中見外資偷佈局多單。建議提前建倉，等待噴出。"
         color = "success"
-    elif abs(ma5_slope) < 10 and margin_ratio < 145 and margin_ratio > 0:
+    elif abs(ma5_slope) < 10 and margin_ratio < 145:
         sig = "🟥 溫水煮青蛙 (瀕臨斷頭)"
         act = "盤整但維持率過低，隨時引發多殺多。空手觀望。"
         color = "error"
@@ -337,7 +344,7 @@ def get_col(df, names):
     cols = {c.lower(): c for c in df.columns}
     for n in names:
         if n in df.columns: return df[n]
-        if n.lower() in cols: return df[cols[n.lower()]]
+    if n.lower() in cols: return df[cols[n.lower()]]
     return None
 
 @st.cache_data(ttl=600)
@@ -461,7 +468,7 @@ def get_prices_twse_mis(codes, info_map):
                 q_list.append(f"tse_{c}.tw")
             else:
                 q_list.append(f"otc_{c}.tw")
-                 
+            
             current_batch_codes.append(c)
                  
         if q_list:
@@ -693,6 +700,7 @@ def plot_chart():
         df = df.dropna(subset=['DT'])
         df['T_S'] = (df['Taiex_Change']*10)+0.5
         base_d = df.iloc[-1]['Date']
+    
         chart_data = df[df['Date'] == base_d].copy()
         if chart_data.empty: return None
         
@@ -830,7 +838,7 @@ def fetch_all():
         if not df.empty and p_price > 0:
             closes = []
             if df.iloc[-1]['date'] == today_str:
-                closes = df['close'].iloc[:-1].tail(5).tolist() 
+                 closes = df['close'].iloc[:-1].tail(5).tolist() 
             else:
                 closes = df['close'].tail(5).tolist()
             if len(closes) >= 5:
@@ -873,7 +881,7 @@ def fetch_all():
                 if curr_p > c_ma5: h_c += 1; c_stt="✅"
                 else: c_stt="📉"
                 v_c += 1
-        
+    
         dtls.append({
             "代號":c, "市場": m_display,
             "昨收":p_price, "昨MA5":round(p_ma5,2), "昨狀態":p_stt,
@@ -1129,7 +1137,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (自動掃描+語法修復版)...")
+        print("正在啟動 Streamlit 介面 (跨代鎖定版 V2/V4)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
