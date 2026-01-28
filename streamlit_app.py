@@ -12,9 +12,9 @@ import time as time_module
 import random
 
 # ==========================================
-# 設定區 v9.24.1 (修復缺失函式版)
+# 設定區 v9.26.0 (數據校正修復版)
 # ==========================================
-APP_VER = "v9.24.1 (修復缺失函式版)"
+APP_VER = "v9.26.0 (數據校正修復版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -168,7 +168,8 @@ def get_days(token):
     
     now = datetime.now(timezone(timedelta(hours=8)))
     today_str = now.strftime("%Y-%m-%d")
-    if 0 <= now.weekday() <= 4 and now.time() >= time(8,45):
+    # 晨間就緒: 08:00 就視為新的一天
+    if 0 <= now.weekday() <= 4 and now.time() >= time(8,0):
         if not dates or today_str > dates[-1]:
             dates.append(today_str)
     return dates
@@ -223,17 +224,19 @@ def get_hist(token, code, start):
     api = DataLoader(); api.login_by_token(token)
     try: return api.taiwan_stock_daily(stock_id=code, start_date=start)
     except: return pd.DataFrame()
-
+# [核心修復] 強化版 MIS 爬蟲: 同時回傳 z(現價) 與 y(昨收)
 def get_prices_twse_mis(codes, info_map):
     if not codes: return {}
     req_strs = []
-    chunk_size = 50 
+    chunk_size = 30 # 縮小 batch size 避免被擋
     
-    headers = {
+    session = requests.Session()
+    session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Referer": "https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw",
-    }
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    })
 
     for i in range(0, len(codes), chunk_size):
         chunk = codes[i:i+chunk_size]
@@ -251,21 +254,22 @@ def get_prices_twse_mis(codes, info_map):
     for q_str in req_strs:
         try:
             url = base_url + q_str
-            time_module.sleep(random.uniform(0.1, 0.3)) 
-            r = requests.get(url, headers=headers)
+            time_module.sleep(random.uniform(0.2, 0.5)) 
+            r = session.get(url, timeout=5)
             if r.status_code == 200:
                 data = r.json()
                 if 'msgArray' in data:
                     for item in data['msgArray']:
                         c = item.get('c', '') 
                         z = item.get('z', '-') 
-                        y = item.get('y', '-') 
-                        if c and z != '-':
-                            try: results[c] = float(z)
-                            except: pass
-                        elif c and y != '-':
-                            try: results[c] = float(y)
-                            except: pass
+                        y = item.get('y', '-')
+                        
+                        res_item = {}
+                        if z != '-': res_item['z'] = float(z)
+                        if y != '-': res_item['y'] = float(y)
+                        
+                        if c and res_item:
+                            results[c] = res_item
         except: pass
         
     return results
@@ -300,6 +304,67 @@ def save_rec(d, t, b, tc, t_cur, t_prev, intra, total_v):
                 row.to_csv(HIST_FILE, mode='a', header=False, index=False)
     except: row.to_csv(HIST_FILE, index=False)
 
+def display_strategy_panel(slope, open_br, br, n_state):
+    st.subheader("♟️ 戰略指揮所")
+    strategies = []
+    
+    if slope > 0:
+        strategies.append({"sig": "MA5斜率為正 ➜ 大盤偏多", "act": "只做多單，放棄空單", "type": "success"})
+    elif slope < 0:
+        strategies.append({"sig": "MA5斜率為負 ➜ 大盤偏空", "act": "只做空單，放棄多單", "type": "error"})
+    else:
+        strategies.append({"sig": "MA5斜率持平", "act": "", "type": "info"})
+        
+    trend_status = n_state.get('intraday_trend')
+    if trend_status == 'up':
+        strategies.append({"sig": "🔒 已觸發【開盤+5%】", "act": "今日偏多確認，留意回檔", "type": "success"})
+    elif trend_status == 'down':
+        strategies.append({"sig": "🔒 已觸發【開盤-5%】", "act": "今日偏空確認，留意反彈", "type": "error"})
+    else:
+        strategies.append({"sig": "⏳ 盤整中 (未達 +/- 5%)", "act": "觀望，等待趨勢表態", "type": "info"})
+
+    if slope > 0:
+        if trend_status == 'up':
+            if n_state['notified_drop_high']:
+                strategies.append({
+                    "sig": "今日偏多 + 賣壓短暫回檔 (高點落 5%)",
+                    "act": "🎯 進場多單 (確認止穩後)",
+                    "type": "success"
+                })
+        elif trend_status == 'down':
+             if n_state['notified_rise_low']:
+                strategies.append({
+                    "sig": "今日偏空(逆勢) + 買方短暫支撐",
+                    "act": "⚠️ 多單出場 / 收盤再進場多單",
+                    "type": "warning"
+                })
+
+    elif slope < 0:
+        if trend_status == 'down':
+            if n_state['notified_rise_low']:
+                strategies.append({
+                    "sig": "今日偏空 + 買方短暫反彈 (低點彈 5%)",
+                    "act": "🎯 進場空單 (確認止漲後)",
+                    "type": "error"
+                })
+        elif trend_status == 'up':
+            if n_state['notified_drop_high']:
+                strategies.append({
+                    "sig": "今日偏多(逆勢) + 賣方短暫壓制",
+                    "act": "⚠️ 空單出場 / 收盤再進場空單",
+                    "type": "warning"
+                })
+
+    cols = st.columns(len(strategies))
+    for i, s in enumerate(strategies):
+        with cols[i]:
+            title = s["sig"]
+            body = s["act"]
+            if s["type"] == "success": st.success(f"**{title}**\n\n{body}")
+            elif s["type"] == "error": st.error(f"**{title}**\n\n{body}")
+            elif s["type"] == "warning": st.warning(f"**{title}**\n\n{body}")
+            else: st.info(f"**{title}**\n\n{body}")
+
 def plot_chart():
     if not os.path.exists(HIST_FILE): return None
     try:
@@ -329,7 +394,6 @@ def plot_chart():
         return (l_b+p_b+l_t+p_t+rule_r+rule_g).properties(height=400, title=f"走勢對照 - {base_d}").resolve_scale(y='shared')
     except: return None
 
-# [核心修復] 補回缺失的 fetch_all 函式
 def fetch_all():
     ft = get_finmind_token()
     if not ft: return "FinMind Token Error"
@@ -376,41 +440,16 @@ def fetch_all():
             try:
                 try: usage = sj_api.usage(); sj_usage_info = str(usage) if usage else "無法取得"
                 except: sj_usage_info = "無法取得"
-
-                contracts = []
-                for c in final_codes:
-                    if c in sj_api.Contracts.Stocks: contracts.append(sj_api.Contracts.Stocks[c])
-                
-                chunk_size = 20
-                count_sj = 0
-                ts_obj = datetime.now()
-                
-                if contracts:
-                    for i in range(0, len(contracts), chunk_size):
-                        chunk = contracts[i:i+chunk_size]
-                        try:
-                            snaps = sj_api.snapshots(chunk)
-                            for s in snaps:
-                                if s.close > 0: 
-                                    pmap[s.code] = float(s.close)
-                                    ts_obj = datetime.fromtimestamp(s.ts/1e9)
-                                    count_sj += 1
-                            time_module.sleep(1.0)
-                        except: pass
-                    
-                    if count_sj > 0:
-                        last_t = ts_obj.strftime("%H:%M:%S")
-                        data_source = "永豐API"
-                        api_status_code = 2
-                    else: api_status_code = 1
-                else: api_status_code = 1
-            except: api_status_code = 1 
+            except: pass
         
-        if not pmap:
-            pmap = get_prices_twse_mis(final_codes, info_map)
-            if pmap:
-                data_source = "證交所MIS(免登入)"
-                last_t = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
+        pmap = get_prices_twse_mis(final_codes, info_map)
+        if pmap:
+            data_source = "證交所MIS(含昨收)"
+            last_t = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
+            api_status_code = 2
+        else:
+            api_status_code = 1 
+
     elif is_post_market:
         data_source = "FinMind盤後資料"
         last_t = "13:30:00"
@@ -424,47 +463,43 @@ def fetch_all():
         m_type = info_map.get(c, "未知")
         m_display = {"twse":"上市", "tpex":"上櫃", "emerging":"興櫃"}.get(m_type, "未知")
         
+        curr_info = pmap.get(c, {})
+        curr_p = curr_info.get('z', 0) 
+        mis_y = curr_info.get('y', 0)  
+        
+        if not df.empty and mis_y > 0 and not is_post_market:
+            pass 
+
         p_price, p_ma5, p_stt = 0, 0, "-"
         
-        curr_p = pmap.get(c, 0)
-        
-        if is_post_market and not df.empty:
-            if df.iloc[-1]['date'] == today_str:
-                curr_p = float(df.iloc[-1]['close'])
-
         if not df.empty:
-            try:
+            if mis_y > 0:
+                p_price = mis_y
+            else:
                 if df.iloc[-1]['date'] == target_date_for_ranks:
-                    if len(df) >= 2:
-                        df_temp = df.copy()
-                        df_temp['MA5'] = df_temp['close'].rolling(5).mean()
-                        p_price = float(df_temp.iloc[-2]['close'])
-                        p_ma5 = float(df_temp.iloc[-2]['MA5'])
-                    else:
-                        p_price = 0; p_ma5=0
+                     if len(df) >= 2: p_price = float(df.iloc[-2]['close'])
                 else:
-                    df_temp = df.copy()
-                    df_temp['MA5'] = df_temp['close'].rolling(5).mean()
-                    p_price = float(df_temp.iloc[-1]['close'])
-                    p_ma5 = float(df_temp.iloc[-1]['MA5'])
+                     p_price = float(df.iloc[-1]['close'])
+            
+            df_temp = df.copy()
+            df_temp['MA5'] = df_temp['close'].rolling(5).mean()
+            p_ma5 = float(df_temp.iloc[-1]['MA5'])
 
-                if p_price > 0 and p_ma5 > 0:
-                    if p_price > p_ma5: h_p += 1; p_stt="✅"
-                    else: p_stt="📉"
-                    v_p += 1
-            except: pass
+            if p_price > 0 and p_ma5 > 0:
+                if p_price > p_ma5: h_p += 1; p_stt="✅"
+                else: p_stt="📉"
+                v_p += 1
 
         c_ma5, c_stt, note = 0, "-", ""
         
         if not df.empty:
             df_cur = df.copy()
+            
+            if mis_y > 0 and df_cur.iloc[-1]['date'] < today_str: 
+                 df_cur = pd.concat([df_cur, pd.DataFrame([{'date': 'Patch_Yesterday', 'close': mis_y}])], ignore_index=True)
+
             if curr_p > 0:
-                if df_cur.iloc[-1]['date'] != today_str:
-                     df_cur = pd.concat([df_cur, pd.DataFrame([{'date': today_str, 'close': curr_p}])], ignore_index=True)
-                else:
-                    pass
-            elif not is_intra and curr_p == 0:
-                pass
+                 df_cur = pd.concat([df_cur, pd.DataFrame([{'date': today_str, 'close': curr_p}])], ignore_index=True)
             
             if curr_p > 0 and len(df_cur) >= 5:
                 df_cur['MA5'] = df_cur['close'].rolling(5).mean()
@@ -476,7 +511,6 @@ def fetch_all():
                 if curr_p == 0: 
                     c_stt = "⚠️無報價"
                     note += "抓取失敗 "
-                if len(df_cur) < 5: c_stt = "⚠️無MA5"; note += "歷史過短 "
         else:
             c_stt = "⚠️無歷史"; note = "FinMind缺資料"
 
@@ -494,38 +528,29 @@ def fetch_all():
     try:
         tw = get_hist(ft, "TAIEX", s_dt)
         if not tw.empty:
-            t_pre = 0
-            if tw.iloc[-1]['date'] == target_date_for_ranks:
-                 if len(tw) >= 2: t_pre = float(tw.iloc[-2]['close'])
-            else:
-                 t_pre = float(tw.iloc[-1]['close'])
+            mis_tw = get_prices_twse_mis(["t00"], {"t00":"twse"}) 
+            tw_curr = mis_tw.get("t00", {}).get("z", 0)
+            tw_y = mis_tw.get("t00", {}).get("y", 0)
 
-            if is_post_market and tw.iloc[-1]['date'] == today_str:
-                t_cur = float(tw.iloc[-1]['close'])
-            else:
-                if data_source == "永豐API":
-                    try: t_cur = float(sj_api.snapshots([sj_api.Contracts.Indices.TSE.TSE001])[0].close)
-                    except: pass
-                if t_cur == 0:
-                    try:
-                       mis_tw = get_prices_twse_mis(["t00"], {"t00":"twse"})
-                       if "t00" in mis_tw: t_cur = mis_tw["t00"]
-                    except: pass
-                if t_cur == 0: 
-                    r = tw.iloc[-1]
-                    t_cur = float(r['close'])
+            if tw_y > 0: t_pre = tw_y
+            else: t_pre = float(tw.iloc[-1]['close'])
+
+            if tw_curr > 0: t_cur = tw_curr
+            else: t_cur = t_pre
+
+            if tw_y > 0:
+                 tw = pd.concat([tw, pd.DataFrame([{'date': 'Patch_Y', 'close': tw_y}])], ignore_index=True)
+            if tw_curr > 0:
+                 tw = pd.concat([tw, pd.DataFrame([{'date': today_str, 'close': tw_curr}])], ignore_index=True)
             
-            if t_cur > 0:
-                if tw.iloc[-1]['date'] != today_str:
-                    tw = pd.concat([tw, pd.DataFrame([{'date':today_str, 'close':t_cur}])], ignore_index=True)
-                else:
-                    tw.iloc[-1, tw.columns.get_loc('close')] = t_cur
             if len(tw) >= 6:
                 tw['MA5'] = tw['close'].rolling(5).mean()
                 slope = tw.iloc[-1]['MA5'] - tw.iloc[-2]['MA5']
     except: pass
     
-    t_chg = (t_cur-t_pre)/t_pre if t_pre>0 else 0
+    if t_cur == t_pre: t_chg = 0
+    else: t_chg = (t_cur-t_pre)/t_pre if t_pre>0 else 0
+    
     rec_t = last_t if is_intra and "無" not in str(last_t) else ("13:30:00" if is_post_market else datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S"))
     
     save_rec(d_cur, rec_t, br_c, t_chg, t_cur, t_pre, is_intra, v_c)
@@ -538,249 +563,6 @@ def fetch_all():
         "raw":{'Date':d_cur,'Time':rec_t,'Breadth':br_c}, "src":msg_src,
         "api_status": api_status_code, "sj_err": sj_err, "sj_usage": sj_usage_info
     }
-
-# [核心修改] 修正戰略顯示邏輯，完全對應 Excel
-def display_strategy_panel(slope, open_br, br, n_state):
-    st.subheader("♟️ 戰略指揮所")
-    
-    strategies = []
-    
-    # 1. 趨勢與開盤
-    if slope > 0:
-        strategies.append({"sig": "MA5斜率為正 ➜ 大盤偏多", "act": "只做多單，放棄空單", "type": "success"})
-    elif slope < 0:
-        strategies.append({"sig": "MA5斜率為負 ➜ 大盤偏空", "act": "只做空單，放棄多單", "type": "error"})
-    else:
-        strategies.append({"sig": "MA5斜率持平", "act": "", "type": "info"})
-        
-    # 2. 盤中趨勢鎖定狀態
-    trend_status = n_state.get('intraday_trend')
-    if trend_status == 'up':
-        strategies.append({"sig": "🔒 已觸發【開盤+5%】", "act": "今日偏多確認，留意回檔", "type": "success"})
-    elif trend_status == 'down':
-        strategies.append({"sig": "🔒 已觸發【開盤-5%】", "act": "今日偏空確認，留意反彈", "type": "error"})
-    else:
-        strategies.append({"sig": "⏳ 盤整中 (未達 +/- 5%)", "act": "觀望，等待趨勢表態", "type": "info"})
-
-    # 3. 戰術執行
-    
-    # === 情境 A: MA5 > 0 (多頭戰場) ===
-    if slope > 0:
-        # 1. 進場邏輯：盤中也鎖定「偏多」 + 發生回檔
-        if trend_status == 'up':
-            if n_state['notified_drop_high']:
-                strategies.append({
-                    "sig": "今日偏多 + 賣壓短暫回檔 (高點落 5%)",
-                    "act": "🎯 進場多單 (確認止穩後)",
-                    "type": "success"
-                })
-        
-        # 2. 出場邏輯：盤中鎖定「偏空」(逆勢) + 發生反彈 -> 趁反彈出場
-        # Row 14: 今日偏空, 買方短暫支撐 -> 多單出場
-        elif trend_status == 'down':
-             if n_state['notified_rise_low']:
-                strategies.append({
-                    "sig": "今日偏空(逆勢) + 買方短暫支撐",
-                    "act": "⚠️ 多單出場 / 收盤再進場多單",
-                    "type": "warning"
-                })
-
-    # === 情境 B: MA5 < 0 (空頭戰場) ===
-    elif slope < 0:
-        # 1. 進場邏輯：盤中也鎖定「偏空」 + 發生反彈
-        if trend_status == 'down':
-            if n_state['notified_rise_low']:
-                strategies.append({
-                    "sig": "今日偏空 + 買方短暫反彈 (低點彈 5%)",
-                    "act": "🎯 進場空單 (確認止漲後)",
-                    "type": "error"
-                })
-        
-        # 2. 出場邏輯：盤中鎖定「偏多」(逆勢) + 發生回檔 -> 趁回檔出場
-        # Row 15: 今日偏多, 賣方短暫壓制 -> 空單出場
-        elif trend_status == 'up':
-            if n_state['notified_drop_high']:
-                strategies.append({
-                    "sig": "今日偏多(逆勢) + 賣方短暫壓制",
-                    "act": "⚠️ 空單出場 / 收盤再進場空單",
-                    "type": "warning"
-                })
-
-    # 顯示
-    cols = st.columns(len(strategies))
-    for i, s in enumerate(strategies):
-        with cols[i]:
-            title = s["sig"]
-            body = s["act"]
-            if s["type"] == "success": st.success(f"**{title}**\n\n{body}")
-            elif s["type"] == "error": st.error(f"**{title}**\n\n{body}")
-            elif s["type"] == "warning": st.warning(f"**{title}**\n\n{body}")
-            else: st.info(f"**{title}**\n\n{body}")
-
-def run_app():
-    st.title(f"📈 {APP_VER}")
-    
-    with st.sidebar:
-        st.subheader("設定")
-        auto = st.checkbox("自動更新", value=False)
-        fin_ok = "🟢" if get_finmind_token() else "🔴"
-        st.caption(f"FinMind Token: {fin_ok}")
-        tg_tok = st.text_input("TG Token", value=st.secrets.get("telegram",{}).get("token",""), type="password")
-        tg_id = st.text_input("Chat ID", value=st.secrets.get("telegram",{}).get("chat_id",""))
-        if tg_tok and tg_id: st.success("TG Ready")
-        
-        st.write("---")
-        if st.button("⚡ 強制清除快取 (重抓名單)", type="primary"):
-            st.cache_data.clear()
-            if os.path.exists(RANK_FILE): os.remove(RANK_FILE)
-            st.toast("快取已清除，正在重新抓取名單...", icon="🚀")
-            time_module.sleep(1)
-            st.rerun()
-            
-        if st.button("🗑️ 重置圖表資料"):
-            if os.path.exists(HIST_FILE):
-                os.remove(HIST_FILE)
-                st.toast("歷史資料已刪除，請重新整理", icon="🗑️")
-                time_module.sleep(1)
-                st.rerun()
-
-    if st.button("🔄 刷新"): st.rerun()
-
-    try:
-        data = fetch_all()
-        if isinstance(data, str): st.error(f"❌ {data}")
-        elif data:
-            st.sidebar.info(f"報價來源: {data['src_type']}")
-            st.sidebar.caption(f"永豐API額度: {data.get('sj_usage', '未知')}")
-            
-            status_code = data['api_status']
-            if status_code == 2: st.sidebar.success("🟢 永豐連線正常")
-            elif status_code == 1: st.sidebar.warning("🟠 流量/連線異常 (忙線)")
-            else:
-                if data['sj_err']: st.sidebar.error(f"🔴 連線失敗: {data['sj_err']}")
-                else: st.sidebar.error("🔴 未連線")
-            
-            br = data['br']
-            open_br = get_opening_breadth(data['d'])
-            
-            hist_max, hist_min = get_intraday_extremes(data['d'])
-            today_max = br if hist_max is None else max(hist_max, br)
-            today_min = br if hist_min is None else min(hist_min, br)
-            
-            n_state = load_notify_state(data['d']) 
-
-            # [核心邏輯] 判斷並鎖定 Intraday Trend
-            if open_br is not None and n_state['intraday_trend'] is None:
-                if br >= (open_br + 0.05):
-                    n_state['intraday_trend'] = 'up'
-                    if tg_tok and tg_id: send_tg(tg_tok, tg_id, f"🔒 <b>【趨勢鎖定】</b>\n廣度先達開盤+5% (目前{br:.1%})，今日確認偏多！")
-                elif br <= (open_br - 0.05):
-                    n_state['intraday_trend'] = 'down'
-                    if tg_tok and tg_id: send_tg(tg_tok, tg_id, f"🔒 <b>【趨勢鎖定】</b>\n廣度先達開盤-5% (目前{br:.1%})，今日確認偏空！")
-
-            if tg_tok and tg_id:
-                # 1. 過熱/冰點
-                stt = 'normal'
-                if br >= BREADTH_THR: stt = 'hot'
-                elif br <= BREADTH_LOW: stt = 'cold'
-                
-                if stt != n_state['last_stt']:
-                    msg = f"🔥 過熱: {br:.1%}" if stt=='hot' else (f"❄️ 冰點: {br:.1%}" if stt=='cold' else "")
-                    if msg: send_tg(tg_tok, tg_id, msg)
-                    n_state['last_stt'] = stt 
-                
-                # 2. 急變
-                rap_msg, rid = check_rapid(data['raw'])
-                if rap_msg and rid != n_state['last_rap']:
-                    send_tg(tg_tok, tg_id, rap_msg)
-                    n_state['last_rap'] = rid
-                
-                # 3. 乖離 (只通知一次)
-                if open_br is not None:
-                    is_dev_high = (br >= open_br + OPEN_DEV_THR)
-                    is_dev_low = (br <= open_br - OPEN_DEV_THR)
-                    
-                    if is_dev_high and not n_state['was_dev_high']:
-                        n_state['was_dev_high'] = True
-                    
-                    if is_dev_low and not n_state['was_dev_low']:
-                        n_state['was_dev_low'] = True
-                
-                # 4. 反轉
-                if br <= (today_max - 0.05):
-                    if not n_state['notified_drop_high']:
-                        # 只在符合策略情境時才發通知
-                        should_notify = False
-                        # 多頭回檔 (買點)
-                        if data['slope'] > 0 and n_state['intraday_trend'] == 'up': should_notify = True
-                        # 空頭遇壓 (逃命點) (這裡修正為: 空頭戰場，但盤中鎖定偏多 -> 遇壓)
-                        if data['slope'] < 0 and n_state['intraday_trend'] == 'up': should_notify = True
-                        
-                        if should_notify:
-                            msg = f"📉 <b>【高點回落】</b>\n今日高點: {today_max:.1%}\n目前廣度: {br:.1%}\n已回檔 5%"
-                            send_tg(tg_tok, tg_id, msg)
-                            
-                        n_state['notified_drop_high'] = True
-                else:
-                    n_state['notified_drop_high'] = False
-                
-                if br >= (today_min + 0.05):
-                    if not n_state['notified_rise_low']:
-                        # 只在符合策略情境時才發通知
-                        should_notify = False
-                        # 空頭反彈 (空點)
-                        if data['slope'] < 0 and n_state['intraday_trend'] == 'down': should_notify = True
-                        # 多頭支撐 (逃命點) (這裡修正為: 多頭戰場，但盤中鎖定偏空 -> 遇撐)
-                        if data['slope'] > 0 and n_state['intraday_trend'] == 'down': should_notify = True
-                        
-                        if should_notify:
-                            msg = f"🚀 <b>【低點反彈】</b>\n今日低點: {today_min:.1%}\n目前廣度: {br:.1%}\n已反彈 5%"
-                            send_tg(tg_tok, tg_id, msg)
-
-                        n_state['notified_rise_low'] = True
-                else:
-                    n_state['notified_rise_low'] = False
-                
-                save_notify_state(n_state)
-            
-            display_strategy_panel(data['slope'], open_br, br, n_state)
-
-            st.subheader(f"📅 {data['d']}")
-            st.caption(f"名單基準日: {data['d_prev']}") 
-            st.info(f"{data['src']} | 更新: {data['t']}")
-            chart = plot_chart()
-            if chart: st.altair_chart(chart, use_container_width=True)
-            
-            c1,c2,c3 = st.columns(3)
-            c1.metric("今日廣度", f"{br:.1%}", f"{data['h']}/{data['v']}")
-            
-            caption_str = f"昨日廣度: {data['br_p']:.1%} ({data['h_p']}/{data['v_p']})"
-            if open_br:
-                caption_str += f" | 開盤: {open_br:.1%}"
-            else:
-                caption_str += " | 開盤: 等待中..."
-            c1.caption(caption_str)
-            
-            c2.metric("大盤漲跌", f"{data['tc']:.2%}")
-            sl = data['slope']; icon = "📈 正" if sl > 0 else "📉 負"
-            c3.metric("大盤MA5斜率", f"{sl:.2f}", icon)
-            
-            st.dataframe(data['df'], use_container_width=True, hide_index=True)
-        else: st.warning("⚠️ 無資料")
-    except Exception as e: st.error(f"Error: {e}")
-
-    if auto:
-        now = datetime.now(timezone(timedelta(hours=8)))
-        is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
-        if is_intra:
-            sec = 120
-            with st.sidebar:
-                t = st.empty()
-                for i in range(sec, 0, -1):
-                    t.info(f"⏳ {i}s")
-                    time_module.sleep(1)
-            st.rerun()
-        else: st.sidebar.warning("⏸ 休市")
 
 if __name__ == "__main__":
     if 'streamlit' in sys.modules: run_app()
