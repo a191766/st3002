@@ -11,9 +11,9 @@ import time as time_module
 import random
 
 # ==========================================
-# 設定區 v9.36.0 (證交所連線強化版)
+# 設定區 v9.37.0 (證交所連線修復版)
 # ==========================================
-APP_VER = "v9.36.0 (證交所連線強化版)"
+APP_VER = "v9.37.0 (證交所連線修復版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -233,18 +233,16 @@ def get_hist(token, code, start):
 def get_prices_twse_mis(codes, info_map):
     """
     強化版：針對證交所擋爬蟲機制進行優化
-    1. 完整 Header 模擬
-    2. Session Cookie 預熱
-    3. 市場別容錯 (若 info_map 缺失則同時查 TSE/OTC)
+    修復重點：縮小 Chunk Size 以避免 URL 過長被擋
     """
     if not codes: return {}
     
     # 建立或重用 Session
     if 'mis_session' not in st.session_state:
         session = requests.Session()
-        # 設置跟真實瀏覽器完全一樣的 Headers
+        # 設置跟真實瀏覽器完全一樣的 Headers (更新至 2025 標準)
         session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
             "Accept": "application/json, text/javascript, */*; q=0.01",
             "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
             "Accept-Encoding": "gzip, deflate, br",
@@ -271,7 +269,8 @@ def get_prices_twse_mis(codes, info_map):
     
     # 準備查詢字串
     req_strs = []
-    chunk_size = 25 # 稍微保守一點
+    # [重要修改] 將批次數量從 25 降至 5，因為 URL 過長是回傳空值的主因
+    chunk_size = 5 
     
     for i in range(0, len(codes), chunk_size):
         chunk = codes[i:i+chunk_size]
@@ -284,7 +283,7 @@ def get_prices_twse_mis(codes, info_map):
             elif m_type == "twse":
                 q_list.append(f"tse_{c}.tw")
             else:
-                # [容錯] 如果不知道市場別 (info_map 空值)，乾脆兩個都查，反正無效的會被忽略
+                # [容錯] 如果不知道市場別，乾脆兩個都查
                 q_list.append(f"tse_{c}.tw")
                 q_list.append(f"otc_{c}.tw")
                 
@@ -295,21 +294,26 @@ def get_prices_twse_mis(codes, info_map):
     # 加上隨機參數避免快取
     base_url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=0&_={ts}&ex_ch="
     
-    print(f"開始抓取 {len(codes)} 檔股票報價 (使用 requests)...")
+    print(f"開始抓取 {len(codes)} 檔股票報價 (Batch Size: {chunk_size})...")
     
-    for q_str in req_strs:
+    for idx, q_str in enumerate(req_strs):
         try:
             url = base_url + q_str
-            time_module.sleep(random.uniform(0.5, 1.0)) # 增加延遲避免太快被擋
+            # 隨機延遲，模擬人類行為
+            time_module.sleep(random.uniform(0.3, 0.8))
             r = session.get(url, timeout=10)
             
             if r.status_code == 200:
                 try:
                     data = r.json()
                     if 'msgArray' not in data:
-                        print("回應中沒有 msgArray，可能被擋或無資料")
+                        # 偶爾會發生有回應但沒 msgArray 的情況
+                        print(f"Batch {idx}: 回應中沒有 msgArray")
                         continue
-                        
+                    
+                    if not data['msgArray']:
+                         print(f"Batch {idx}: msgArray 為空 (可能是代號錯誤或無成交)")
+
                     for item in data['msgArray']:
                         try:
                             c = item.get('c', '') 
@@ -341,14 +345,9 @@ def get_prices_twse_mis(codes, info_map):
                                     try: price = float(a_str.split('_')[0])
                                     except: pass
                             
-                            # 即使價格為 0 (無成交)，只要有昨收，我們也存下來，避免狀態顯示 "無報價"
-                            if price > 0: 
-                                val['z'] = price
-                            else:
-                                # 若當日尚未成交，用昨收暫代 (或者保持為0由後端判斷)
-                                # 這裡保持原邏輯，只存大於0的，但在後端狀態處理做寬容
-                                pass
-
+                            # 只要有價格或有昨收，就存入
+                            if price > 0: val['z'] = price
+                            
                             if c and val: results[c] = val
                         except:
                             continue
@@ -728,7 +727,7 @@ def run_app():
             hist_max, hist_min = get_intraday_extremes(data['d'])
             today_max = br if hist_max is None else max(hist_max, br)
             today_min = br if hist_min is None else min(hist_min, br)
-            
+        
             n_state = load_notify_state(data['d']) 
 
             if open_br is not None and n_state['intraday_trend'] is None:
