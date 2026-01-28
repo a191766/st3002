@@ -18,9 +18,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.56.0 (極速查詢版)
+# 設定區 v9.56.1 (極速查詢修正版)
 # ==========================================
-APP_VER = "v9.56.0 (極速查詢版)"
+APP_VER = "v9.56.1 (極速查詢修正版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -247,7 +247,7 @@ def get_hist(token, code, start):
     try: return api.taiwan_stock_daily(stock_id=code, start_date=start)
     except: return pd.DataFrame()
 
-# [核心修改] 加速版 MIS 查詢
+# [核心修改] 加速版 MIS 查詢 (已修復 NameError)
 def get_prices_twse_mis(codes, info_map):
     if not codes: return {}, {}
     
@@ -264,7 +264,7 @@ def get_prices_twse_mis(codes, info_map):
     
     try:
         ts_now = int(time_module.time() * 1000)
-        # [加速] 初始化等待時間縮短為 0.1s
+        # [加速] 初始化等待 0.1s
         session.get(f"https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw&_={ts_now}", timeout=10)
         time_module.sleep(0.1) 
     except:
@@ -274,6 +274,7 @@ def get_prices_twse_mis(codes, info_map):
     chunk_size = 5
     results = {}
     debug_log = {}
+    batch_map = [] # [修正] 補回定義
 
     for i in range(0, len(codes), chunk_size):
         chunk = codes[i:i+chunk_size]
@@ -293,6 +294,7 @@ def get_prices_twse_mis(codes, info_map):
                  
         if q_list:
             req_strs.append("|".join(q_list))
+            batch_map.append(current_batch_codes) # [修正] 補回 map 記錄
     
     base_url = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
     
@@ -302,7 +304,7 @@ def get_prices_twse_mis(codes, info_map):
         batch_codes = batch_map[idx] 
 
         try:
-            # [加速] 查詢間隔縮短為 0.05~0.1s，大幅提升速度
+            # [加速] 查詢間隔 0.05~0.1s
             time_module.sleep(random.uniform(0.05, 0.1))
             r = session.get(base_url, params=params, timeout=10)
             
@@ -518,6 +520,7 @@ def fetch_all():
     is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
     allow_live_fetch = (0<=now.weekday()<=4) and (now.time() >= time(8,45))
     
+    # [雙軌排名邏輯]
     if len(days) > 1:
         date_prev = days[-2]
     else:
@@ -916,7 +919,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (極速查詢版)...")
+        print("正在啟動 Streamlit 介面 (極速查詢修正版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
