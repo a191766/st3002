@@ -10,7 +10,7 @@ import altair as alt
 import time as time_module
 import random
 
-# 引入 curl_cffi (連線必須保留，否則全掛)
+# 引入 curl_cffi 
 try:
     from curl_cffi import requests as cffi_requests
 except ImportError:
@@ -18,9 +18,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.54.0 (穩定回滾版)
+# 設定區 v9.55.0 (雙軌排名精確計算版)
 # ==========================================
-APP_VER = "v9.54.0 (穩定回滾版)"
+APP_VER = "v9.55.0 (雙軌排名精確計算版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -177,6 +177,8 @@ def get_days(token):
     
     now = datetime.now(timezone(timedelta(hours=8)))
     today_str = now.strftime("%Y-%m-%d")
+    # 早上 8 點後，如果 FinMind 已經有今天的日期(通常沒有)，或者我們強制加入
+    # 這裡邏輯保持，主要是為了讓 d_cur 能指向今天
     if 0 <= now.weekday() <= 4 and now.time() >= time(8,0):
         if not dates or today_str > dates[-1]:
             dates.append(today_str)
@@ -199,9 +201,9 @@ def get_stock_info_map(token):
         return base_map
     except: return base_map
 
-def get_ranks_strict(token, target_date_str):
-    # [回滾] 移除 min_count 參數，不再過濾資料量
-    if os.path.exists(RANK_FILE):
+# [核心修改] 恢復 min_count，用於盤後檢核
+def get_ranks_strict(token, target_date_str, min_count=0):
+    if min_count == 0 and os.path.exists(RANK_FILE):
         try:
             with open(RANK_FILE, 'r') as f:
                 data = json.load(f)
@@ -217,6 +219,11 @@ def get_ranks_strict(token, target_date_str):
     
     if df.empty: return [], False
 
+    # 檢查是否包含完整市場資料
+    if min_count > 0 and len(df) < min_count:
+        print(f"DEBUG: {target_date_str} 資料量 {len(df)} 不足 (預期 > {min_count})，判定未更新完畢")
+        return [], False
+
     df['ID'] = get_col(df, ['stock_id','code'])
     df['Money'] = get_col(df, ['Trading_money','turnover'])
     if df['ID'] is None or df['Money'] is None: return [], False
@@ -228,7 +235,8 @@ def get_ranks_strict(token, target_date_str):
     
     ranks = df.sort_values('Money', ascending=False).head(TOP_N)['ID'].tolist()
     
-    if ranks:
+    # 只有資料完整時才寫入快取 (避免寫入殘缺名單)
+    if ranks and (min_count == 0 or len(df) > 1500):
         try:
             with open(RANK_FILE, 'w') as f:
                 json.dump({"date": target_date_str, "ranks": ranks}, f)
@@ -243,13 +251,12 @@ def get_hist(token, code, start):
     try: return api.taiwan_stock_daily(stock_id=code, start_date=start)
     except: return pd.DataFrame()
 
-# [回滾] 恢復最簡單的查詢邏輯，移除 emg_ 與 retry 機制
+# MIS 查詢函式 (維持穩定回滾版邏輯)
 def get_prices_twse_mis(codes, info_map):
     if not codes: return {}, {}
     
     print(f"DEBUG: 準備從 MIS 抓取 {len(codes)} 檔股票...")
     
-    # 仍使用 curl_cffi 以通過防火牆
     session = cffi_requests.Session(impersonate="chrome")
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -259,7 +266,6 @@ def get_prices_twse_mis(codes, info_map):
     }
     session.headers.update(headers)
     
-    # Init Cookie
     try:
         ts_now = int(time_module.time() * 1000)
         session.get(f"https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw&_={ts_now}", timeout=10)
@@ -269,7 +275,6 @@ def get_prices_twse_mis(codes, info_map):
 
     req_strs = []
     chunk_size = 5
-    batch_map = []
     results = {}
     debug_log = {}
 
@@ -281,8 +286,6 @@ def get_prices_twse_mis(codes, info_map):
             c = str(c).strip()
             if not c: continue
             
-            # [回滾] 簡單二分法：上市 tse，其他全部 otc (包含興櫃)
-            # 這樣雖然興櫃會抓不到(因為要 emg)，但保證上櫃會抓到
             m_type = info_map.get(c, "twse").lower()
             if "twse" in m_type:
                 q_list.append(f"tse_{c}.tw")
@@ -293,15 +296,13 @@ def get_prices_twse_mis(codes, info_map):
                  
         if q_list:
             req_strs.append("|".join(q_list))
-            batch_map.append(current_batch_codes)
     
     base_url = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
     
     for idx, q_str in enumerate(req_strs):
         ts = int(time_module.time() * 1000)
         params = {"json": "1", "delay": "0", "_": ts, "ex_ch": q_str}
-        batch_codes = batch_map[idx] 
-
+        
         try:
             time_module.sleep(random.uniform(0.3, 0.8))
             r = session.get(base_url, params=params, timeout=10)
@@ -310,15 +311,11 @@ def get_prices_twse_mis(codes, info_map):
                 try:
                     data = r.json()
                     if 'msgArray' not in data: 
-                        for c in batch_codes: debug_log[c] = "MIS回傳空值"
+                        for c in codes[idx*chunk_size : (idx+1)*chunk_size]: debug_log[c] = "MIS回傳空值"
                         continue
                     
-                    returned_codes = set()
-
                     for item in data['msgArray']:
                         c = item.get('c', '') 
-                        returned_codes.add(c)
-                        
                         z = item.get('z', '-') 
                         pz = item.get('pz', '-') 
                         y = item.get('y', '-') 
@@ -331,21 +328,18 @@ def get_prices_twse_mis(codes, info_map):
                         price = 0
                         source_note = ""
 
-                        # 1. 成交價
                         if z != '-' and z != '':
                             try: 
                                 price = float(z)
                                 source_note = "來源:成交"
                             except: pass
                         
-                        # 2. 試撮價 (補回漲跌停邏輯)
                         if price == 0 and pz != '-' and pz != '':
                             try:
                                 price = float(pz)
                                 source_note = "來源:試撮"
                             except: pass
 
-                        # 3. 買賣價
                         if price == 0:
                             try:
                                 b = item.get('b', '-').split('_')[0]
@@ -369,17 +363,9 @@ def get_prices_twse_mis(codes, info_map):
                             debug_log[c] = source_note
                         
                         if c and val: results[c] = val
-                    
-                    for bc in batch_codes:
-                        if bc not in returned_codes:
-                             debug_log[bc] = "查無此股"
 
-                except: 
-                    for c in batch_codes: debug_log[c] = "JSON錯誤"
-            else:
-                for c in batch_codes: debug_log[c] = f"HTTP {r.status_code}"
-        except Exception as e:
-             for c in batch_codes: debug_log[c] = "連線中斷"
+                except: pass
+        except: pass
              
     return results, debug_log
 
@@ -523,18 +509,35 @@ def fetch_all():
     is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
     allow_live_fetch = (0<=now.weekday()<=4) and (now.time() >= time(8,45))
     
-    # [修正: 名單邏輯]
-    # 因為盤後 FinMind 上市上櫃更新時間不一，導致上櫃消失
-    # 這裡回滾邏輯：盤中必定用昨天，盤後也盡量用昨天 (確保完整性)
-    if len(days) > 1:
-        target_rank_date = days[-2]
-    else:
-        # 手動推算昨天
-        target_rank_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    # [核心修改: 雙軌排名邏輯]
     
-    # 這裡直接用昨天的，不再嘗試抓今天，以確保上櫃股票一定存在
-    final_codes, from_disk = get_ranks_strict(ft, target_rank_date)
-    msg_src = f"名單:{target_rank_date} {'(硬碟)' if from_disk else '(新抓)'}"
+    # 1. 鎖定「昨日」排名日期 (盤前00:00-09:00一定要用這個)
+    if len(days) > 1:
+        date_prev = days[-2]
+    else:
+        # 如果 FinMind 連線異常只回傳今天，手動推算昨天
+        date_prev = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    
+    # 2. 獲取「昨日」排名名單 (用於計算昨日廣度)
+    ranks_prev, _ = get_ranks_strict(ft, date_prev) # 不檢查數量，確保有東西
+    
+    # 3. 獲取「今日」排名名單 (用於計算今日廣度，預設=昨日)
+    ranks_curr = ranks_prev # 預設：盤中或盤前使用昨日名單
+    msg_src = f"名單:{date_prev}(昨日/盤中)"
+    
+    # [盤後特殊處理]：嘗試抓取今日完整名單
+    if now.time() >= time(14, 0) and d_cur == today_str:
+        # 這裡加上 min_count=1500，確保 FinMind 已經更新了上市+上櫃
+        # 如果只有上市(約900檔)，這裡會回傳 False，程式就會繼續使用 ranks_prev
+        ranks_today, _ = get_ranks_strict(ft, today_str, min_count=1500)
+        
+        if ranks_today:
+            ranks_curr = ranks_today
+            msg_src = f"名單:{today_str}(今日完整)"
+    
+    # 4. 合併所有需要查詢即時價的股票
+    # 為了計算兩個廣度，我們需要這兩份名單的價格
+    all_targets = list(set(ranks_curr + ranks_prev))
 
     pmap = {}
     mis_debug_map = {} 
@@ -547,12 +550,12 @@ def fetch_all():
     is_post_market = (now.time() >= time(14, 0))
     
     if allow_live_fetch:
-        # 1. Shioaji (優先)
+        # 1. Shioaji
         if sj_api:
             try:
                 usage = sj_api.usage(); sj_usage_info = str(usage) if usage else "無法取得"
                 contracts = []
-                for c in final_codes:
+                for c in all_targets: # 改查合併名單
                     if c in sj_api.Contracts.Stocks: contracts.append(sj_api.Contracts.Stocks[c])
                 
                 if contracts:
@@ -573,8 +576,8 @@ def fetch_all():
                         api_status_code = 2
             except: pass
         
-        # 2. MIS (Shioaji 沒抓到的補)
-        missing_codes = [c for c in final_codes if c not in pmap]
+        # 2. MIS
+        missing_codes = [c for c in all_targets if c not in pmap]
         if missing_codes:
             mis_data, debug_log = get_prices_twse_mis(missing_codes, info_map)
             mis_debug_map = debug_log 
@@ -593,19 +596,21 @@ def fetch_all():
              last_t = "13:30:00"
 
     s_dt = (datetime.now()-timedelta(days=40)).strftime("%Y-%m-%d")
-    h_c, v_c, h_p, v_p = 0, 0, 0, 0
+    
+    # --- 計算今日廣度 (使用 ranks_curr) ---
+    h_c, v_c = 0, 0
     dtls = []
     
-    for c in final_codes:
+    for c in ranks_curr:
         df = get_hist(ft, c, s_dt) 
         m_type = info_map.get(c, "未知")
         m_display = {"twse":"上市", "tpex":"上櫃", "emerging":"興櫃"}.get(m_type, "未知")
         
         info = pmap.get(c, {})
         curr_p = info.get('z', info.get('price', 0)) 
-        
         real_y = info.get('y', info.get('y_close', 0)) 
         
+        # 盤後補全
         if is_post_market and not df.empty:
             if df.iloc[-1]['date'] == today_str:
                 curr_p = float(df.iloc[-1]['close'])
@@ -624,18 +629,17 @@ def fetch_all():
         p_ma5 = 0
         p_stt = "-"
         
+        # 昨收相關 (用於顯示)
         if not df.empty and p_price > 0:
             closes = []
             if df.iloc[-1]['date'] == today_str:
                 closes = df['close'].iloc[:-1].tail(5).tolist() 
             else:
                 closes = df['close'].tail(5).tolist()
-            
             if len(closes) >= 5:
                 p_ma5 = sum(closes[-5:]) / 5
-                if p_price > p_ma5: h_p += 1; p_stt="✅"
+                if p_price > p_ma5: p_stt="✅"
                 else: p_stt="📉"
-                v_p += 1
 
         c_ma5 = 0
         c_stt = "-"
@@ -654,14 +658,11 @@ def fetch_all():
                 elif c not in pmap:
                     reason = "MIS未回傳"
             
-            if reason:
-                note = f"⚠️{reason} | 昨收{p_price}"
-            else:
-                note = f"昨收{p_price}"
+            if reason: note = f"⚠️{reason} | 昨收{p_price}"
+            else: note = f"昨收{p_price}"
         
         source_note = info.get('note', '')
-        if source_note:
-            note = f"📝{source_note} " + note
+        if source_note: note = f"📝{source_note} " + note
 
         if curr_p > 0 and p_price > 0 and not df.empty:
             hist_closes = []
@@ -685,6 +686,35 @@ def fetch_all():
             "備註": note
         })
 
+    # --- 計算昨日廣度 (使用 ranks_prev) ---
+    # 這是為了確保昨天的數據永遠根據昨天的名單計算
+    h_p, v_p = 0, 0
+    for c in ranks_prev:
+        df = get_hist(ft, c, s_dt)
+        if df.empty: continue
+        
+        # 找出昨天的收盤與昨天的MA5
+        # 因為 df 可能包含今天，也可能不包含，需判斷
+        has_today = (df.iloc[-1]['date'] == today_str)
+        
+        prev_close = 0
+        prev_ma5 = 0
+        
+        if has_today:
+            if len(df) >= 2: prev_close = float(df.iloc[-2]['close'])
+            # 昨MA5 = 前天~昨天的5日平均 (iloc[-6:-1])
+            if len(df) >= 6:
+                prev_ma5 = df['close'].iloc[-6:-1].mean()
+        else:
+            prev_close = float(df.iloc[-1]['close'])
+            # 昨MA5 = iloc[-5:]
+            if len(df) >= 5:
+                prev_ma5 = df['close'].iloc[-5:].mean()
+        
+        if prev_close > 0 and prev_ma5 > 0:
+            if prev_close > prev_ma5: h_p += 1
+            v_p += 1
+
     br_c = h_c/v_c if v_c>0 else 0
     br_p = h_p/v_p if v_p>0 else 0
     
@@ -704,7 +734,6 @@ def fetch_all():
             if t_curr > 0: t_cur = t_curr
             else: t_cur = t_pre
 
-            # [斜率公式]
             hist_tw = tw['close'].tail(6).tolist()
             if len(hist_tw) >= 6:
                 closes_for_prev = hist_tw[-6:-1]
@@ -727,7 +756,7 @@ def fetch_all():
     save_rec(d_cur, rec_t, br_c, t_chg, t_cur, t_pre, is_intra, v_c)
     
     return {
-        "d":d_cur, "d_prev": target_rank_date, 
+        "d":d_cur, "d_prev": date_prev, 
         "br":br_c, "br_p":br_p, "h":h_c, "v":v_c, "h_p":h_p, "v_p":v_p,
         "df":pd.DataFrame(dtls), 
         "t":last_t, "tc":t_chg, "slope":slope, "src_type": data_source,
@@ -904,7 +933,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (穩定回滾版)...")
+        print("正在啟動 Streamlit 介面 (雙軌排名精確計算版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
