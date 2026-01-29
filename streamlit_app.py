@@ -19,9 +19,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.31 (排名完整性驗證修復版)
+# 設定區 v9.55.32 (日期標記增強版)
 # ==========================================
-APP_VER = "v9.55.31 (排名完整性驗證修復版)"
+APP_VER = "v9.55.32 (日期標記增強版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -86,9 +86,6 @@ def save_notify_state(state):
         pass
 
 def check_rapid(row):
-    """
-    檢查廣度急變
-    """
     if not os.path.exists(HIST_FILE): return None, None
     try:
         df = pd.read_csv(HIST_FILE)
@@ -198,12 +195,13 @@ def get_taifex_pc_ratio(target_date_str):
                 if df.shape[1] >= 7:
                     top_row = df.iloc[0] 
                     try:
-                        val = float(top_row.iloc[6]) 
-                        return val, f"期交所官網 ({top_row.iloc[0]})"
+                        val = float(top_row.iloc[6])
+                        date_str = str(top_row.iloc[0]) # 抓取日期
+                        return val, date_str, f"期交所官網 ({date_str})"
                     except: continue
     except Exception as e:
-        return None, str(e)
-    return None, "找不到表格"
+        return None, None, str(e)
+    return None, None, "找不到表格"
 
 @st.cache_data(ttl=43200) 
 def get_chips_data(token, target_date_str):
@@ -231,9 +229,12 @@ def get_chips_data(token, target_date_str):
             else:
                 latest = df_foreign.iloc[-1]
                 prev = df_foreign.iloc[-2] if len(df_foreign) >= 2 else latest
+                res['fut_date'] = latest.get('date', '未知日期') # 抓取日期
+                
                 try:
                     curr_long = float(latest.get('long_open_interest_balance_volume', 0))
                     curr_short = float(latest.get('short_open_interest_balance_volume', 0))
+                    
                     if curr_long==0 and curr_short==0 and 'open_interest' in latest:
                         res['fut_oi'] = int(latest['open_interest'])
                         prev_oi = int(prev.get('open_interest', 0))
@@ -243,12 +244,14 @@ def get_chips_data(token, target_date_str):
                         prev_short = float(prev.get('short_open_interest_balance_volume', 0))
                         res['fut_oi'] = int(curr_long - curr_short)
                         res['fut_oi_chg'] = res['fut_oi'] - int(prev_long - prev_short)
-                    diagnosis.append(f"✅ 期貨(外資): 成功 ({res['fut_oi']})")
+                    diagnosis.append(f"✅ 期貨(外資): 成功 ({res['fut_date']})")
                 except: diagnosis.append("❌ 期貨: 計算錯誤")
         else: diagnosis.append("❌ 期貨: 欄位錯誤")
 
     # 2. 選擇權
     pc_val = None
+    pc_date = None
+    
     df_opt, _ = call_finmind_api_try_versions(["TaiwanOptionDaily"], "TXO", start_date, token)
     if not df_opt.empty:
         latest = df_opt[df_opt['date'] == df_opt['date'].max()]
@@ -258,18 +261,21 @@ def get_chips_data(token, target_date_str):
             call = latest[latest[cp_col].str.lower()=='call']['open_interest'].sum()
             if call > 0: 
                 pc_val = round((put/call)*100, 2)
-                diagnosis.append(f"✅ 選擇權(FinMind): {pc_val}%")
+                pc_date = latest.iloc[0]['date']
+                diagnosis.append(f"✅ 選擇權(FinMind): {pc_val}% ({pc_date})")
 
     if pc_val is None or pc_val == 0:
-        taifex_val, taifex_msg = get_taifex_pc_ratio(target_date_str)
+        taifex_val, taifex_date, taifex_msg = get_taifex_pc_ratio(target_date_str)
         if taifex_val is not None:
             pc_val = taifex_val
-            diagnosis.append(f"✅ 選擇權(期交所): {pc_val}%")
+            pc_date = taifex_date
+            diagnosis.append(f"✅ 選擇權(期交所): {pc_val}% ({pc_date})")
         else:
             if pc_val is None: diagnosis.append(f"❌ 選擇權: 全數失敗 ({taifex_msg})")
             
     if pc_val is not None:
         res['pc_ratio'] = pc_val
+        res['pc_date'] = pc_date
 
     # 3. 維持率
     maint_candidates = ["TaiwanTotalExchangeMarginMaintenance"]
@@ -280,20 +286,22 @@ def get_chips_data(token, target_date_str):
         if col not in latest: col = 'margin_maintenance_ratio'
         if col in latest:
             res['margin_ratio'] = float(latest[col])
-            diagnosis.append(f"✅ 維持率: {res['margin_ratio']}%")
+            res['margin_date'] = latest.get('date', '未知日期')
+            diagnosis.append(f"✅ 維持率: {res['margin_ratio']}% ({res['margin_date']})")
 
     # 4. 融資餘額
     df_margin, margin_src = call_finmind_api_try_versions(["TaiwanStockTotalMarginPurchaseShortSale"], None, start_date, token)
     if not df_margin.empty:
-        df_money = df_margin[df_margin['name'] == 'MarginPurchaseMoney'].sort_values('date')
-        if not df_money.empty:
-            latest = df_money.iloc[-1]
-            prev = df_money.iloc[-2] if len(df_money) >= 2 else latest
-            curr_bal = float(latest['TodayBalance'])
-            prev_bal = float(prev['TodayBalance'])
-            res['margin_chg'] = round((curr_bal - prev_bal) / 100000000, 2) 
-            res['margin_bal'] = round(curr_bal / 100000000, 1)
-            diagnosis.append(f"✅ 融資餘額: {res['margin_bal']}億 (變動: {res['margin_chg']}億)")
+        df_m = df_margin[df_margin['name'] == 'MarginPurchaseMoney'].sort_values('date')
+        if not df_m.empty:
+            latest = df_m.iloc[-1]
+            prev = df_m.iloc[-2] if len(df_m)>1 else curr
+            curr = float(latest['TodayBalance'])
+            prev_val = float(prev['TodayBalance'])
+            res['margin_bal'] = round(curr/1e8, 1)
+            res['margin_chg'] = round((curr-prev_val)/1e8, 2)
+            res['margin_bal_date'] = latest.get('date', '未知日期')
+            diagnosis.append(f"✅ 融資餘額: {res['margin_bal']}億 ({res['margin_bal_date']})")
 
     return res, diagnosis
 
@@ -382,25 +390,17 @@ def get_ranks_strict(token, target_date_str, min_count=0):
     
     if df.empty: return [], False
 
-    # [修正點] 先過濾權證/ETF/DR，再檢查資料筆數
     df['ID'] = get_col(df, ['stock_id','code'])
     df['Money'] = get_col(df, ['Trading_money','turnover'])
-    
     if df['ID'] is None or df['Money'] is None: return [], False
     
     df['ID'] = df['ID'].astype(str)
-    df = df[df['ID'].str.len()==4] # 只留4碼
-    df = df[df['ID'].str.isdigit()] # 只留數字
-    for p in EXCL_PFX: df = df[~df['ID'].str.startswith(p)] # 排除 00, 91
-    
-    # 過濾完「純正個股」後，若數量不足 1500，代表資料未全 (例如只有 TWSE)
-    if min_count > 0 and len(df) < min_count:
-        print(f"DEBUG: {target_date_str} 資料量 {len(df)} 不足 (預期 > {min_count})，判定未更新完畢")
-        return [], False
+    df = df[df['ID'].str.len()==4]
+    df = df[df['ID'].str.isdigit()]
+    for p in EXCL_PFX: df = df[~df['ID'].str.startswith(p)]
      
     ranks = df.sort_values('Money', ascending=False).head(TOP_N)['ID'].tolist()
     
-    # 存檔條件：min_count=0 (盤中/昨日) 或 min_count>0 且過濾後仍足夠多
     if ranks and (min_count == 0 or len(df) > 1500):
         try:
             with open(RANK_FILE, 'w') as f:
@@ -541,11 +541,14 @@ def save_rec(d, t, b, tc, t_cur, t_prev, intra, total_v):
     except: row.to_csv(HIST_FILE, index=False)
 
 def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag):
-    # [UI優化 1/2] 注入 CSS 強制縮小 metric 數字字體 (26px -> 20px)
+    # [UI優化] 注入 CSS 強制縮小 metric 數字字體 (26px -> 18px) 以容納日期
     st.markdown("""
         <style>
         div[data-testid="stMetricValue"] {
-            font-size: 20px !important;
+            font-size: 18px !important;
+        }
+        div[data-testid="stMetricLabel"] {
+            font-size: 14px !important;
         }
         </style>
     """, unsafe_allow_html=True)
@@ -582,13 +585,19 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
     
     if chip_strategy and chip_strategy['data']:
         d = chip_strategy['data']
-        # [UI優化 2/2] 調整欄位權重
+        # [UI優化] 調整欄位權重
         c1, c2, c3, c4, c5 = st.columns([1.1, 1.1, 1.1, 1.4, 2.5])
         
-        c1.metric("外資期貨淨OI", f"{d.get('fut_oi',0):,}", f"{d.get('fut_oi_chg',0):,}")
-        c2.metric("P/C Ratio", f"{d.get('pc_ratio',0)}%")
-        c3.metric("融資維持率", f"{d.get('margin_ratio',0)}%")
-        c4.metric("融資餘額(億)", f"{d.get('margin_bal',0)}", f"{d.get('margin_chg',0)}")
+        # [關鍵修改] 標題帶入日期
+        date_fut = d.get('fut_date', '--').replace('-', '/')[-5:] # 只取 MM/DD
+        date_pc = d.get('pc_date', '--').replace('-', '/')[-5:]
+        date_maint = d.get('margin_date', '--').replace('-', '/')[-5:]
+        date_bal = d.get('margin_bal_date', '--').replace('-', '/')[-5:]
+
+        c1.metric(f"期貨OI ({date_fut})", f"{d.get('fut_oi',0):,}", f"{d.get('fut_oi_chg',0):,}")
+        c2.metric(f"P/C Ratio ({date_pc})", f"{d.get('pc_ratio',0)}%")
+        c3.metric(f"維持率 ({date_maint})", f"{d.get('margin_ratio',0)}%")
+        c4.metric(f"融資 ({date_bal})", f"{d.get('margin_bal',0)}億", f"{d.get('margin_chg',0)}億")
         
         sig = chip_strategy['sig']; act = chip_strategy['act']; color = chip_strategy['color']
         with c5:
@@ -1078,7 +1087,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (排名完整性驗證修復版)...")
+        print("正在啟動 Streamlit 介面 (日期標記增強版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
