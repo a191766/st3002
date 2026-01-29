@@ -18,9 +18,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.21 (廣度極值顯示版)
+# 設定區 v9.55.22 (終極整合修復版)
 # ==========================================
-APP_VER = "v9.55.21 (廣度極值顯示版)"
+APP_VER = "v9.55.22 (終極整合修復版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -62,33 +62,21 @@ def load_notify_state(today_str):
         "notified_rise_low": False,
         "intraday_trend": None  
     }
-    
-    if not os.path.exists(NOTIFY_FILE):
-        return default_state
-    
+    if not os.path.exists(NOTIFY_FILE): return default_state
     try:
         with open(NOTIFY_FILE, 'r') as f:
             state = json.load(f)
-            if state.get("date") != today_str:
-                return default_state
-            if "intraday_trend" not in state:
-                state["intraday_trend"] = None
+            if state.get("date") != today_str: return default_state
+            if "intraday_trend" not in state: state["intraday_trend"] = None
             return state
-    except:
-        return default_state
+    except: return default_state
 
 def save_notify_state(state):
     try:
-        with open(NOTIFY_FILE, 'w') as f:
-            json.dump(state, f)
-    except:
-        pass
+        with open(NOTIFY_FILE, 'w') as f: json.dump(state, f)
+    except: pass
 
 def check_rapid(row):
-    """
-    檢查廣度急變
-    修正：放寬時間視窗至 3~7 分鐘 (180s ~ 420s)，避免因更新間隔較長而漏抓
-    """
     if not os.path.exists(HIST_FILE): return None, None
     try:
         df = pd.read_csv(HIST_FILE)
@@ -97,29 +85,21 @@ def check_rapid(row):
         curr_v = float(row['Breadth'])
         target = None
         
-        # 往回找最近 15 筆資料
         for i in range(2, min(15, len(df)+1)):
             r = df.iloc[-i]
-            try: 
-                r_t = r['Time'] if len(str(r['Time']))==5 else r['Time'][:5]
+            try: r_t = r['Time'] if len(str(r['Time']))==5 else r['Time'][:5]
             except: continue
-            
             r_dt = datetime.strptime(f"{r['Date']} {r_t}", "%Y-%m-%d %H:%M")
             seconds_diff = (curr_dt - r_dt).total_seconds()
-            
-            # [修正點] 放寬判定區間：3分鐘 ~ 7分鐘
-            if 180 <= seconds_diff <= 420:
+            if 180 <= seconds_diff <= 420: # 放寬至 3~7 分鐘
                 target = r; break
                 
         if target is not None:
             prev_v = float(target['Breadth'])
             diff = curr_v - prev_v
-            
             if abs(diff) >= RAPID_THR:
                 d_str = "上漲" if diff > 0 else "下跌"
-                time_diff_min = int(seconds_diff // 60)
-                msg = f"⚡ <b>【廣度急變】</b>\n{target['Time'][:5]} ({prev_v:.1%}) ➜ {row['Time']} ({curr_v:.1%})\n{time_diff_min}分鐘內{d_str} {abs(diff):.1%}"
-                return msg, str(curr_dt)
+                return f"⚡ <b>【廣度急變】</b>\n{target['Time'][:5]} ({prev_v:.1%}) ➜ {row['Time']} ({curr_v:.1%})\n{d_str} {abs(diff):.1%}", str(curr_dt)
     except: pass
     return None, None
 
@@ -129,16 +109,11 @@ def get_opening_breadth(d_cur):
         df = pd.read_csv(HIST_FILE)
         if df.empty: return None
         if 'Total' not in df.columns: df['Total'] = 0
-    
         df['Date'] = df['Date'].astype(str)
         df_today = df[df['Date'] == str(d_cur)].copy()
         if df_today.empty: return None
-        
-        df_today = df_today[df_today['Time'] >= "09:00"]
-        df_valid = df_today[df_today['Total'] >= OPEN_COUNT_THR].sort_values('Time')
-        
-        if not df_valid.empty:
-            return float(df_valid.iloc[0]['Breadth'])
+        df_valid = df_today[(df_today['Time'] >= "09:00") & (df_today['Total'] >= OPEN_COUNT_THR)].sort_values('Time')
+        if not df_valid.empty: return float(df_valid.iloc[0]['Breadth'])
     except: pass
     return None
 
@@ -160,11 +135,10 @@ def get_api():
         api.login(api_key=st.secrets["shioaji"]["api_key"], secret_key=st.secrets["shioaji"]["secret_key"])
         api.fetch_contracts(contract_download=True)
         return api, None
-    except Exception as e:
-        return None, str(e)
+    except Exception as e: return None, str(e)
 
 # ==========================================
-# 籌碼面資料處理
+# 籌碼面資料處理 (含修復邏輯)
 # ==========================================
 def call_finmind_api_try_versions(dataset_candidates, data_id, start_date, token):
     versions = ["v4", "v3", "v2"]
@@ -180,6 +154,8 @@ def call_finmind_api_try_versions(dataset_candidates, data_id, start_date, token
                     res_json = r.json()
                     if "data" in res_json and len(res_json["data"]) > 0:
                         return pd.DataFrame(res_json["data"]), f"{dataset} ({v})"
+                    elif "msg" in res_json: last_error = f"{dataset} ({v}): {res_json['msg']}"
+                else: last_error = f"{dataset} ({v}) HTTP {r.status_code}"
             except Exception as e: last_error = str(e)
     return pd.DataFrame(), last_error
 
@@ -193,11 +169,11 @@ def get_chips_data(token, target_date_str):
     start_date = (datetime.strptime(target_date_str, "%Y-%m-%d") - timedelta(days=10)).strftime("%Y-%m-%d")
     res = {}
     
-    # 1. 期貨
+    # 1. 期貨 (復原正確計算邏輯)
     fut_candidates = ["TaiwanFuturesInstitutional", "TaiwanFuturesInstitutionalInvestors"]
     df_fut, fut_src = call_finmind_api_try_versions(fut_candidates, "TX", start_date, token)
     if df_fut.empty:
-        diagnosis.append(f"❌ 期貨: 無資料")
+        diagnosis.append(f"❌ 期貨: 掃描失敗")
     else:
         col_name = None
         for c in ['institutional_investors', 'name', 'institutional_investor']:
@@ -210,8 +186,10 @@ def get_chips_data(token, target_date_str):
                 latest = df_foreign.iloc[-1]
                 prev = df_foreign.iloc[-2] if len(df_foreign) >= 2 else latest
                 try:
+                    # [修復] 使用正確的長短部位欄位
                     curr_long = float(latest.get('long_open_interest_balance_volume', 0))
                     curr_short = float(latest.get('short_open_interest_balance_volume', 0))
+                    
                     if curr_long==0 and curr_short==0 and 'open_interest' in latest:
                         res['fut_oi'] = int(latest['open_interest'])
                         prev_oi = int(prev.get('open_interest', 0))
@@ -221,8 +199,8 @@ def get_chips_data(token, target_date_str):
                         prev_short = float(prev.get('short_open_interest_balance_volume', 0))
                         res['fut_oi'] = int(curr_long - curr_short)
                         res['fut_oi_chg'] = res['fut_oi'] - int(prev_long - prev_short)
-                    diagnosis.append(f"✅ 期貨(外資): 成功 ({res['fut_oi']})")
-                except: diagnosis.append("❌ 期貨: 計算錯誤")
+                    diagnosis.append(f"✅ 期貨: {res['fut_oi']} ({res['fut_oi_chg']})")
+                except: diagnosis.append("❌ 期貨: 數值計算失敗")
         else: diagnosis.append("❌ 期貨: 欄位錯誤")
 
     # 2. 選擇權
@@ -235,14 +213,18 @@ def get_chips_data(token, target_date_str):
             call = latest[latest[cp_col].str.lower()=='call']['open_interest'].sum()
             if call>0: res['pc_ratio'] = round((put/call)*100, 2); diagnosis.append(f"✅ 選擇權: {res['pc_ratio']}%")
 
-    # 3. 維持率 (使用正確名稱與欄位)
+    # 3. 維持率 (使用正確的大盤 Dataset)
     maint_candidates = ["TaiwanTotalExchangeMarginMaintenance"]
     df_maint, _ = call_finmind_api_try_versions(maint_candidates, None, start_date, token)
     if not df_maint.empty:
-        col = 'TotalExchangeMarginMaintenance' # 根據您的截圖修正
-        if col in df_maint.columns:
-            res['margin_ratio'] = float(df_maint.iloc[-1][col])
+        latest = df_maint.iloc[-1]
+        col_maint = 'TotalExchangeMarginMaintenance' # 根據您的截圖
+        if col_maint not in latest: col_maint = 'margin_maintenance_ratio'
+        
+        if col_maint in latest:
+            res['margin_ratio'] = float(latest[col_maint])
             diagnosis.append(f"✅ 維持率: {res['margin_ratio']}%")
+        else: diagnosis.append(f"❌ 維持率: 找不到欄位 {list(latest.keys())}")
 
     # 4. 融資餘額
     df_margin, _ = call_finmind_api_try_versions(["TaiwanStockTotalMarginPurchaseShortSale"], None, start_date, token)
@@ -253,7 +235,7 @@ def get_chips_data(token, target_date_str):
             prev = float(df_m.iloc[-2]['TodayBalance']) if len(df_m)>1 else curr
             res['margin_bal'] = round(curr/1e8, 1)
             res['margin_chg'] = round((curr-prev)/1e8, 2)
-            diagnosis.append(f"✅ 融資餘額: {res['margin_bal']}億")
+            diagnosis.append(f"✅ 融資: {res['margin_bal']}億")
 
     return res, diagnosis
 
@@ -404,7 +386,6 @@ def get_prices_twse_mis(codes, info_map):
                     elif item.get('pz','-')!='-': price = float(item['pz']); note="試撮"
                     elif item.get('b','-').split('_')[0]!='-': price=float(item['b'].split('_')[0]); note="委買"
                     elif item.get('a','-').split('_')[0]!='-': price=float(item['a'].split('_')[0]); note="委賣"
-                    
                     if price > 0:
                         val['z'] = price; val['note'] = note
                         results[c] = val
@@ -430,19 +411,14 @@ def save_rec(d, t, b, tc, t_cur, t_prev, intra, total_v):
 
 def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag):
     st.subheader("♟️ 戰略指揮所")
-    
-    # 1. 顯示訊號
     strategies = []
     trend_status = n_state.get('intraday_trend')
-    
     if slope > 0: strategies.append({"sig": "MA5斜率為正 ➜ 大盤偏多", "act": "只做多單", "type": "success"})
     elif slope < 0: strategies.append({"sig": "MA5斜率為負 ➜ 大盤偏空", "act": "只做空單", "type": "error"})
     else: strategies.append({"sig": "MA5斜率持平", "act": "觀望", "type": "info"})
-    
     if trend_status == 'up': strategies.append({"sig": "🔒 趨勢鎖定：偏多", "act": "留意回檔", "type": "success"})
     elif trend_status == 'down': strategies.append({"sig": "🔒 趨勢鎖定：偏空", "act": "留意反彈", "type": "error"})
     else: strategies.append({"sig": "⏳ 趨勢未鎖定", "act": "等待 +/- 5%", "type": "info"})
-
     if slope > 0 and trend_status == 'up' and n_state['notified_drop_high']:
         strategies.append({"sig": "偏多回檔 (高點-5%)", "act": "🎯 進場多單", "type": "success"})
     elif slope < 0 and trend_status == 'down' and n_state['notified_rise_low']:
@@ -456,7 +432,6 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
             elif s["type"] == "info": st.info(f"**{s['sig']}**\n\n{s['act']}")
             else: st.warning(f"**{s['sig']}**\n\n{s['act']}")
 
-    # 2. 籌碼氣象站
     st.markdown("---")
     st.subheader("♟️ 籌碼氣象站 (Sponsor)")
     if chip_strategy and chip_strategy['data']:
@@ -466,7 +441,6 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
         c2.metric("P/C Ratio", f"{d.get('pc_ratio',0)}%")
         if d.get('margin_ratio', 0) > 0: c3.metric("融資維持率", f"{d.get('margin_ratio',0)}%")
         else: c3.metric("融資餘額(億)", f"{d.get('margin_bal',0)}", f"{d.get('margin_chg',0)}")
-        
         s_col = chip_strategy['color']
         with c4:
             msg = f"**{chip_strategy['sig']}**\n\n{chip_strategy['act']}"
@@ -475,7 +449,6 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
             elif s_col == 'warning': st.warning(msg)
             elif s_col == 'primary': st.info(msg, icon="💎")
             else: st.info(msg)
-            
         with st.expander("查看詳細數據來源"):
             for msg in chip_diag: st.text(msg)
     else: st.error("⚠️ 無籌碼資料"); st.write(chip_diag)
@@ -489,31 +462,22 @@ def plot_chart():
                 df['Date'] = df['Date'].astype(str)
                 df['Time'] = df['Time'].astype(str)
                 df['Time'] = df['Time'].apply(lambda x: str(x)[:5])
-                
-                # [Fix] Filter out pre-market data to prevent empty charts
-                # Only consider data after 09:00 for plotting context
-                df_valid = df[df['Time'] >= "09:00"].copy()
-                
-                if not df_valid.empty:
-                    df_valid = df_valid.sort_values(['Date', 'Time'])
-                    base_d = df_valid.iloc[-1]['Date']
-                    
-                    chart_data = df_valid[df_valid['Date'] == base_d].copy()
-                    
-                    # [Fix] Convert to Timestamp for Altair scale
+                # 優先顯示今日 09:00 後的資料
+                df_today = df[df['Time'] >= "09:00"].copy()
+                if not df_today.empty:
+                    df_today = df_today.sort_values(['Date', 'Time'])
+                    last_date = df_today.iloc[-1]['Date']
+                    chart_data = df_today[df_today['Date'] == last_date].copy()
                     chart_data['DT'] = pd.to_datetime(chart_data['Date'] + ' ' + chart_data['Time'], errors='coerce')
                     chart_data = chart_data.dropna(subset=['DT'])
                     chart_data['T_S'] = (chart_data['Taiex_Change']*10)+0.5
+                    base_d = last_date
         except: pass
 
     if base_d == "": base_d = datetime.now().strftime("%Y-%m-%d")
-    
-    # [Fix] Ensure start/end are Timestamps
     start = pd.to_datetime(f"{base_d} 09:00:00")
     end = pd.to_datetime(f"{base_d} 13:30:00")
-    
-    if not chart_data.empty:
-        chart_data = chart_data[chart_data['DT'] >= start] 
+    if not chart_data.empty: chart_data = chart_data[chart_data['DT'] >= start] 
 
     x_scale = alt.Scale(domain=[start, end])
     y_vals = [i/10 for i in range(11)]
@@ -534,13 +498,11 @@ def plot_chart():
         l_t = base.mark_line(color='#007bff', strokeDash=[4,4]).encode(y=alt.Y('T_S', scale=alt.Scale(domain=[0,1])))
         p_t = base.mark_circle(color='#007bff', size=20).encode(y='T_S', tooltip=['DT', alt.Tooltip('Taiex_Change', format='.2%')])
         layers = [l_b, p_b, l_t, p_t]
-    else:
-        layers = [base]
+    else: layers = [base]
 
     rule_r = alt.Chart(pd.DataFrame({'y':[BREADTH_THR]})).mark_rule(color='red', strokeDash=[5,5]).encode(y='y')
     rule_g = alt.Chart(pd.DataFrame({'y':[BREADTH_LOW]})).mark_rule(color='green', strokeDash=[5,5]).encode(y='y')
     layers.extend([rule_r, rule_g])
-
     return alt.layer(*layers).properties(height=400, title=f"走勢對照 - {base_d}").resolve_scale(y='shared')
 
 def fetch_all():
@@ -550,27 +512,21 @@ def fetch_all():
     now = datetime.now(timezone(timedelta(hours=8)))
     today_str = now.strftime("%Y-%m-%d")
     if not days: days = [today_str]
-    
     info_map = get_stock_info_map(ft)
     d_cur = days[-1]
     is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
     allow_live_fetch = (0<=now.weekday()<=4) and (now.time() >= time(8,45))
-    
     date_prev = days[-2] if len(days) > 1 else (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    ranks_curr, _ = get_ranks_strict(ft, date_prev) # 盤中用昨天的名單
+    ranks_curr, _ = get_ranks_strict(ft, date_prev) 
     msg_src = f"名單:{date_prev}(昨日/盤中)"
-    
-    if now.time() >= time(14, 0) and d_cur == today_str: # 盤後嘗試抓今天的
+    if now.time() >= time(14, 0) and d_cur == today_str:
         r_today, _ = get_ranks_strict(ft, today_str, min_count=1500)
         if r_today: ranks_curr = r_today; msg_src = f"名單:{today_str}(今日完整)"
     
     all_targets = list(set(ranks_curr))
-    pmap = {}; mis_debug = {}
-    src_type = "歷史"
-    last_t = "無即時資料"
-    
+    pmap = {}; src_type = "歷史"; last_t = "無即時資料"
     if allow_live_fetch:
-        if sj_api: # Shioaji
+        if sj_api:
             try:
                 for i in range(0, len(all_targets), 50):
                     snaps = sj_api.snapshots([sj_api.Contracts.Stocks[c] for c in all_targets[i:i+50] if c in sj_api.Contracts.Stocks])
@@ -578,8 +534,7 @@ def fetch_all():
                         if s.close > 0: pmap[s.code] = {'price': float(s.close), 'y_close': float(s.reference_price)}
                 if pmap: src_type = "永豐API"; last_t = now.strftime("%H:%M:%S")
             except: pass
-        
-        missing = [c for c in all_targets if c not in pmap] # MIS
+        missing = [c for c in all_targets if c not in pmap]
         if missing:
             mis_data, _ = get_prices_twse_mis(missing, info_map)
             pmap.update(mis_data)
@@ -589,15 +544,16 @@ def fetch_all():
     h_c, v_c = 0, 0
     dtls = []
     
+    # [修復] 昨日廣度計算邏輯 (避免 KeyError: 'br_p')
+    h_p, v_p = 0, 0
     for c in ranks_curr:
         info = pmap.get(c, {})
         curr = info.get('z', info.get('price', 0))
         y_close = info.get('y', info.get('y_close', 0))
-        
-        # 取得歷史資料計算昨收 & MA5
         df = get_hist(ft, c, s_dt)
         p_price = y_close if y_close > 0 else (float(df.iloc[-1]['close']) if not df.empty else 0)
         
+        # 今日計算
         if curr > 0 and p_price > 0 and not df.empty:
             closes = df['close'].tail(4).tolist()
             if len(closes) >= 4:
@@ -605,43 +561,55 @@ def fetch_all():
                 if curr > ma5: h_c += 1
                 v_c += 1
                 dtls.append({"代號":c, "現價":curr, "MA5":round(ma5,2), "狀態":"✅" if curr>ma5 else "📉"})
+        
+        # 昨日計算
+        if not df.empty:
+            try:
+                # 簡單取倒數第二筆 (假設是昨日收盤)
+                row_prev = df.iloc[-1]
+                if row_prev['date'] == today_str and len(df) >= 2: row_prev = df.iloc[-2]
+                
+                # 若這筆資料的日期 == date_prev
+                if row_prev['date'] == date_prev:
+                    # 抓 MA5: 需要該日及前4日
+                    idx = df.index.get_loc(row_prev.name) # 取得整數索引
+                    if idx >= 4:
+                        p_close_val = float(row_prev['close'])
+                        p_ma5_val = df['close'].iloc[idx-4:idx+1].mean()
+                        if p_close_val > p_ma5_val: h_p += 1
+                        v_p += 1
+            except: pass
 
     br_c = h_c/v_c if v_c>0 else 0
-    
-    # 大盤
+    br_p = h_p/v_p if v_p>0 else 0 # [修復] 補回變數
+
     t_cur, t_pre, slope = 0, 0, 0
     try:
         tw = get_hist(ft, "TAIEX", s_dt)
         if not tw.empty:
             mis_tw, _ = get_prices_twse_mis(["t00"], {"t00":"twse"})
             t_now = mis_tw.get("t00", {}).get("z", 0)
-            t_pre = float(tw.iloc[-1]['close']) # 假設尚未收盤，最後一筆是昨天
+            t_pre = float(tw.iloc[-1]['close'])
             if t_now > 0: t_cur = t_now
             else: t_cur = t_pre 
-            
-            # MA5 斜率
             h_tw = tw['close'].tail(6).tolist()
             if len(h_tw) >= 6:
                 ma5_prev = sum(h_tw[-6:-1])/5
-                ma5_curr = sum(h_tw[-5:] + ([t_cur] if t_cur!=t_pre else [])) / 5 # 簡易計算
                 if t_cur!=t_pre: ma5_curr = (sum(h_tw[-4:]) + t_cur)/5
                 else: ma5_curr = sum(h_tw[-5:])/5
                 slope = ma5_curr - ma5_prev
     except: pass
-    
     t_chg = (t_cur-t_pre)/t_pre if t_pre>0 else 0
     
-    # 存檔
     rec_t = last_t if "無" not in str(last_t) else now.strftime("%H:%M:%S")
     save_rec(d_cur, rec_t, br_c, t_chg, t_cur, t_pre, is_intra, v_c)
     
-    # 籌碼
     chips_data, chips_diag = get_chips_data(ft, d_cur)
     chip_strategy = get_chip_strategy(slope, chips_data)
     
     return {
-        "d":d_cur, "br":br_c, "h":h_c, "v":v_c, "df":pd.DataFrame(dtls),
-        "t":last_t, "tc":t_chg, "slope":slope, "src":msg_src, "src_type":src_type,
+        "d":d_cur, "br":br_c, "h":h_c, "v":v_c, "br_p":br_p, "h_p":h_p, "v_p":v_p, # [修復] 回傳 keys
+        "df":pd.DataFrame(dtls), "t":last_t, "tc":t_chg, "slope":slope, "src":msg_src, "src_type":src_type,
         "raw":{'Date':d_cur,'Time':rec_t,'Breadth':br_c},
         "chip_strat": chip_strategy, "chip_diag": chips_diag
     }
@@ -658,7 +626,6 @@ def run_app():
         if st.button("重置資料"): 
             if os.path.exists(HIST_FILE): os.remove(HIST_FILE)
             st.rerun()
-
     if st.button("🔄 刷新"): st.rerun()
 
     try:
@@ -666,17 +633,13 @@ def run_app():
         if data:
             st.sidebar.info(f"來源: {data['src_type']}")
             br = data['br']
-            
-            # --- 通知邏輯 (修正版) ---
             n_state = load_notify_state(data['d'])
             open_br = get_opening_breadth(data['d'])
             hist_max, hist_min = get_intraday_extremes(data['d'])
-            # [修正點] 強制納入當前值，避免 CSV 寫入延遲導致漏判
             today_min = min(hist_min, br) if hist_min is not None else br
             today_max = max(hist_max, br) if hist_max is not None else br
 
             if tg_tok and tg_id:
-                # 1. 趨勢鎖定
                 if open_br is not None and n_state['intraday_trend'] is None:
                     if br >= (open_br + 0.05):
                         n_state['intraday_trend'] = 'up'
@@ -684,8 +647,6 @@ def run_app():
                     elif br <= (open_br - 0.05):
                         n_state['intraday_trend'] = 'down'
                         send_tg(tg_tok, tg_id, f"🔒 <b>【趨勢鎖定】</b>\n廣度達開盤-5% (目前{br:.1%})，今日偏空！")
-                
-                # 2. 過熱/冰點
                 stt = 'normal'
                 if br >= BREADTH_THR: stt = 'hot'
                 elif br <= BREADTH_LOW: stt = 'cold'
@@ -693,35 +654,25 @@ def run_app():
                     msg = f"🔥 過熱: {br:.1%}" if stt=='hot' else (f"❄️ 冰點: {br:.1%}" if stt=='cold' else "")
                     if msg: send_tg(tg_tok, tg_id, msg)
                     n_state['last_stt'] = stt
-                
-                # 3. 急變 (已放寬檢查窗口)
                 rap_msg, rid = check_rapid(data['raw'])
                 if rap_msg and rid != n_state['last_rap']:
                     send_tg(tg_tok, tg_id, rap_msg)
                     n_state['last_rap'] = rid
-                
-                # 4. 反彈/回落 (移除 slope 限制，只看趨勢與幅度)
                 if n_state['intraday_trend'] == 'down': 
                     if br >= (today_min + 0.05):
                         if not n_state['notified_rise_low']:
                             send_tg(tg_tok, tg_id, f"🚀 <b>【低點反彈】</b>\n低點: {today_min:.1%} ➜ 目前: {br:.1%}\n已反彈 > 5%")
                             n_state['notified_rise_low'] = True
-                    else:
-                        n_state['notified_rise_low'] = False
-                
+                    else: n_state['notified_rise_low'] = False
                 elif n_state['intraday_trend'] == 'up':
                     if br <= (today_max - 0.05):
                         if not n_state['notified_drop_high']:
                             send_tg(tg_tok, tg_id, f"📉 <b>【高點回落】</b>\n高點: {today_max:.1%} ➜ 目前: {br:.1%}\n已回檔 > 5%")
                             n_state['notified_drop_high'] = True
-                    else:
-                        n_state['notified_drop_high'] = False
-
+                    else: n_state['notified_drop_high'] = False
                 save_notify_state(n_state)
 
-            # UI 顯示
             display_strategy_panel(data['slope'], open_br, br, n_state, data['chip_strat'], data['chip_diag'])
-            
             st.subheader(f"📅 {data['d']}")
             st.caption(f"{data['src']} | {data['t']}")
             chart = plot_chart()
@@ -732,22 +683,15 @@ def run_app():
             c2.metric("大盤漲跌", f"{data['tc']:.2%}")
             c3.metric("大盤MA5斜率", f"{data['slope']:.2f}", "📈" if data['slope']>0 else "📉")
             
-            # [新增] 廣度極值顯示
             caption_str = f"昨日廣度: {data['br_p']:.1%} ({data['h_p']}/{data['v_p']})"
-            if open_br:
-                caption_str += f" | 開盤: {open_br:.1%}"
-            else:
-                caption_str += " | 開盤: 等待中..."
-            
-            # 這裡顯示今日極值
+            if open_br: caption_str += f" | 開盤: {open_br:.1%}"
+            else: caption_str += " | 開盤: 等待中..."
             caption_str += f"\n今日目前最高廣度: {today_max:.1%}"
             caption_str += f"\n今日目前最低廣度: {today_min:.1%}"
-            
             c1.caption(caption_str)
             
             st.dataframe(data['df'], use_container_width=True, hide_index=True)
         else: st.warning("⚠️ 無資料")
-        
     except Exception as e:
         st.error(f"Error: {e}")
         st.text(traceback.format_exc())
@@ -769,13 +713,9 @@ if __name__ == "__main__":
     try:
         from streamlit.web import cli as stcli
     except ImportError:
-        try:
-            import streamlit.cli as stcli
-        except:
-            pass
-
-    if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
-        run_app()
+        try: import streamlit.cli as stcli
+        except: pass
+    if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv): run_app()
     else:
         print("Starting...")
         try: subprocess.call(["streamlit", "run", __file__])
