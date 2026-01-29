@@ -18,9 +18,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.23 (嚴格復原修正版)
+# 設定區 v9.55.24 (嚴格復原版)
 # ==========================================
-APP_VER = "v9.55.23 (嚴格復原修正版)"
+APP_VER = "v9.55.24 (嚴格復原版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -163,7 +163,7 @@ def get_api():
         return None, str(e)
 
 # ==========================================
-# 籌碼面資料處理 (Scanner)
+# 籌碼面資料處理 (維持最新修復邏輯)
 # ==========================================
 def call_finmind_api_try_versions(dataset_candidates, data_id, start_date, token):
     versions = ["v4", "v3", "v2"]
@@ -212,7 +212,6 @@ def get_chips_data(token, target_date_str):
                     curr_long = float(latest.get('long_open_interest_balance_volume', 0))
                     curr_short = float(latest.get('short_open_interest_balance_volume', 0))
                     
-                    # 舊版欄位兼容
                     if curr_long==0 and curr_short==0 and 'open_interest' in latest:
                         res['fut_oi'] = int(latest['open_interest'])
                         prev_oi = int(prev.get('open_interest', 0))
@@ -396,7 +395,10 @@ def get_prices_twse_mis(codes, info_map):
             r = session.get(base_url, params={"json": "1", "delay": "0", "_": ts, "ex_ch": q_str}, timeout=10)
             if r.status_code == 200:
                 data = r.json()
-                if 'msgArray' not in data: continue
+                if 'msgArray' not in data: 
+                    for c in chunk: debug_log[c] = "MIS空"
+                    continue
+                
                 for item in data['msgArray']:
                     c = item.get('c', '')
                     z = item.get('z', '-')
@@ -547,7 +549,7 @@ def fetch_all():
         if r_today: ranks_curr = r_today; msg_src = f"名單:{today_str}(今日完整)"
     
     all_targets = list(set(ranks_curr))
-    pmap = {}; src_type = "歷史"; last_t = "無即時資料"
+    pmap = {}; mis_debug = {}; src_type = "歷史"; last_t = "無即時資料"
     if allow_live_fetch:
         if sj_api:
             try:
@@ -559,53 +561,81 @@ def fetch_all():
             except: pass
         missing = [c for c in all_targets if c not in pmap]
         if missing:
-            mis_data, _ = get_prices_twse_mis(missing, info_map)
+            mis_data, m_debug = get_prices_twse_mis(missing, info_map)
             pmap.update(mis_data)
+            mis_debug.update(m_debug)
             if mis_data and src_type=="歷史": src_type="證交所MIS"; last_t = now.strftime("%H:%M:%S")
 
     s_dt = (datetime.now()-timedelta(days=40)).strftime("%Y-%m-%d")
     h_c, v_c = 0, 0
     dtls = []
     
-    # [重構] 昨日廣度計算邏輯 (修復 KeyError: 'br_p')
+    # [嚴格復原] 詳細資料表與昨日廣度計算
     h_p, v_p = 0, 0
     
     for c in ranks_curr:
         info = pmap.get(c, {})
-        curr = info.get('z', info.get('price', 0))
+        curr_p = info.get('z', info.get('price', 0))
         y_close = info.get('y', info.get('y_close', 0))
+        
         df = get_hist(ft, c, s_dt)
+        m_type = info_map.get(c, "未知")
+        m_display = {"twse":"上市", "tpex":"上櫃", "emerging":"興櫃"}.get(m_type, "未知")
+        
         p_price = y_close if y_close > 0 else (float(df.iloc[-1]['close']) if not df.empty else 0)
+        p_ma5 = 0; p_stt = "-"
         
-        # 今日廣度
-        if curr > 0 and p_price > 0 and not df.empty:
-            closes = df['close'].tail(4).tolist()
-            if len(closes) >= 4:
-                ma5 = sum(closes + [curr]) / 5
-                if curr > ma5: h_c += 1
+        # 昨收/昨MA5 計算 (用於列表顯示)
+        if not df.empty and p_price > 0:
+            # 這裡簡單取倒數5筆來算昨日 MA5
+            closes = df['close'].tail(5).tolist()
+            if len(closes) >= 5:
+                p_ma5 = sum(closes) / 5
+            if p_price > p_ma5: p_stt="✅"
+            else: p_stt="📉"
+
+        c_ma5 = 0; c_stt = "-"; note = ""
+        if curr_p == 0: 
+            c_stt = "⚠️無報價"
+            reason = mis_debug.get(c, "非交易時間" if not allow_live_fetch else "MIS未回傳")
+            note = f"⚠️{reason} | 昨收{p_price}"
+        else: note = f"昨收{p_price}"
+        
+        source_note = info.get('note', '')
+        if source_note: note = f"📝{source_note} " + note
+
+        if curr_p > 0 and p_price > 0 and not df.empty:
+            hist_closes = df['close'].tail(4).tolist()
+            if len(hist_closes) >= 4:
+                ma5_input = hist_closes + [curr_p]
+                c_ma5 = sum(ma5_input) / 5
+                if curr_p > c_ma5: h_c += 1; c_stt="✅"
+                else: c_stt="📉"
                 v_c += 1
-                dtls.append({"代號":c, "現價":curr, "MA5":round(ma5,2), "狀態":"✅" if curr>ma5 else "📉"})
         
-        # 昨日廣度
+        dtls.append({
+            "代號":c, "市場": m_display,
+            "昨收":p_price, "昨MA5":round(p_ma5,2), "昨狀態":p_stt,
+            "現價":curr_p, "今MA5":round(c_ma5,2), "今狀態":c_stt,
+            "備註": note
+        })
+        
+        # 昨日廣度計算 (修復 KeyError 'br_p')
         if not df.empty:
             try:
-                # 取得昨日收盤價 (無論今天有無資料)
-                # 若今天有資料(尚未收盤)，df最後一筆通常是昨收
-                # 若今天已收盤，df最後一筆是今天，倒數第二筆是昨收
-                # 這裡為了保險，我們直接用 date_prev 去篩選
+                # 嚴格篩選昨日日期
                 df_prev = df[df['date'] == date_prev]
                 if not df_prev.empty:
-                    # 抓該日 MA5
                     idx = df.index.get_loc(df_prev.index[0])
                     if idx >= 4:
-                        p_close_val = float(df_prev.iloc[0]['close'])
-                        p_ma5_val = df['close'].iloc[idx-4:idx+1].mean()
-                        if p_close_val > p_ma5_val: h_p += 1
+                        prev_c = float(df_prev.iloc[0]['close'])
+                        prev_m = df['close'].iloc[idx-4:idx+1].mean()
+                        if prev_c > prev_m: h_p += 1
                         v_p += 1
             except: pass
 
     br_c = h_c/v_c if v_c>0 else 0
-    br_p = h_p/v_p if v_p>0 else 0 # 確保有值
+    br_p = h_p/v_p if v_p>0 else 0 
 
     t_cur, t_pre, slope = 0, 0, 0
     try:
@@ -631,7 +661,6 @@ def fetch_all():
     chips_data, chips_diag = get_chips_data(ft, d_cur)
     chip_strategy = get_chip_strategy(slope, chips_data)
     
-    # [修復] 確保回傳所有 keys
     return {
         "d":d_cur, "br":br_c, "h":h_c, "v":v_c, "br_p":br_p, "h_p":h_p, "v_p":v_p,
         "df":pd.DataFrame(dtls), "t":last_t, "tc":t_chg, "slope":slope, "src":msg_src, "src_type":src_type,
