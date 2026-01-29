@@ -19,9 +19,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.33 (智慧緩存版)
+# 設定區 v9.55.34 (圖表精細化版)
 # ==========================================
-APP_VER = "v9.55.33 (智慧緩存版)"
+APP_VER = "v9.55.34 (圖表精細化版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -33,7 +33,7 @@ EXCL_PFX = ["00", "91"]
 HIST_FILE = "breadth_history_v3.csv"
 RANK_FILE = "ranking_cache.json"
 NOTIFY_FILE = "notify_state.json" 
-CHIPS_FILE = "chips_cache_v2.json" # [新增] 籌碼永久快取檔
+CHIPS_FILE = "chips_cache_v2.json"
 
 # ==========================================
 # 基礎函式
@@ -162,7 +162,7 @@ def get_api():
         return None, str(e)
 
 # ==========================================
-# 籌碼面資料處理 (核心：網路抓取層)
+# 籌碼面資料處理
 # ==========================================
 def call_finmind_api_try_versions(dataset_candidates, data_id, start_date, token):
     versions = ["v4", "v3", "v2"]
@@ -199,18 +199,16 @@ def get_taifex_pc_ratio(target_date_str):
                     top_row = df.iloc[0] 
                     try:
                         val = float(top_row.iloc[6])
-                        date_str = str(top_row.iloc[0]) # 抓取日期
+                        date_str = str(top_row.iloc[0]) 
                         return val, date_str, f"期交所官網 ({date_str})"
                     except: continue
     except Exception as e:
         return None, None, str(e)
     return None, None, "找不到表格"
 
-# 實際執行網路抓取的函式 (無快取)
 def fetch_chips_from_network(token, target_date_str):
     diagnosis = [] 
     res = {}
-    
     start_date = (datetime.strptime(target_date_str, "%Y-%m-%d") - timedelta(days=10)).strftime("%Y-%m-%d")
     
     # 1. 期貨
@@ -230,11 +228,9 @@ def fetch_chips_from_network(token, target_date_str):
                 latest = df_foreign.iloc[-1]
                 prev = df_foreign.iloc[-2] if len(df_foreign) >= 2 else latest
                 
-                # 檢查日期是否匹配目標日期 (如果是抓今日，必須是今日資料才算成功)
                 data_date = latest.get('date', '')
                 res['fut_date'] = data_date
                 
-                # 數值計算
                 try:
                     curr_long = float(latest.get('long_open_interest_balance_volume', 0))
                     curr_short = float(latest.get('short_open_interest_balance_volume', 0))
@@ -252,9 +248,7 @@ def fetch_chips_from_network(token, target_date_str):
                 except: diagnosis.append("❌ 期貨: 計算錯誤")
 
     # 2. 選擇權
-    pc_val = None
-    pc_date = None
-    
+    pc_val = None; pc_date = None
     df_opt, _ = call_finmind_api_try_versions(["TaiwanOptionDaily"], "TXO", start_date, token)
     if not df_opt.empty:
         latest = df_opt[df_opt['date'] == df_opt['date'].max()]
@@ -267,13 +261,10 @@ def fetch_chips_from_network(token, target_date_str):
                 pc_date = latest.iloc[0]['date']
                 diagnosis.append(f"✅ 選擇權(FinMind): {pc_val}% ({pc_date})")
 
-    # 若 FinMind 失敗或非今日(假設我們要抓今日)，嘗試官網
-    # 這裡簡化邏輯：如果有抓到就用，日期由 UI 判斷
     if pc_val is None or pc_val == 0:
         taifex_val, taifex_date, taifex_msg = get_taifex_pc_ratio(target_date_str)
         if taifex_val is not None:
-            pc_val = taifex_val
-            pc_date = taifex_date
+            pc_val = taifex_val; pc_date = taifex_date
             diagnosis.append(f"✅ 選擇權(期交所): {pc_val}% ({pc_date})")
         else:
             if pc_val is None: diagnosis.append(f"❌ 選擇權: 全數失敗 ({taifex_msg})")
@@ -302,45 +293,31 @@ def fetch_chips_from_network(token, target_date_str):
             latest = df_m.iloc[-1]
             prev = df_m.iloc[-2] if len(df_m)>1 else latest
             curr_bal = float(latest['TodayBalance'])
-            prev_val = float(prev['TodayBalance'])
-            res['margin_chg'] = round((curr_bal - prev_val)/1e8, 2)
+            prev_bal = float(prev['TodayBalance'])
+            res['margin_chg'] = round((curr_bal - prev_bal)/1e8, 2)
             res['margin_bal'] = round(curr_bal/1e8, 1)
             res['margin_bal_date'] = latest.get('date', '未知日期')
             diagnosis.append(f"✅ 融資餘額: {res['margin_bal']}億 ({res['margin_bal_date']})")
 
     return res, diagnosis
 
-# [核心] 智慧緩存管理器
 def get_chips_data_smart(token):
-    # 1. 決定目標日期
     now = datetime.now(timezone(timedelta(hours=8)))
     today = now.date()
     yesterday = today - timedelta(days=1)
     
-    # 邏輯判斷：14:00 前只看昨天，14:00 後才看今天
     if now.time() < time(14, 0):
         target_date = yesterday
-        date_label = "昨日"
     else:
         target_date = today
-        date_label = "今日"
         
     target_str = target_date.strftime("%Y-%m-%d")
-    
-    # 2. 讀取快取檔案
     cache = load_json_file(CHIPS_FILE)
     
-    # 3. 檢查目標日期是否已在快取中
     if target_str in cache:
-        # 命中！直接回傳，完全不連網
         return cache[target_str]['data'], cache[target_str]['diag']
     
-    # 4. 若快取沒有，執行抓取 (只抓一次)
     data, diag = fetch_chips_from_network(token, target_str)
-    
-    # 5. 判斷是否抓到「目標日期」的資料 (關鍵！)
-    # 我們檢查 'fut_date' (期貨日期) 是否等於 target_str
-    # 或是如果我們是要抓昨天，只要有資料就算成功
     
     is_success = False
     fetched_date = data.get('fut_date', '')
@@ -348,25 +325,18 @@ def get_chips_data_smart(token):
     if fetched_date == target_str:
         is_success = True
     elif target_date == yesterday and fetched_date: 
-        # 如果是要抓昨天，但 API 回傳的日期可能是前天(假日)，也算有抓到
         is_success = True
         
     if is_success:
-        # 寫入快取，下次就不會再抓了
         cache[target_str] = {'data': data, 'diag': diag}
         save_json_file(CHIPS_FILE, cache)
         return data, diag
     
-    # 6. 如果目標是「今日」但沒抓到 (盤後資料未出)，退回顯示「快取中最新的舊資料」
     if target_date == today:
-        # 找快取中日期最大的那一筆
         cached_dates = sorted(cache.keys())
         if cached_dates:
             last_date = cached_dates[-1]
             return cache[last_date]['data'], cache[last_date]['diag'] + [f"⚠️ {target_str} 資料未出，顯示 {last_date} 數據"]
-            
-        # 若連快取都空的，只好回傳剛剛抓到的(雖然日期不對)
-        return data, diag
         
     return data, diag
 
@@ -454,6 +424,9 @@ def get_ranks_strict(token, target_date_str, min_count=0):
     except: pass
     
     if df.empty: return [], False
+
+    if min_count > 0 and len(df) < min_count:
+        return [], False
 
     df['ID'] = get_col(df, ['stock_id','code'])
     df['Money'] = get_col(df, ['Trading_money','turnover'])
@@ -729,10 +702,23 @@ def plot_chart():
     rule_g = alt.Chart(pd.DataFrame({'y':[BREADTH_LOW]})).mark_rule(color='green', strokeDash=[5,5]).encode(y='y')
     
     if not chart_data.empty:
-        l_b = base.mark_line(color='#ffc107').encode(y=alt.Y('Breadth', title=None, scale=alt.Scale(domain=[0,1], nice=False), axis=y_axis))
-        p_b = base.mark_circle(color='#ffc107', size=20).encode(y='Breadth', tooltip=['DT', alt.Tooltip('Breadth', format='.1%')])
-        l_t = base.mark_line(color='#007bff', strokeDash=[4,4]).encode(y=alt.Y('T_S', scale=alt.Scale(domain=[0,1])))
-        p_t = base.mark_circle(color='#007bff', size=20).encode(y='T_S', tooltip=['DT', alt.Tooltip('Taiex_Change', format='.2%')])
+        # [圖表優化] 黃色廣度: 實線(細) + 點(小)
+        l_b = base.mark_line(color='#ffc107', strokeWidth=1).encode(
+            y=alt.Y('Breadth', title=None, scale=alt.Scale(domain=[0,1], nice=False), axis=y_axis)
+        )
+        p_b = base.mark_circle(color='#ffc107', size=10).encode(
+            y='Breadth', 
+            tooltip=['DT', alt.Tooltip('Breadth', format='.1%')]
+        )
+        
+        # [圖表優化] 藍色大盤: 實線(細) + 點(小)
+        l_t = base.mark_line(color='#007bff', strokeWidth=1).encode(
+            y=alt.Y('T_S', scale=alt.Scale(domain=[0,1]))
+        )
+        p_t = base.mark_circle(color='#007bff', size=10).encode(
+            y='T_S', 
+            tooltip=['DT', alt.Tooltip('Taiex_Change', format='.2%')]
+        )
         layers = [l_b, p_b, l_t, p_t, rule_r, rule_g]
     else:
         layers = [base, rule_r, rule_g]
@@ -961,7 +947,7 @@ def fetch_all():
     
     save_rec(d_cur, rec_t, br_c, t_chg, t_cur, t_pre, is_intra, v_c)
     
-    # [核心修改] 呼叫智慧緩存版籌碼函式
+    # 籌碼面處理 (Sponsor) - 帶回診斷日誌
     chips_data, chips_diag = get_chips_data_smart(ft)
     chip_strategy = get_chip_strategy(slope, chips_data)
     
@@ -1159,7 +1145,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (智慧緩存版)...")
+        print("正在啟動 Streamlit 介面 (圖表精細化版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
