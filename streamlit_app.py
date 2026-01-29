@@ -9,7 +9,7 @@ import os, sys, json, subprocess, traceback
 import altair as alt
 import time as time_module
 import random
-import io # 新增：用於解析 HTML
+import io 
 
 # 引入 curl_cffi 
 try:
@@ -19,9 +19,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.25 (雙核心完全體)
+# 設定區 v9.55.26 (PC Ratio 排序修正版)
 # ==========================================
-APP_VER = "v9.55.25 (雙核心完全體)"
+APP_VER = "v9.55.26 (PC Ratio 排序修正版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -86,10 +86,6 @@ def save_notify_state(state):
         pass
 
 def check_rapid(row):
-    """
-    檢查廣度急變
-    修正：放寬時間視窗至 3~7 分鐘 (180s ~ 420s)
-    """
     if not os.path.exists(HIST_FILE): return None, None
     try:
         df = pd.read_csv(HIST_FILE)
@@ -163,7 +159,7 @@ def get_api():
         return None, str(e)
 
 # ==========================================
-# 籌碼面資料處理 (含期交所直連)
+# 籌碼面資料處理
 # ==========================================
 def call_finmind_api_try_versions(dataset_candidates, data_id, start_date, token):
     versions = ["v4", "v3", "v2"]
@@ -182,11 +178,9 @@ def call_finmind_api_try_versions(dataset_candidates, data_id, start_date, token
             except Exception as e: last_error = str(e)
     return pd.DataFrame(), last_error
 
-# [新增] 期交所官網爬蟲 (學習自 get_pc_ratio.py)
 def get_taifex_pc_ratio(target_date_str):
     """直接從期交所官網抓取 PC Ratio"""
     try:
-        # 計算日期區間 (抓前10天確保有資料)
         end_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
         start_dt = end_dt - timedelta(days=10)
         
@@ -197,21 +191,18 @@ def get_taifex_pc_ratio(target_date_str):
             'queryDate': end_dt.strftime("%Y/%m/%d")
         }
         
-        # 使用 cffi_requests 模擬瀏覽器 (更強大)
         r = cffi_requests.post(url, data=payload, impersonate="chrome", timeout=10)
         
         if r.status_code == 200:
-            # 讀取表格
             dfs = pd.read_html(io.StringIO(r.text))
             for df in dfs:
-                # 尋找包含 "PC Ratio" 的表格
-                # 根據您的腳本，第7欄 (index 6) 是 PC Ratio
                 if df.shape[1] >= 7:
-                    # 檢查最後一列是否為有效數據
-                    last_row = df.iloc[-1]
+                    # [修正] 期交所表格是 "由新到舊" 排序
+                    # 所以最新的資料是第 0 列 (iloc[0])，而不是最後一列 (iloc[-1])
+                    top_row = df.iloc[0]
                     try:
-                        val = float(last_row.iloc[6]) # 嘗試讀取第7欄
-                        return val, f"期交所官網 ({last_row.iloc[0]})"
+                        val = float(top_row.iloc[6]) 
+                        return val, f"期交所官網 ({top_row.iloc[0]})"
                     except: continue
     except Exception as e:
         return None, str(e)
@@ -227,7 +218,7 @@ def get_chips_data(token, target_date_str):
     start_date = (datetime.strptime(target_date_str, "%Y-%m-%d") - timedelta(days=10)).strftime("%Y-%m-%d")
     res = {}
     
-    # 1. 期貨 (FinMind)
+    # 1. 期貨
     fut_candidates = ["TaiwanFuturesInstitutional", "TaiwanFuturesInstitutionalInvestors"]
     df_fut, fut_src = call_finmind_api_try_versions(fut_candidates, "TX", start_date, token)
     if df_fut.empty:
@@ -260,10 +251,10 @@ def get_chips_data(token, target_date_str):
                 except: diagnosis.append("❌ 期貨: 計算錯誤")
         else: diagnosis.append("❌ 期貨: 欄位錯誤")
 
-    # 2. 選擇權 (雙核心：FinMind 優先 -> 失敗則轉用 期交所)
+    # 2. 選擇權 (雙核心)
     pc_val = None
     
-    # A. 嘗試 FinMind
+    # A. 優先嘗試 FinMind
     df_opt, _ = call_finmind_api_try_versions(["TaiwanOptionDaily"], "TXO", start_date, token)
     if not df_opt.empty:
         latest = df_opt[df_opt['date'] == df_opt['date'].max()]
@@ -275,19 +266,19 @@ def get_chips_data(token, target_date_str):
                 pc_val = round((put/call)*100, 2)
                 diagnosis.append(f"✅ 選擇權(FinMind): {pc_val}%")
 
-    # B. 如果 FinMind 沒抓到，切換期交所爬蟲
-    if pc_val is None:
+    # B. 若 FinMind 失敗或數值為0，切換期交所
+    if pc_val is None or pc_val == 0:
         taifex_val, taifex_msg = get_taifex_pc_ratio(target_date_str)
         if taifex_val is not None:
             pc_val = taifex_val
             diagnosis.append(f"✅ 選擇權(期交所): {pc_val}%")
         else:
-            diagnosis.append(f"❌ 選擇權: 全數失敗 ({taifex_msg})")
+            if pc_val is None: diagnosis.append(f"❌ 選擇權: 全數失敗 ({taifex_msg})")
             
     if pc_val is not None:
         res['pc_ratio'] = pc_val
 
-    # 3. 維持率 (使用正確名稱)
+    # 3. 維持率
     maint_candidates = ["TaiwanTotalExchangeMarginMaintenance"]
     df_maint, _ = call_finmind_api_try_versions(maint_candidates, None, start_date, token)
     if not df_maint.empty:
@@ -445,7 +436,10 @@ def get_prices_twse_mis(codes, info_map):
             r = session.get(base_url, params={"json": "1", "delay": "0", "_": ts, "ex_ch": q_str}, timeout=10)
             if r.status_code == 200:
                 data = r.json()
-                if 'msgArray' not in data: continue
+                if 'msgArray' not in data: 
+                    for c in chunk: debug_log[c] = "MIS空"
+                    continue
+                
                 for item in data['msgArray']:
                     c = item.get('c', '')
                     z = item.get('z', '-')
@@ -617,7 +611,6 @@ def fetch_all():
     h_c, v_c = 0, 0
     dtls = []
     
-    # [嚴格復原] 詳細資料表與昨日廣度計算
     h_p, v_p = 0, 0
     
     for c in ranks_curr:
@@ -632,7 +625,6 @@ def fetch_all():
         p_price = y_close if y_close > 0 else (float(df.iloc[-1]['close']) if not df.empty else 0)
         p_ma5 = 0; p_stt = "-"
         
-        # 昨收/昨MA5 計算 (用於列表顯示)
         if not df.empty and p_price > 0:
             closes = df['close'].tail(5).tolist()
             if len(closes) >= 5:
@@ -666,10 +658,8 @@ def fetch_all():
             "備註": note
         })
         
-        # 昨日廣度計算 (修復 KeyError 'br_p')
         if not df.empty:
             try:
-                # 嚴格篩選昨日日期
                 df_prev = df[df['date'] == date_prev]
                 if not df_prev.empty:
                     idx = df.index.get_loc(df_prev.index[0])
@@ -707,7 +697,6 @@ def fetch_all():
     chips_data, chips_diag = get_chips_data(ft, d_cur)
     chip_strategy = get_chip_strategy(slope, chips_data)
     
-    # [修復] 確保回傳所有 keys
     return {
         "d":d_cur, "br":br_c, "h":h_c, "v":v_c, "br_p":br_p, "h_p":h_p, "v_p":v_p,
         "df":pd.DataFrame(dtls), "t":last_t, "tc":t_chg, "slope":slope, "src":msg_src, "src_type":src_type,
