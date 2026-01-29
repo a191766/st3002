@@ -19,9 +19,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.27 (漲跌停價格修復版)
+# 設定區 v9.55.28 (漲跌停價格終極修復版)
 # ==========================================
-APP_VER = "v9.55.27 (漲跌停價格修復版)"
+APP_VER = "v9.55.28 (漲跌停價格終極修復版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -196,7 +196,7 @@ def get_taifex_pc_ratio(target_date_str):
             dfs = pd.read_html(io.StringIO(r.text))
             for df in dfs:
                 if df.shape[1] >= 7:
-                    top_row = df.iloc[0] # 由新到舊，取第一筆
+                    top_row = df.iloc[0] 
                     try:
                         val = float(top_row.iloc[6]) 
                         return val, f"期交所官網 ({top_row.iloc[0]})"
@@ -438,33 +438,48 @@ def get_prices_twse_mis(codes, info_map):
                     c = item.get('c', '')
                     z = item.get('z', '-')
                     y = item.get('y', '-')
+                    pz = item.get('pz', '-')
+                    
                     val = {}
                     if y!='-' and y!='': val['y'] = float(y)
                     price = 0
                     note = ""
                     
-                    # [修正] 增加對漲跌停(有掛單無成交)的判斷
-                    if z!='-' and z!='': 
+                    # [終極修正] 漲跌停無價判斷邏輯
+                    # 1. 優先嘗試成交價
+                    if z and z != '-' and z.replace('.','').isdigit(): 
                         price = float(z); note="成交"
-                    elif item.get('pz','-')!='-': 
-                        price = float(item['pz']); note="試撮"
-                    else:
-                        # 檢查買賣五檔，若有掛單則視為漲/跌停鎖死
-                        b_str = item.get('b','-').split('_')[0]
-                        a_str = item.get('a','-').split('_')[0]
+                    # 2. 其次嘗試試撮價
+                    elif pz and pz != '-' and pz.replace('.','').isdigit(): 
+                        price = float(pz); note="試撮"
+                    
+                    # 3. 若仍無價，檢查是否漲停(只有買單) 或 跌停(只有賣單)
+                    if price == 0:
+                        b_str = item.get('b','').split('_')[0]
+                        a_str = item.get('a','').split('_')[0]
                         
-                        if b_str != '-' and b_str: # 只有買單 (漲停鎖死)
-                            price = float(b_str)
-                            note = "漲停試算"
-                        elif a_str != '-' and a_str: # 只有賣單 (跌停鎖死)
-                            price = float(a_str)
-                            note = "跌停試算"
+                        # 檢查買單 (漲停鎖死通常 b 有值, a 無值/0)
+                        if b_str and b_str != '-' and b_str != '0':
+                            try:
+                                price = float(b_str)
+                                note = "漲停試算"
+                            except: pass
+                        
+                        # 若還是 0，檢查賣單 (跌停鎖死通常 a 有值, b 無值/0)
+                        if price == 0 and a_str and a_str != '-' and a_str != '0':
+                            try:
+                                price = float(a_str)
+                                note = "跌停試算"
+                            except: pass
                     
                     if price > 0:
                         val['z'] = price; val['note'] = note
                         results[c] = val
                     else: debug_log[c] = "無價"
-        except: pass
+        except Exception as e: 
+            # 這裡不噴錯，只紀錄
+            pass
+            
     return results, debug_log
 
 def save_rec(d, t, b, tc, t_cur, t_prev, intra, total_v):
