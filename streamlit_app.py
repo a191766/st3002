@@ -19,9 +19,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.29 (介面全開版)
+# 設定區 v9.55.30 (介面優化版)
 # ==========================================
-APP_VER = "v9.55.29 (介面全開版)"
+APP_VER = "v9.55.30 (介面優化版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -234,7 +234,6 @@ def get_chips_data(token, target_date_str):
                 try:
                     curr_long = float(latest.get('long_open_interest_balance_volume', 0))
                     curr_short = float(latest.get('short_open_interest_balance_volume', 0))
-                    
                     if curr_long==0 and curr_short==0 and 'open_interest' in latest:
                         res['fut_oi'] = int(latest['open_interest'])
                         prev_oi = int(prev.get('open_interest', 0))
@@ -294,7 +293,6 @@ def get_chips_data(token, target_date_str):
             prev_bal = float(prev['TodayBalance'])
             res['margin_chg'] = round((curr_bal - prev_bal) / 100000000, 2) 
             res['margin_bal'] = round(curr_bal / 100000000, 1)
-            # [修正] 補上變動值顯示
             diagnosis.append(f"✅ 融資餘額: {res['margin_bal']}億 (變動: {res['margin_chg']}億)")
 
     return res, diagnosis
@@ -346,21 +344,26 @@ def get_days(token):
     now = datetime.now(timezone(timedelta(hours=8)))
     today_str = now.strftime("%Y-%m-%d")
     if 0 <= now.weekday() <= 4:
-        if not dates or today_str > dates[-1]: dates.append(today_str)
+        if not dates or today_str > dates[-1]:
+            dates.append(today_str)
     return dates
 
 @st.cache_data(ttl=86400)
 def get_stock_info_map(token):
-    base_map = {"2330":"twse", "2317":"twse", "2454":"twse", "0050":"twse", "0056":"twse"}
+    base_map = {
+        "2330":"twse", "2317":"twse", "2454":"twse", "2303":"twse", "2308":"twse",
+        "0050":"twse", "0056":"twse", "00878":"twse", "t00": "twse"
+    }
     api = DataLoader()
     if token: api.login_by_token(token)
     try:
         df = api.taiwan_stock_info()
-        if not df.empty:
-            df['stock_id'] = df['stock_id'].astype(str)
-            base_map.update(dict(zip(df['stock_id'], df['type'])))
-    except: pass
-    return base_map
+        if df.empty: return base_map
+        df['stock_id'] = df['stock_id'].astype(str)
+        api_map = dict(zip(df['stock_id'], df['type']))
+        base_map.update(api_map)
+        return base_map
+    except: return base_map
 
 def get_ranks_strict(token, target_date_str, min_count=0):
     if min_count == 0 and os.path.exists(RANK_FILE):
@@ -373,11 +376,14 @@ def get_ranks_strict(token, target_date_str, min_count=0):
 
     api = DataLoader()
     if token: api.login_by_token(token)
+    df = pd.DataFrame()
     try: df = api.taiwan_stock_daily(stock_id="", start_date=target_date_str)
-    except: return [], False
+    except: pass
     
     if df.empty: return [], False
-    if min_count > 0 and len(df) < min_count: return [], False
+
+    if min_count > 0 and len(df) < min_count:
+        return [], False
 
     df['ID'] = get_col(df, ['stock_id','code'])
     df['Money'] = get_col(df, ['Trading_money','turnover'])
@@ -389,6 +395,7 @@ def get_ranks_strict(token, target_date_str, min_count=0):
     for p in EXCL_PFX: df = df[~df['ID'].str.startswith(p)]
      
     ranks = df.sort_values('Money', ascending=False).head(TOP_N)['ID'].tolist()
+    
     if ranks and (min_count == 0 or len(df) > 1500):
         try:
             with open(RANK_FILE, 'w') as f:
@@ -529,6 +536,15 @@ def save_rec(d, t, b, tc, t_cur, t_prev, intra, total_v):
     except: row.to_csv(HIST_FILE, index=False)
 
 def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag):
+    # [UI優化 1/2] 注入 CSS 強制縮小 metric 數字字體 (26px -> 20px)
+    st.markdown("""
+        <style>
+        div[data-testid="stMetricValue"] {
+            font-size: 20px !important;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
     st.subheader("♟️ 戰略指揮所")
     strategies = []
     
@@ -561,14 +577,12 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
     
     if chip_strategy and chip_strategy['data']:
         d = chip_strategy['data']
-        # [變更] 使用 5 個欄位來容納所有數據
-        c1, c2, c3, c4, c5 = st.columns(5)
+        # [UI優化 2/2] 調整欄位權重：縮小數據欄位，放大文字欄位
+        c1, c2, c3, c4, c5 = st.columns([1.1, 1.1, 1.1, 1.4, 2.5])
         
         c1.metric("外資期貨淨OI", f"{d.get('fut_oi',0):,}", f"{d.get('fut_oi_chg',0):,}")
         c2.metric("P/C Ratio", f"{d.get('pc_ratio',0)}%")
         c3.metric("融資維持率", f"{d.get('margin_ratio',0)}%")
-        
-        # [修正] 顯示融資餘額與變動
         c4.metric("融資餘額(億)", f"{d.get('margin_bal',0)}", f"{d.get('margin_chg',0)}")
         
         sig = chip_strategy['sig']; act = chip_strategy['act']; color = chip_strategy['color']
@@ -587,7 +601,9 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
             for msg in chip_diag: st.write(msg)
 
 def plot_chart():
-    chart_data = pd.DataFrame(); base_d = ""
+    chart_data = pd.DataFrame()
+    base_d = ""
+    
     if os.path.exists(HIST_FILE):
         try:
             df = pd.read_csv(HIST_FILE)
@@ -595,6 +611,7 @@ def plot_chart():
                 df['Date'] = df['Date'].astype(str)
                 df['Time'] = df['Time'].astype(str)
                 df['Time'] = df['Time'].apply(lambda x: x[:5])
+                
                 df_today = df[df['Time'] >= "09:00"].copy()
                 if not df_today.empty:
                     df_today = df_today.sort_values(['Date', 'Time'])
@@ -773,31 +790,17 @@ def fetch_all():
         
         if curr_p == 0: 
             c_stt = "⚠️無報價"
-            reason = ""
-            if not allow_live_fetch: 
-                reason = "非交易時間"
-            else:
-                if c in mis_debug_map:
-                    reason = mis_debug_map[c] 
-                elif c not in pmap:
-                    reason = "MIS未回傳"
-            
-            if reason: note = f"⚠️{reason} | 昨收{p_price}"
-            else: note = f"昨收{p_price}"
+            reason = mis_debug_map.get(c, "非交易時間" if not allow_live_fetch else "MIS未回傳")
+            note = f"⚠️{reason} | 昨收{p_price}"
+        else: note = f"昨收{p_price}"
         
         source_note = info.get('note', '')
         if source_note: note = f"📝{source_note} " + note
 
         if curr_p > 0 and p_price > 0 and not df.empty:
-            hist_closes = []
-            if df.iloc[-1]['date'] == today_str:
-                 hist_closes = df['close'].iloc[:-1].tail(4).tolist()
-            else:
-                 hist_closes = df['close'].tail(4).tolist()
-                 
+            hist_closes = df['close'].tail(4).tolist()
             if len(hist_closes) >= 4:
-                ma5_input = hist_closes 
-                ma5_input.append(curr_p)     
+                ma5_input = hist_closes + [curr_p]
                 c_ma5 = sum(ma5_input) / 5
                 if curr_p > c_ma5: h_c += 1; c_stt="✅"
                 else: c_stt="📉"
@@ -815,22 +818,16 @@ def fetch_all():
         df = get_hist(ft, c, s_dt)
         if df.empty: continue
         
-        has_today = (df.iloc[-1]['date'] == today_str)
-        prev_close = 0
-        prev_ma5 = 0
-        
-        if has_today:
-            if len(df) >= 2: prev_close = float(df.iloc[-2]['close'])
-            if len(df) >= 6:
-                prev_ma5 = df['close'].iloc[-6:-1].mean()
-        else:
-            prev_close = float(df.iloc[-1]['close'])
-            if len(df) >= 5:
-                prev_ma5 = df['close'].iloc[-5:].mean()
-        
-        if prev_close > 0 and prev_ma5 > 0:
-            if prev_close > prev_ma5: h_p += 1
-            v_p += 1
+        try:
+            df_prev = df[df['date'] == date_prev]
+            if not df_prev.empty:
+                idx = df.index.get_loc(df_prev.index[0])
+                if idx >= 4:
+                    prev_c = float(df_prev.iloc[0]['close'])
+                    prev_m = df['close'].iloc[idx-4:idx+1].mean()
+                    if prev_c > prev_m: h_p += 1
+                    v_p += 1
+        except: pass
 
     br_c = h_c/v_c if v_c>0 else 0
     br_p = h_p/v_p if v_p>0 else 0
@@ -933,8 +930,8 @@ def run_app():
             open_br = get_opening_breadth(data['d'])
              
             hist_max, hist_min = get_intraday_extremes(data['d'])
-            today_max = br if hist_max is None else max(hist_max, br)
-            today_min = br if hist_min is None else min(hist_min, br)
+            today_max = max(hist_max, br) if hist_max is not None else br
+            today_min = min(hist_min, br) if hist_min is not None else br
         
             n_state = load_notify_state(data['d']) 
 
@@ -1062,7 +1059,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (介面全開版)...")
+        print("正在啟動 Streamlit 介面 (介面優化版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
