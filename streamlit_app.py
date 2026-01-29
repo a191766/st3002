@@ -19,9 +19,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.32 (日期標記增強版)
+# 設定區 v9.55.33 (智慧緩存版)
 # ==========================================
-APP_VER = "v9.55.32 (日期標記增強版)"
+APP_VER = "v9.55.33 (智慧緩存版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -33,6 +33,7 @@ EXCL_PFX = ["00", "91"]
 HIST_FILE = "breadth_history_v3.csv"
 RANK_FILE = "ranking_cache.json"
 NOTIFY_FILE = "notify_state.json" 
+CHIPS_FILE = "chips_cache_v2.json" # [新增] 籌碼永久快取檔
 
 # ==========================================
 # 基礎函式
@@ -52,6 +53,19 @@ def send_tg(token, chat_id, msg):
     except:
         return False
 
+def load_json_file(filepath):
+    if not os.path.exists(filepath): return {}
+    try:
+        with open(filepath, 'r') as f:
+            return json.load(f)
+    except: return {}
+
+def save_json_file(filepath, data):
+    try:
+        with open(filepath, 'w') as f:
+            json.dump(data, f)
+    except: pass
+
 def load_notify_state(today_str):
     default_state = {
         "date": today_str,
@@ -64,26 +78,15 @@ def load_notify_state(today_str):
         "intraday_trend": None  
     }
     
-    if not os.path.exists(NOTIFY_FILE):
+    state = load_json_file(NOTIFY_FILE)
+    if not state or state.get("date") != today_str:
         return default_state
     
-    try:
-        with open(NOTIFY_FILE, 'r') as f:
-            state = json.load(f)
-            if state.get("date") != today_str:
-                return default_state
-            if "intraday_trend" not in state:
-                state["intraday_trend"] = None
-            return state
-    except:
-        return default_state
+    if "intraday_trend" not in state: state["intraday_trend"] = None
+    return state
 
 def save_notify_state(state):
-    try:
-        with open(NOTIFY_FILE, 'w') as f:
-            json.dump(state, f)
-    except:
-        pass
+    save_json_file(NOTIFY_FILE, state)
 
 def check_rapid(row):
     if not os.path.exists(HIST_FILE): return None, None
@@ -159,7 +162,7 @@ def get_api():
         return None, str(e)
 
 # ==========================================
-# 籌碼面資料處理
+# 籌碼面資料處理 (核心：網路抓取層)
 # ==========================================
 def call_finmind_api_try_versions(dataset_candidates, data_id, start_date, token):
     versions = ["v4", "v3", "v2"]
@@ -203,15 +206,12 @@ def get_taifex_pc_ratio(target_date_str):
         return None, None, str(e)
     return None, None, "找不到表格"
 
-@st.cache_data(ttl=43200) 
-def get_chips_data(token, target_date_str):
+# 實際執行網路抓取的函式 (無快取)
+def fetch_chips_from_network(token, target_date_str):
     diagnosis = [] 
-    if not token:
-        diagnosis.append("❌ 錯誤: 未設定 FinMind Token")
-        return None, diagnosis
+    res = {}
     
     start_date = (datetime.strptime(target_date_str, "%Y-%m-%d") - timedelta(days=10)).strftime("%Y-%m-%d")
-    res = {}
     
     # 1. 期貨
     fut_candidates = ["TaiwanFuturesInstitutional", "TaiwanFuturesInstitutionalInvestors"]
@@ -229,8 +229,12 @@ def get_chips_data(token, target_date_str):
             else:
                 latest = df_foreign.iloc[-1]
                 prev = df_foreign.iloc[-2] if len(df_foreign) >= 2 else latest
-                res['fut_date'] = latest.get('date', '未知日期') # 抓取日期
                 
+                # 檢查日期是否匹配目標日期 (如果是抓今日，必須是今日資料才算成功)
+                data_date = latest.get('date', '')
+                res['fut_date'] = data_date
+                
+                # 數值計算
                 try:
                     curr_long = float(latest.get('long_open_interest_balance_volume', 0))
                     curr_short = float(latest.get('short_open_interest_balance_volume', 0))
@@ -244,9 +248,8 @@ def get_chips_data(token, target_date_str):
                         prev_short = float(prev.get('short_open_interest_balance_volume', 0))
                         res['fut_oi'] = int(curr_long - curr_short)
                         res['fut_oi_chg'] = res['fut_oi'] - int(prev_long - prev_short)
-                    diagnosis.append(f"✅ 期貨(外資): 成功 ({res['fut_date']})")
+                    diagnosis.append(f"✅ 期貨(外資): 成功 ({data_date})")
                 except: diagnosis.append("❌ 期貨: 計算錯誤")
-        else: diagnosis.append("❌ 期貨: 欄位錯誤")
 
     # 2. 選擇權
     pc_val = None
@@ -264,6 +267,8 @@ def get_chips_data(token, target_date_str):
                 pc_date = latest.iloc[0]['date']
                 diagnosis.append(f"✅ 選擇權(FinMind): {pc_val}% ({pc_date})")
 
+    # 若 FinMind 失敗或非今日(假設我們要抓今日)，嘗試官網
+    # 這裡簡化邏輯：如果有抓到就用，日期由 UI 判斷
     if pc_val is None or pc_val == 0:
         taifex_val, taifex_date, taifex_msg = get_taifex_pc_ratio(target_date_str)
         if taifex_val is not None:
@@ -295,15 +300,75 @@ def get_chips_data(token, target_date_str):
         df_m = df_margin[df_margin['name'] == 'MarginPurchaseMoney'].sort_values('date')
         if not df_m.empty:
             latest = df_m.iloc[-1]
-            prev = df_m.iloc[-2] if len(df_m)>1 else curr
-            curr = float(latest['TodayBalance'])
+            prev = df_m.iloc[-2] if len(df_m)>1 else latest
+            curr_bal = float(latest['TodayBalance'])
             prev_val = float(prev['TodayBalance'])
-            res['margin_bal'] = round(curr/1e8, 1)
-            res['margin_chg'] = round((curr-prev_val)/1e8, 2)
+            res['margin_chg'] = round((curr_bal - prev_val)/1e8, 2)
+            res['margin_bal'] = round(curr_bal/1e8, 1)
             res['margin_bal_date'] = latest.get('date', '未知日期')
             diagnosis.append(f"✅ 融資餘額: {res['margin_bal']}億 ({res['margin_bal_date']})")
 
     return res, diagnosis
+
+# [核心] 智慧緩存管理器
+def get_chips_data_smart(token):
+    # 1. 決定目標日期
+    now = datetime.now(timezone(timedelta(hours=8)))
+    today = now.date()
+    yesterday = today - timedelta(days=1)
+    
+    # 邏輯判斷：14:00 前只看昨天，14:00 後才看今天
+    if now.time() < time(14, 0):
+        target_date = yesterday
+        date_label = "昨日"
+    else:
+        target_date = today
+        date_label = "今日"
+        
+    target_str = target_date.strftime("%Y-%m-%d")
+    
+    # 2. 讀取快取檔案
+    cache = load_json_file(CHIPS_FILE)
+    
+    # 3. 檢查目標日期是否已在快取中
+    if target_str in cache:
+        # 命中！直接回傳，完全不連網
+        return cache[target_str]['data'], cache[target_str]['diag']
+    
+    # 4. 若快取沒有，執行抓取 (只抓一次)
+    data, diag = fetch_chips_from_network(token, target_str)
+    
+    # 5. 判斷是否抓到「目標日期」的資料 (關鍵！)
+    # 我們檢查 'fut_date' (期貨日期) 是否等於 target_str
+    # 或是如果我們是要抓昨天，只要有資料就算成功
+    
+    is_success = False
+    fetched_date = data.get('fut_date', '')
+    
+    if fetched_date == target_str:
+        is_success = True
+    elif target_date == yesterday and fetched_date: 
+        # 如果是要抓昨天，但 API 回傳的日期可能是前天(假日)，也算有抓到
+        is_success = True
+        
+    if is_success:
+        # 寫入快取，下次就不會再抓了
+        cache[target_str] = {'data': data, 'diag': diag}
+        save_json_file(CHIPS_FILE, cache)
+        return data, diag
+    
+    # 6. 如果目標是「今日」但沒抓到 (盤後資料未出)，退回顯示「快取中最新的舊資料」
+    if target_date == today:
+        # 找快取中日期最大的那一筆
+        cached_dates = sorted(cache.keys())
+        if cached_dates:
+            last_date = cached_dates[-1]
+            return cache[last_date]['data'], cache[last_date]['diag'] + [f"⚠️ {target_str} 資料未出，顯示 {last_date} 數據"]
+            
+        # 若連快取都空的，只好回傳剛剛抓到的(雖然日期不對)
+        return data, diag
+        
+    return data, diag
 
 def get_chip_strategy(ma5_slope, chips):
     if not chips: return None
@@ -541,7 +606,7 @@ def save_rec(d, t, b, tc, t_cur, t_prev, intra, total_v):
     except: row.to_csv(HIST_FILE, index=False)
 
 def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag):
-    # [UI優化] 注入 CSS 強制縮小 metric 數字字體 (26px -> 18px) 以容納日期
+    # [UI優化] CSS
     st.markdown("""
         <style>
         div[data-testid="stMetricValue"] {
@@ -588,8 +653,7 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
         # [UI優化] 調整欄位權重
         c1, c2, c3, c4, c5 = st.columns([1.1, 1.1, 1.1, 1.4, 2.5])
         
-        # [關鍵修改] 標題帶入日期
-        date_fut = d.get('fut_date', '--').replace('-', '/')[-5:] # 只取 MM/DD
+        date_fut = d.get('fut_date', '--').replace('-', '/')[-5:]
         date_pc = d.get('pc_date', '--').replace('-', '/')[-5:]
         date_maint = d.get('margin_date', '--').replace('-', '/')[-5:]
         date_bal = d.get('margin_bal_date', '--').replace('-', '/')[-5:]
@@ -897,7 +961,8 @@ def fetch_all():
     
     save_rec(d_cur, rec_t, br_c, t_chg, t_cur, t_pre, is_intra, v_c)
     
-    chips_data, chips_diag = get_chips_data(ft, d_cur)
+    # [核心修改] 呼叫智慧緩存版籌碼函式
+    chips_data, chips_diag = get_chips_data_smart(ft)
     chip_strategy = get_chip_strategy(slope, chips_data)
     
     return {
@@ -935,6 +1000,13 @@ def run_app():
             if os.path.exists(HIST_FILE):
                 os.remove(HIST_FILE)
                 st.toast("歷史資料已刪除，請重新整理", icon="🗑️")
+                time_module.sleep(1)
+            st.rerun()
+            
+        if st.button("🧼 重置籌碼快取"):
+            if os.path.exists(CHIPS_FILE):
+                os.remove(CHIPS_FILE)
+                st.toast("籌碼快取已清除", icon="🧹")
                 time_module.sleep(1)
             st.rerun()
 
@@ -1087,7 +1159,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (日期標記增強版)...")
+        print("正在啟動 Streamlit 介面 (智慧緩存版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
