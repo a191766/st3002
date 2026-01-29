@@ -19,9 +19,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.30 (介面優化版)
+# 設定區 v9.55.31 (排名完整性驗證修復版)
 # ==========================================
-APP_VER = "v9.55.30 (介面優化版)"
+APP_VER = "v9.55.31 (排名完整性驗證修復版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -382,20 +382,25 @@ def get_ranks_strict(token, target_date_str, min_count=0):
     
     if df.empty: return [], False
 
-    if min_count > 0 and len(df) < min_count:
-        return [], False
-
+    # [修正點] 先過濾權證/ETF/DR，再檢查資料筆數
     df['ID'] = get_col(df, ['stock_id','code'])
     df['Money'] = get_col(df, ['Trading_money','turnover'])
+    
     if df['ID'] is None or df['Money'] is None: return [], False
     
     df['ID'] = df['ID'].astype(str)
-    df = df[df['ID'].str.len()==4]
-    df = df[df['ID'].str.isdigit()]
-    for p in EXCL_PFX: df = df[~df['ID'].str.startswith(p)]
+    df = df[df['ID'].str.len()==4] # 只留4碼
+    df = df[df['ID'].str.isdigit()] # 只留數字
+    for p in EXCL_PFX: df = df[~df['ID'].str.startswith(p)] # 排除 00, 91
+    
+    # 過濾完「純正個股」後，若數量不足 1500，代表資料未全 (例如只有 TWSE)
+    if min_count > 0 and len(df) < min_count:
+        print(f"DEBUG: {target_date_str} 資料量 {len(df)} 不足 (預期 > {min_count})，判定未更新完畢")
+        return [], False
      
     ranks = df.sort_values('Money', ascending=False).head(TOP_N)['ID'].tolist()
     
+    # 存檔條件：min_count=0 (盤中/昨日) 或 min_count>0 且過濾後仍足夠多
     if ranks and (min_count == 0 or len(df) > 1500):
         try:
             with open(RANK_FILE, 'w') as f:
@@ -577,7 +582,7 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
     
     if chip_strategy and chip_strategy['data']:
         d = chip_strategy['data']
-        # [UI優化 2/2] 調整欄位權重：縮小數據欄位，放大文字欄位
+        # [UI優化 2/2] 調整欄位權重
         c1, c2, c3, c4, c5 = st.columns([1.1, 1.1, 1.1, 1.4, 2.5])
         
         c1.metric("外資期貨淨OI", f"{d.get('fut_oi',0):,}", f"{d.get('fut_oi_chg',0):,}")
@@ -790,17 +795,31 @@ def fetch_all():
         
         if curr_p == 0: 
             c_stt = "⚠️無報價"
-            reason = mis_debug_map.get(c, "非交易時間" if not allow_live_fetch else "MIS未回傳")
-            note = f"⚠️{reason} | 昨收{p_price}"
-        else: note = f"昨收{p_price}"
+            reason = ""
+            if not allow_live_fetch: 
+                reason = "非交易時間"
+            else:
+                if c in mis_debug_map:
+                    reason = mis_debug_map[c] 
+                elif c not in pmap:
+                    reason = "MIS未回傳"
+            
+            if reason: note = f"⚠️{reason} | 昨收{p_price}"
+            else: note = f"昨收{p_price}"
         
         source_note = info.get('note', '')
         if source_note: note = f"📝{source_note} " + note
 
         if curr_p > 0 and p_price > 0 and not df.empty:
-            hist_closes = df['close'].tail(4).tolist()
+            hist_closes = []
+            if df.iloc[-1]['date'] == today_str:
+                 hist_closes = df['close'].iloc[:-1].tail(4).tolist()
+            else:
+                 hist_closes = df['close'].tail(4).tolist()
+                 
             if len(hist_closes) >= 4:
-                ma5_input = hist_closes + [curr_p]
+                ma5_input = hist_closes 
+                ma5_input.append(curr_p)     
                 c_ma5 = sum(ma5_input) / 5
                 if curr_p > c_ma5: h_c += 1; c_stt="✅"
                 else: c_stt="📉"
@@ -1059,7 +1078,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (介面優化版)...")
+        print("正在啟動 Streamlit 介面 (排名完整性驗證修復版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
