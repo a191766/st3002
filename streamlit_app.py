@@ -19,9 +19,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.26 (PC Ratio 排序修正版)
+# 設定區 v9.55.27 (漲跌停價格修復版)
 # ==========================================
-APP_VER = "v9.55.26 (PC Ratio 排序修正版)"
+APP_VER = "v9.55.27 (漲跌停價格修復版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -179,7 +179,6 @@ def call_finmind_api_try_versions(dataset_candidates, data_id, start_date, token
     return pd.DataFrame(), last_error
 
 def get_taifex_pc_ratio(target_date_str):
-    """直接從期交所官網抓取 PC Ratio"""
     try:
         end_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
         start_dt = end_dt - timedelta(days=10)
@@ -197,9 +196,7 @@ def get_taifex_pc_ratio(target_date_str):
             dfs = pd.read_html(io.StringIO(r.text))
             for df in dfs:
                 if df.shape[1] >= 7:
-                    # [修正] 期交所表格是 "由新到舊" 排序
-                    # 所以最新的資料是第 0 列 (iloc[0])，而不是最後一列 (iloc[-1])
-                    top_row = df.iloc[0]
+                    top_row = df.iloc[0] # 由新到舊，取第一筆
                     try:
                         val = float(top_row.iloc[6]) 
                         return val, f"期交所官網 ({top_row.iloc[0]})"
@@ -251,10 +248,8 @@ def get_chips_data(token, target_date_str):
                 except: diagnosis.append("❌ 期貨: 計算錯誤")
         else: diagnosis.append("❌ 期貨: 欄位錯誤")
 
-    # 2. 選擇權 (雙核心)
+    # 2. 選擇權
     pc_val = None
-    
-    # A. 優先嘗試 FinMind
     df_opt, _ = call_finmind_api_try_versions(["TaiwanOptionDaily"], "TXO", start_date, token)
     if not df_opt.empty:
         latest = df_opt[df_opt['date'] == df_opt['date'].max()]
@@ -266,7 +261,6 @@ def get_chips_data(token, target_date_str):
                 pc_val = round((put/call)*100, 2)
                 diagnosis.append(f"✅ 選擇權(FinMind): {pc_val}%")
 
-    # B. 若 FinMind 失敗或數值為0，切換期交所
     if pc_val is None or pc_val == 0:
         taifex_val, taifex_msg = get_taifex_pc_ratio(target_date_str)
         if taifex_val is not None:
@@ -448,10 +442,23 @@ def get_prices_twse_mis(codes, info_map):
                     if y!='-' and y!='': val['y'] = float(y)
                     price = 0
                     note = ""
-                    if z!='-' and z!='': price = float(z); note="成交"
-                    elif item.get('pz','-')!='-': price = float(item['pz']); note="試撮"
-                    elif item.get('b','-').split('_')[0]!='-': price=float(item['b'].split('_')[0]); note="委買"
-                    elif item.get('a','-').split('_')[0]!='-': price=float(item['a'].split('_')[0]); note="委賣"
+                    
+                    # [修正] 增加對漲跌停(有掛單無成交)的判斷
+                    if z!='-' and z!='': 
+                        price = float(z); note="成交"
+                    elif item.get('pz','-')!='-': 
+                        price = float(item['pz']); note="試撮"
+                    else:
+                        # 檢查買賣五檔，若有掛單則視為漲/跌停鎖死
+                        b_str = item.get('b','-').split('_')[0]
+                        a_str = item.get('a','-').split('_')[0]
+                        
+                        if b_str != '-' and b_str: # 只有買單 (漲停鎖死)
+                            price = float(b_str)
+                            note = "漲停試算"
+                        elif a_str != '-' and a_str: # 只有賣單 (跌停鎖死)
+                            price = float(a_str)
+                            note = "跌停試算"
                     
                     if price > 0:
                         val['z'] = price; val['note'] = note
