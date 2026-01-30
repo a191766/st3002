@@ -20,9 +20,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.56 (籌碼邏輯精修版)
+# 設定區 v9.55.57 (外資現貨戰略整合版)
 # ==========================================
-APP_VER = "v9.55.56 (籌碼邏輯精修版)"
+APP_VER = "v9.55.57 (外資現貨戰略整合版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -316,6 +316,25 @@ def fetch_chips_from_network(token, target_date_str):
             res['margin_bal_date'] = latest.get('date', '未知日期')
             diagnosis.append(f"✅ 融資餘額: {res['margin_bal']}億 ({res['margin_bal_date']})")
 
+    # [新增] 5. 外資現貨
+    df_spot, _ = call_finmind_api_try_versions(["TaiwanStockTotalInstitutionalInvestors"], None, start_date, token)
+    if not df_spot.empty:
+        # 尋找 "Foreign_Investor" 或 "外資"
+        name_col = 'name' if 'name' in df_spot.columns else 'type'
+        df_f = df_spot[df_spot[name_col].astype(str).str.contains('Foreign|外資', case=False, na=False)].sort_values('date')
+        if not df_f.empty:
+            latest = df_f.iloc[-1]
+            buy = float(latest.get('buy', 0))
+            sell = float(latest.get('sell', 0))
+            net = buy - sell
+            res['spot_net'] = round(net / 1e8, 2) # 轉為億
+            res['spot_date'] = latest.get('date', '未知')
+            diagnosis.append(f"✅ 外資現貨: {res['spot_net']}億 ({res['spot_date']})")
+        else:
+            diagnosis.append("⚠️ 外資現貨: 找不到資料")
+    else:
+        diagnosis.append("❌ 外資現貨: 無資料")
+
     return res, diagnosis
 
 def get_chips_data_smart(token):
@@ -335,8 +354,13 @@ def get_chips_data_smart(token):
         cached_data = cache[target_str]['data']
         margin_date = cached_data.get('margin_date', '')
         margin_bal_date = cached_data.get('margin_bal_date', '')
+        # [新增] 檢查現貨日期
+        spot_date = cached_data.get('spot_date', '')
         
-        if margin_date == target_str and margin_bal_date == target_str:
+        # 只要有一項資料不是最新的，就強制重抓
+        is_all_updated = (margin_date == target_str) and (margin_bal_date == target_str) and (spot_date == target_str)
+        
+        if is_all_updated:
             return cached_data, cache[target_str]['diag']
     
     data, diag = fetch_chips_from_network(token, target_str)
@@ -369,52 +393,66 @@ def get_chip_strategy(ma5_slope, chips):
     pc_ratio = chips.get('pc_ratio', 100)
     margin_ratio = chips.get('margin_ratio', 0) 
     margin_chg = chips.get('margin_chg', 0)
+    # [新增] 現貨數據 (預設0)
+    spot_net = chips.get('spot_net', 0)
     
     is_chip_bearish = False
     is_chip_bullish = False
     
     sig, act, color = "籌碼中性", "觀察技術面為主", "info"
     
-    # [核心修正] 重新梳理判斷邏輯
     # 1. 殺戮盤 (空頭趨勢 + 外資大空 + 散戶接 + 選擇權看空)
+    # [強化] 加入現貨大賣檢核：如果現貨也大賣 > 200億，確認為大逃殺
     if ma5_slope < 0 and fut_oi < -10000 and margin_chg > 5 and pc_ratio < 90:
-        sig, act, color = "📉 殺戮盤 (全面崩潰)", "外資期權同步做空，散戶逆勢接刀。強力做空，切勿猜底。", "error"
+        if spot_net < -200:
+            sig, act, color = "💀 法人大逃殺 (全面崩潰)", "外資期現貨同步狂殺，散戶接刀。這是系統性風險，絕對禁止做多。", "error"
+        else:
+            sig, act, color = "📉 殺戮盤 (空方控盤)", "外資期權偏空，散戶逆勢接刀。強力做空，切勿猜底。", "error"
         is_chip_bearish = True
 
-    # 2. 火力全開 (多頭趨勢 + 外資大多 + 支撐強)
+    # 2. 火力全開 vs 誘多
     elif ma5_slope > 0 and fut_oi > 10000 and pc_ratio > 110:
-        sig, act, color = "🚀 火力全開 (外資助攻)", "外資期現貨同步作多，支撐強勁。多單抱緊，甚至加碼。", "success"
-        is_chip_bullish = True
+        # [新增] 檢查現貨：如果期貨多，但現貨大賣 > 50億 -> 誘多
+        if spot_net < -50:
+            sig, act, color = "⚠️ 虛漲 (期貨拉抬現貨出貨)", "外資期貨做多但現貨大賣，標準的『拉高出貨』。多單應獲利了結。", "warning"
+            is_chip_bearish = True
+        else:
+            sig, act, color = "🚀 火力全開 (外資助攻)", "外資期現貨同步作多，支撐強勁。多單抱緊，甚至加碼。", "success"
+            is_chip_bullish = True
         
-    # 3. 絕佳抄底 (空頭趨勢 + 融資斷頭)
+    # 3. 絕佳抄底
     elif ma5_slope < 0 and ((margin_ratio > 0 and margin_ratio < 135) or margin_chg < -15):
         sig, act, color = "💎 絕佳抄底 (斷頭清洗)", "空頭趨勢中見融資斷頭，醞釀反彈。", "primary"
         is_chip_bullish = True 
 
-    # 4. 多頭清洗 (多頭趨勢 + 融資大減)
+    # 4. 多頭清洗
     elif ma5_slope > 0 and margin_chg < -15:
         sig, act, color = "🚿 多頭清洗 (甩轎)", "上升趨勢中融資大減，籌碼換手成功，有利後市。", "success"
         is_chip_bullish = True
 
-    # 5. 籌碼渙散 vs 下跌中繼 (外資跑 + 散戶接)
+    # 5. 籌碼渙散
     elif fut_chg < -3000 and margin_chg > 5: 
         if ma5_slope > 0:
-            sig, act, color = "⚠️ 籌碼渙散 (拉高出貨)", "指數漲但外資大逃亡，散戶在接最後一棒。多單減碼，小心反轉。", "warning"
+            sig, act, color = "⚠️ 籌碼渙散 (主力落跑)", "指數漲但外資大逃亡，散戶在接最後一棒。多單減碼，小心反轉。", "warning"
             is_chip_bearish = True
         else:
             sig, act, color = "🔪 下跌中繼 (散戶接刀)", "趨勢向下且外資續賣，散戶沿路攤平。空頭未止，禁止做多。", "error"
             is_chip_bearish = True
 
-    # 6. 潛伏期 (盤整 + 外資偷買 + 支撐強)
+    # 6. 潛伏期
     elif abs(ma5_slope) < 10 and fut_chg > 2000 and pc_ratio > 110:
         sig, act, color = "🟩 潛伏期 (主力吃貨)", "盤整中見外資偷佈局多單。建議提前建倉，等待噴出。", "success"
         is_chip_bullish = True
 
-    # 7. 假突破 (多頭趨勢 + 外資重倉避險)
-    # [修正] 門檻提高至 -10000，避免誤判
+    # 7. 假突破 vs 軋空助漲
     elif ma5_slope > 0 and fut_oi < -10000:
-        sig, act, color = "🟨 假突破警戒 (避險高掛)", "現貨漲但期貨大量空單留倉。可能是假突破，多單要設緊停損。", "warning"
-        is_chip_bearish = True
+        # [新增] 檢查現貨：如果現貨大買 > 100億 -> 只是避險
+        if spot_net > 100:
+            sig, act, color = "🟢 軋空助漲 (外資避險)", "現貨大買但期貨空單鎖利。這是『多頭避險』，非看空，盤勢仍穩。", "success"
+            is_chip_bullish = True
+        else:
+            sig, act, color = "🟨 假突破警戒 (避險高掛)", "現貨漲但期貨大量空單留倉。可能是假突破，多單要設緊停損。", "warning"
+            is_chip_bearish = True
         
     return {
         "sig": sig, "act": act, "color": color, "data": chips,
@@ -719,20 +757,25 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
     
     if chip_strategy and chip_strategy['data']:
         d = chip_strategy['data']
-        c1, c2, c3, c4, c5 = st.columns([1.1, 1.1, 1.1, 1.4, 2.5])
+        # [修改] 調整欄位比例以容納現貨
+        c1, c2, c3, c4, c5, c6 = st.columns([1.1, 1.1, 1.1, 1.3, 1.3, 2.5])
         
         date_fut = str(d.get('fut_date', '--')).replace('-', '/')[-5:]
         date_pc = str(d.get('pc_date', '--')).replace('-', '/')[-5:]
         date_maint = str(d.get('margin_date', '--')).replace('-', '/')[-5:]
         date_bal = str(d.get('margin_bal_date', '--')).replace('-', '/')[-5:]
+        # [新增] 現貨日期
+        date_spot = str(d.get('spot_date', '--')).replace('-', '/')[-5:]
 
         c1.metric(f"期貨OI ({date_fut})", f"{d.get('fut_oi',0):,}", f"{d.get('fut_oi_chg',0):,}")
         c2.metric(f"P/C Ratio ({date_pc})", f"{d.get('pc_ratio',0)}%")
         c3.metric(f"維持率 ({date_maint})", f"{d.get('margin_ratio',0)}%")
         c4.metric(f"融資 ({date_bal})", f"{d.get('margin_bal',0)}億", f"{d.get('margin_chg',0)}億")
+        # [新增] 現貨顯示
+        c5.metric(f"外資現貨 ({date_spot})", f"{d.get('spot_net',0)}億")
         
         sig = chip_strategy['sig']; act = chip_strategy['act']; color = chip_strategy['color']
-        with c5:
+        with c6:
             if color == 'success': st.success(f"**{sig}**\n\n{act}")
             elif color == 'error': st.error(f"**{sig}**\n\n{act}")
             elif color == 'warning': st.warning(f"**{sig}**\n\n{act}")
@@ -1294,7 +1337,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (籌碼邏輯精修版)...")
+        print("正在啟動 Streamlit 介面 (外資現貨戰略整合版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
