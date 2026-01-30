@@ -20,9 +20,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.69 (期交所優先版)
+# 設定區 v9.55.69 (純期交所版)
 # ==========================================
-APP_VER = "v9.55.69 (期交所優先版)"
+APP_VER = "v9.55.69 (純期交所版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -265,38 +265,16 @@ def fetch_chips_from_network(token, target_date_str):
                     diagnosis.append(f"✅ 期貨(外資): 成功 ({data_date})")
                 except: diagnosis.append("❌ 期貨: 計算錯誤")
 
-    # 2. 選擇權 (優先使用期交所)
+    # 2. 選擇權 (純期交所版)
+    # 不再呼叫 FinMind，只信賴期交所爬蟲
     pc_val = None; pc_date = None
     
-    # (A) 第一順位：期交所官網
     taifex_val, taifex_date, taifex_msg = get_taifex_pc_ratio(target_date_str)
     if taifex_val is not None:
         pc_val = taifex_val; pc_date = taifex_date
-        diagnosis.append(f"✅ 選擇權(期交所-優先): {pc_val}% ({pc_date})")
-    
-    # (B) 第二順位：FinMind (備援) - 只有當期交所失敗時才執行
-    if pc_val is None or pc_val == 0:
-        df_opt, _ = call_finmind_api_try_versions(["TaiwanOptionDaily"], "TXO", start_date, token)
-        if not df_opt.empty:
-            # 這裡依然保留 trading_session 過濾機制，確保備援數據也是正確的
-            if 'trading_session' in df_opt.columns:
-                df_opt = df_opt[df_opt['trading_session'] == 'position']
-                
-            latest = df_opt[df_opt['date'] == df_opt['date'].max()]
-            cp_col = 'call_put' if 'call_put' in latest.columns else 'CallPut'
-            
-            if cp_col in latest.columns:
-                put = latest[latest[cp_col].str.lower()=='put']['open_interest'].sum()
-                call = latest[latest[cp_col].str.lower()=='call']['open_interest'].sum()
-                
-                if call > 0: 
-                    pc_val = round((put/call)*100, 2)
-                    pc_date = latest.iloc[0]['date']
-                    diagnosis.append(f"✅ 選擇權(FinMind-備援): {pc_val}% (Put={int(put):,}/Call={int(call):,}) ({pc_date})")
-
-    # (C) 如果兩個都失敗
-    if pc_val is None: 
-         diagnosis.append(f"❌ 選擇權: 全數失敗 (期交所: {taifex_msg})")
+        diagnosis.append(f"✅ 選擇權(期交所): {pc_val}% ({pc_date})")
+    else:
+        diagnosis.append(f"❌ 選擇權: 抓取失敗 ({taifex_msg})")
             
     if pc_val is not None:
         res['pc_ratio'] = pc_val
@@ -1364,7 +1342,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (期交所優先版)...")
+        print("正在啟動 Streamlit 介面 (純期交所版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
