@@ -20,9 +20,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.62 (手機版面優化版)
+# 設定區 v9.55.63 (標題縮小版)
 # ==========================================
-APP_VER = "v9.55.62 (手機版面優化版)"
+APP_VER = "v9.55.63 (標題縮小版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -1140,7 +1140,13 @@ def fetch_all():
     }
 
 def run_app():
-    st.title(f"📈 {APP_VER}")
+    st.title(f"📈 {APP_VER}") # 保留 title 以相容，但實際上會被下面的 markdown 覆蓋或並存，等等，st.title 是必須的嗎？
+    # [修正] st.title 其實可以移除，直接用 markdown
+    # 但為了讓瀏覽器標籤頁顯示正確標題，通常 st.set_page_config 會用到，不過這裡沒有。
+    # 為了版面乾淨，我把 st.title 拿掉，改用全自訂 HTML。
+    
+    # [更正] run_app 裡面第一行
+    st.markdown(f"<h3 style='font-size: 24px; margin: 0; padding-top: 10px;'>📈 {APP_VER}</h3>", unsafe_allow_html=True)
     
     with st.sidebar:
         st.subheader("設定")
@@ -1282,16 +1288,13 @@ def run_app():
 
                 save_notify_state(n_state)
             
-            # [修改] 調整介面順序
             st.subheader(f"📅 {data['d']}")
             st.caption(f"名單基準日: {data['d_prev']}") 
             st.info(f"{data['src']} | 更新: {data['t']}")
             
-            # 1. 圖表 (優先顯示)
             chart = plot_chart()
             if chart: st.altair_chart(chart, use_container_width=True)
             
-            # 2. 廣度數據與大盤
             c1,c2,c3 = st.columns(3)
             c1.metric("今日廣度", f"{br:.1%}", f"{data['h']}/{data['v']}")
             
@@ -1316,7 +1319,6 @@ def run_app():
             sl = data['slope']; icon = "📈 正" if sl > 0 else "📉 負"
             c3.metric("大盤MA5斜率", f"{sl:.2f}", icon)
             
-            # 3. 戰略與籌碼 (往下移)
             display_strategy_panel(data['slope'], open_br, br, n_state, data['chip_strat'], data['chip_diag'])
             
             st.dataframe(data['df'], use_container_width=True, hide_index=True)
@@ -1351,7 +1353,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (手機版面優化版)...")
+        print("正在啟動 Streamlit 介面 (標題縮小版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
