@@ -19,9 +19,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.43 (盤後提示優化版)
+# 設定區 v9.55.44 (提示訊息修復版)
 # ==========================================
-APP_VER = "v9.55.43 (盤後提示優化版)"
+APP_VER = "v9.55.44 (提示訊息修復版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -534,7 +534,7 @@ def get_prices_twse_mis(codes, info_map):
                         elif pz and pz != '-' and pz.replace('.','').isdigit(): 
                             price = float(pz); note="試撮"
                         
-                        # 3. [回退至穩定版邏輯] 解決漲跌停市價單問題
+                        # 3. [精準修復] 漲跌停 vs 暫無成交
                         if price == 0:
                             b_str = item.get('b','').split('_')[0]
                             a_str = item.get('a','').split('_')[0]
@@ -547,10 +547,13 @@ def get_prices_twse_mis(codes, info_map):
                                 l_val = float(item.get('l', '0'))
                                 
                                 if has_b and not has_a:
+                                    # 情境B: 有買無賣 -> 漲停鎖死 -> 用當日最高價
                                     if h_val > 0: price = h_val; note = "漲停(H)"
                                 elif has_a and not has_b:
+                                    # 情境C: 有賣無買 -> 跌停鎖死 -> 用當日最低價
                                     if l_val > 0: price = l_val; note = "跌停(L)"
                                 elif has_b and has_a:
+                                    # 情境A: 有買也有賣 -> 正常交易 -> 嘗試用委買價
                                     try: 
                                         price = float(b_str)
                                         note = "委買價"
@@ -1205,11 +1208,11 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (盤後提示優化版)...")
+        print("正在啟動 Streamlit 介面 (提示訊息修復版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
             print(f"啟動失敗: {e}")
             print("請確認已安裝 streamlit (pip install streamlit) 和 curl_cffi (pip install curl_cffi)")
         
-        input("\n程式執行結束 (或發生錯誤)，請按 Enter 鍵離開...")
+        input("\n程式執行結束 (或發生錯誤)，請按 Enter 鍵離開...")ㄋ
