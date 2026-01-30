@@ -19,9 +19,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.35 (精細化+高低點通知)
+# 設定區 v9.55.37 (區間極值通知版)
 # ==========================================
-APP_VER = "v9.55.35 (精細化+高低點通知)"
+APP_VER = "v9.55.37 (區間極值通知版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -76,9 +76,8 @@ def load_notify_state(today_str):
         "notified_drop_high": False,
         "notified_rise_low": False,
         "intraday_trend": None,
-        # [新增] 記錄當日已通知過的最高/最低點
-        "last_high_record": None,
-        "last_low_record": None
+        "record_high": -1.0,  # [新增] 當日最高紀錄
+        "record_low": 2.0     # [新增] 當日最低紀錄
     }
     
     state = load_json_file(NOTIFY_FILE)
@@ -86,10 +85,9 @@ def load_notify_state(today_str):
         return default_state
     
     if "intraday_trend" not in state: state["intraday_trend"] = None
-    # 確保舊存檔兼容新欄位
-    if "last_high_record" not in state: state["last_high_record"] = None
-    if "last_low_record" not in state: state["last_low_record"] = None
-
+    if "record_high" not in state: state["record_high"] = -1.0
+    if "record_low" not in state: state["record_low"] = 2.0
+        
     return state
 
 def save_notify_state(state):
@@ -102,7 +100,6 @@ def check_rapid(row):
         if len(df) < 2: return None, None
         curr_dt = datetime.strptime(f"{row['Date']} {row['Time']}", "%Y-%m-%d %H:%M")
         curr_v = float(row['Breadth'])
-    
         target = None
         
         for i in range(2, min(15, len(df)+1)):
@@ -110,7 +107,7 @@ def check_rapid(row):
             try: 
                 r_t = r['Time'] if len(str(r['Time']))==5 else r['Time'][:5]
             except: continue
-             
+            
             r_dt = datetime.strptime(f"{r['Date']} {r_t}", "%Y-%m-%d %H:%M")
             seconds_diff = (curr_dt - r_dt).total_seconds()
             
@@ -154,13 +151,15 @@ def get_intraday_extremes(d_cur):
         df = pd.read_csv(HIST_FILE)
         if df.empty: return None, None
         df['Date'] = df['Date'].astype(str)
-        df_today = df[df['Date'] == str(d_cur)]
-        if df_today.empty: return None, None
         
-        # [修改] 嚴格過濾時間 09:00 ~ 13:30
-        df_today = df_today[(df_today['Time'] >= "09:00") & (df_today['Time'] <= "13:30")]
-        if df_today.empty: return None, None
+        # [核心修正] 只取 09:00 ~ 13:30 的資料來計算極值
+        df_today = df[
+            (df['Date'] == str(d_cur)) & 
+            (df['Time'] >= "09:00") & 
+            (df['Time'] <= "13:30")
+        ]
         
+        if df_today.empty: return None, None
         return df_today['Breadth'].max(), df_today['Breadth'].min()
     except: return None, None
 
@@ -438,9 +437,6 @@ def get_ranks_strict(token, target_date_str, min_count=0):
     
     if df.empty: return [], False
 
-    if min_count > 0 and len(df) < min_count:
-        return [], False
-
     df['ID'] = get_col(df, ['stock_id','code'])
     df['Money'] = get_col(df, ['Trading_money','turnover'])
     if df['ID'] is None or df['Money'] is None: return [], False
@@ -592,7 +588,6 @@ def save_rec(d, t, b, tc, t_cur, t_prev, intra, total_v):
     except: row.to_csv(HIST_FILE, index=False)
 
 def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag):
-    # [UI優化] CSS
     st.markdown("""
         <style>
         div[data-testid="stMetricValue"] {
@@ -636,13 +631,12 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
     
     if chip_strategy and chip_strategy['data']:
         d = chip_strategy['data']
-        # [UI優化] 調整欄位權重
         c1, c2, c3, c4, c5 = st.columns([1.1, 1.1, 1.1, 1.4, 2.5])
         
-        date_fut = d.get('fut_date', '--').replace('-', '/')[-5:]
-        date_pc = d.get('pc_date', '--').replace('-', '/')[-5:]
-        date_maint = d.get('margin_date', '--').replace('-', '/')[-5:]
-        date_bal = d.get('margin_bal_date', '--').replace('-', '/')[-5:]
+        date_fut = str(d.get('fut_date', '--')).replace('-', '/')[-5:]
+        date_pc = str(d.get('pc_date', '--')).replace('-', '/')[-5:]
+        date_maint = str(d.get('margin_date', '--')).replace('-', '/')[-5:]
+        date_bal = str(d.get('margin_bal_date', '--')).replace('-', '/')[-5:]
 
         c1.metric(f"期貨OI ({date_fut})", f"{d.get('fut_oi',0):,}", f"{d.get('fut_oi_chg',0):,}")
         c2.metric(f"P/C Ratio ({date_pc})", f"{d.get('pc_ratio',0)}%")
@@ -656,7 +650,7 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
             elif color == 'warning': st.warning(f"**{sig}**\n\n{act}")
             elif color == 'primary': st.info(f"**{sig}**\n\n{act}", icon="💎")
             else: st.info(f"**{sig}**\n\n{act}")
-        
+            
         with st.expander("查看詳細數據來源"):
             for msg in chip_diag: st.text(msg)
     else:
@@ -715,7 +709,6 @@ def plot_chart():
     rule_g = alt.Chart(pd.DataFrame({'y':[BREADTH_LOW]})).mark_rule(color='green', strokeDash=[5,5]).encode(y='y')
     
     if not chart_data.empty:
-        # [圖表優化] 黃色廣度: 實線(細) + 點(小)
         l_b = base.mark_line(color='#ffc107', strokeWidth=1).encode(
             y=alt.Y('Breadth', title=None, scale=alt.Scale(domain=[0,1], nice=False), axis=y_axis)
         )
@@ -723,8 +716,6 @@ def plot_chart():
             y='Breadth', 
             tooltip=['DT', alt.Tooltip('Breadth', format='.1%')]
         )
-        
-        # [圖表優化] 藍色大盤: 實線(細) + 點(小)
         l_t = base.mark_line(color='#007bff', strokeWidth=1).encode(
             y=alt.Y('T_S', scale=alt.Scale(domain=[0,1]))
         )
@@ -960,7 +951,6 @@ def fetch_all():
     
     save_rec(d_cur, rec_t, br_c, t_chg, t_cur, t_pre, is_intra, v_c)
     
-    # 籌碼面處理 (Sponsor) - 帶回診斷日誌
     chips_data, chips_diag = get_chips_data_smart(ft)
     chip_strategy = get_chip_strategy(slope, chips_data)
     
@@ -1007,7 +997,7 @@ def run_app():
                 os.remove(CHIPS_FILE)
                 st.toast("籌碼快取已清除", icon="🧹")
                 time_module.sleep(1)
-        st.rerun()
+            st.rerun()
 
     if st.button("🔄 刷新"): st.rerun()
 
@@ -1028,23 +1018,28 @@ def run_app():
             br = data['br']
             open_br = get_opening_breadth(data['d'])
              
+            # [修正] 取得極值時，底層已經限制為 09:00~13:30
             hist_max, hist_min = get_intraday_extremes(data['d'])
             
-            # [修改] 增加時間判定 (09:00-13:30)
-            curr_t = str(data['t'])
-            is_valid_time = False
-            if len(curr_t) >= 5 and "09:00" <= curr_t[:5] <= "13:30":
-                is_valid_time = True
+            # [修正] 只有在 09:00~13:30 區間內，目前的 br 才有資格挑戰極值
+            current_time = datetime.now(timezone(timedelta(hours=8))).time()
+            in_valid_window = time(9, 0) <= current_time <= time(13, 30)
             
-            if is_valid_time:
-                today_max = max(hist_max, br) if hist_max is not None else br
-                today_min = min(hist_min, br) if hist_min is not None else br
-            else:
-                today_max = hist_max if hist_max is not None else br
-                today_min = hist_min if hist_min is not None else br
-    
+            today_max = br
+            today_min = br
+            
+            if hist_max is not None:
+                if in_valid_window:
+                    today_max = max(hist_max, br)
+                    today_min = min(hist_min, br)
+                else:
+                    # 不在盤中，直接用歷史紀錄
+                    today_max = hist_max
+                    today_min = hist_min
+        
             n_state = load_notify_state(data['d']) 
 
+            # 原有: 趨勢鎖定通知
             if open_br is not None and n_state['intraday_trend'] is None:
                 if br >= (open_br + 0.05):
                     n_state['intraday_trend'] = 'up'
@@ -1054,6 +1049,7 @@ def run_app():
                      if tg_tok and tg_id: send_tg(tg_tok, tg_id, f"🔒 <b>【趨勢鎖定】</b>\n廣度先達開盤-5% (目前{br:.1%})，今日確認偏空！")
 
             if tg_tok and tg_id:
+                # 原有: 過熱/冰點通知
                 stt = 'normal'
                 if br >= BREADTH_THR: stt = 'hot'
                 elif br <= BREADTH_LOW: stt = 'cold'
@@ -1061,69 +1057,57 @@ def run_app():
                 if stt != n_state['last_stt']:
                     msg = f"🔥 過熱: {br:.1%}" if stt=='hot' else (f"❄️ 冰點: {br:.1%}" if stt=='cold' else "")
                     if msg: send_tg(tg_tok, tg_id, msg)
-                
                 n_state['last_stt'] = stt 
-            
+                
+                # 原有: 急變通知
                 rap_msg, rid = check_rapid(data['raw'])
                 if rap_msg and rid != n_state['last_rap']:
                     send_tg(tg_tok, tg_id, rap_msg)
                     n_state['last_rap'] = rid
                 
+                # 原有: 趨勢相關通知
                 if open_br is not None:
                     is_dev_high = (br >= open_br + OPEN_DEV_THR)
                     is_dev_low = (br <= open_br - OPEN_DEV_THR)
-                
-                    if is_dev_high and not n_state['was_dev_high']:
-                        n_state['was_dev_high'] = True
-                    
-                    if is_dev_low and not n_state['was_dev_low']:
-                        n_state['was_dev_low'] = True
+                    if is_dev_high and not n_state['was_dev_high']: n_state['was_dev_high'] = True
+                    if is_dev_low and not n_state['was_dev_low']: n_state['was_dev_low'] = True
                 
                     if br <= (today_max - 0.05):
                         if not n_state['notified_drop_high']:
                             should_notify = False
                             if data['slope'] > 0 and n_state['intraday_trend'] == 'up': should_notify = True
                             if data['slope'] < 0 and n_state['intraday_trend'] == 'up': should_notify = True
-               
                             if should_notify:
-                                msg = f"📉 <b>【高點回落】</b>\n今日高點: {today_max:.1%}\n目前廣度: {br:.1%}\n已回檔 5%"
-                                send_tg(tg_tok, tg_id, msg)
-                                
+                                send_tg(tg_tok, tg_id, f"📉 <b>【高點回落】</b>\n今日高點: {today_max:.1%}\n目前廣度: {br:.1%}\n已回檔 5%")
                             n_state['notified_drop_high'] = True
-                    else:
-                        n_state['notified_drop_high'] = False
+                    else: n_state['notified_drop_high'] = False
                     
                     if br >= (today_min + 0.05):
                         if not n_state['notified_rise_low']:
                             should_notify = False
                             if data['slope'] < 0 and n_state['intraday_trend'] == 'down': should_notify = True
                             if data['slope'] > 0 and n_state['intraday_trend'] == 'down': should_notify = True
-                            
                             if should_notify:
-                                msg = f"🚀 <b>【低點反彈】</b>\n今日低點: {today_min:.1%}\n目前廣度: {br:.1%}\n已反彈 5%"
-                                send_tg(tg_tok, tg_id, msg)
-
+                                send_tg(tg_tok, tg_id, f"🚀 <b>【低點反彈】</b>\n今日低點: {today_min:.1%}\n目前廣度: {br:.1%}\n已反彈 5%")
                             n_state['notified_rise_low'] = True
+                    else: n_state['notified_rise_low'] = False
+
+                # [新增功能] 創新高/新低通知 (只在 09:00~13:30 觸發)
+                if in_valid_window:
+                    # 初始化紀錄 (若是當日第一次執行)
+                    if n_state['record_high'] == -1.0:
+                        n_state['record_high'] = br
+                        n_state['record_low'] = br
                     else:
-                        n_state['notified_rise_low'] = False
-                
-                # [新增] 創新高/創新低通知 (僅限 09:00 ~ 13:30)
-                if is_valid_time:
-                    # 初始化
-                    if n_state.get('last_high_record') is None: n_state['last_high_record'] = today_max
-                    if n_state.get('last_low_record') is None: n_state['last_low_record'] = today_min
-
-                    # 創新高
-                    if today_max > n_state['last_high_record']:
-                         msg = f"🏆 <b>【創新高】</b>\n廣度突破 {today_max:.1%} (原: {n_state['last_high_record']:.1%})"
-                         send_tg(tg_tok, tg_id, msg)
-                         n_state['last_high_record'] = today_max
-
-                    # 創新低
-                    if today_min < n_state['last_low_record']:
-                         msg = f"📉 <b>【創新低】</b>\n廣度跌破 {today_min:.1%} (原: {n_state['last_low_record']:.1%})"
-                         send_tg(tg_tok, tg_id, msg)
-                         n_state['last_low_record'] = today_min
+                        # 檢查創新高
+                        if br > n_state['record_high']:
+                            send_tg(tg_tok, tg_id, f"🏆 <b>【創新高】</b>\n目前廣度: {br:.1%}\n超越前高: {n_state['record_high']:.1%}")
+                            n_state['record_high'] = br
+                        
+                        # 檢查創新低
+                        if br < n_state['record_low']:
+                            send_tg(tg_tok, tg_id, f"📉 <b>【創新低】</b>\n目前廣度: {br:.1%}\n跌破前低: {n_state['record_low']:.1%}")
+                            n_state['record_low'] = br
 
                 save_notify_state(n_state)
             
@@ -1145,8 +1129,9 @@ def run_app():
             else:
                 caption_str += " | 開盤: 等待中..."
             
-            # [新增] 廣度極值顯示
-            caption_str += f" | 高: {today_max:.1%} | 低: {today_min:.1%}"
+            # [修正] 顯示經過時間濾網的極值
+            caption_str += f"\n今日目前最高廣度: {today_max:.1%}"
+            caption_str += f"\n今日目前最低廣度: {today_min:.1%}"
             
             c1.caption(caption_str)
             
@@ -1186,7 +1171,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (精細化+高低點通知)...")
+        print("正在啟動 Streamlit 介面 (區間極值通知版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
