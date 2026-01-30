@@ -20,9 +20,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.54 (綜合戰略優化版)
+# 設定區 v9.55.55 (策略語意修正版)
 # ==========================================
-APP_VER = "v9.55.54 (綜合戰略優化版)"
+APP_VER = "v9.55.55 (策略語意修正版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -370,7 +370,6 @@ def get_chip_strategy(ma5_slope, chips):
     margin_ratio = chips.get('margin_ratio', 0) 
     margin_chg = chips.get('margin_chg', 0)
     
-    # 定義籌碼偏多/偏空的標籤
     is_chip_bearish = False
     is_chip_bullish = False
     
@@ -383,9 +382,17 @@ def get_chip_strategy(ma5_slope, chips):
     elif fut_oi > 10000 and pc_ratio > 110:
         sig, act, color = "🚀 火力全開 (外資助攻)", "外資期現貨同步作多，支撐強勁。多單抱緊，甚至加碼。", "success"
         is_chip_bullish = True
-    elif (margin_ratio > 0 and margin_ratio < 135) or margin_chg < -15:
-        sig, act, color = "💎 絕佳抄底 (斷頭清洗)", "融資斷頭清洗中，留意止跌訊號。", "primary"
-        is_chip_bullish = True # 視為潛在多頭訊號
+        
+    # [修正] 絕佳抄底：嚴格限制 ma5_slope < 0 (趨勢向下)
+    elif ma5_slope < 0 and ((margin_ratio > 0 and margin_ratio < 135) or margin_chg < -15):
+        sig, act, color = "💎 絕佳抄底 (斷頭清洗)", "空頭趨勢中見融資斷頭，醞釀反彈。", "primary"
+        is_chip_bullish = True 
+
+    # [新增] 多頭清洗：ma5_slope > 0 (趨勢向上) 且 融資大減
+    elif ma5_slope > 0 and margin_chg < -15:
+        sig, act, color = "🚿 多頭清洗 (甩轎)", "上升趨勢中融資大減，籌碼換手成功，有利後市。", "success"
+        is_chip_bullish = True
+
     elif fut_chg < -3000 and margin_chg > 5: 
         sig, act, color = "⚠️ 籌碼渙散 (拉高出貨)", "指數漲但外資大逃亡，散戶在接最後一棒。獲利了結，小心反轉。", "warning"
         is_chip_bearish = True
@@ -658,7 +665,6 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
     st.subheader("♟️ 戰略指揮所")
     strategies = []
     
-    # [核心修改] 綜合判斷技術面(MA5)與籌碼面
     chip_bull = chip_strategy.get('is_bull', False) if chip_strategy else False
     chip_bear = chip_strategy.get('is_bear', False) if chip_strategy else False
     
@@ -1275,7 +1281,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (綜合戰略優化版)...")
+        print("正在啟動 Streamlit 介面 (策略語意修正版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
