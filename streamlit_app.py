@@ -20,9 +20,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.60 (外資現貨絕對優先版)
+# 設定區 v9.55.61 (防重複寫入版)
 # ==========================================
-APP_VER = "v9.55.60 (外資現貨絕對優先版)"
+APP_VER = "v9.55.61 (防重複寫入版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -402,8 +402,7 @@ def get_chip_strategy(ma5_slope, chips):
     
     sig, act, color = "籌碼中性", "觀察技術面為主", "info"
     
-    # [核心修正] 絕對優先權 (Priority Override)
-    # 1. 法人大逃殺 (現貨大賣 > 200億)：這是一票否決權
+    # 1. 法人大逃殺 (現貨大賣 > 200億) - 絕對優先
     if spot_net < -200:
         sig, act, color = "💀 法人大逃殺 (全面崩潰)", "外資現貨狂殺，資金大撤退。這是系統性風險，絕對禁止做多。", "error"
         is_chip_bearish = True
@@ -412,7 +411,7 @@ def get_chip_strategy(ma5_slope, chips):
             "is_bull": is_chip_bullish, "is_bear": is_chip_bearish
         }
 
-    # 2. 殺戮盤 (空頭趨勢 + 外資大空 + 散戶接 + 選擇權看空)
+    # 2. 殺戮盤
     if ma5_slope < 0 and fut_oi < -10000 and margin_chg > 5 and pc_ratio < 90:
         sig, act, color = "📉 殺戮盤 (空方控盤)", "外資期權偏空，散戶逆勢接刀。強力做空，切勿猜底。", "error"
         is_chip_bearish = True
@@ -426,14 +425,13 @@ def get_chip_strategy(ma5_slope, chips):
             sig, act, color = "🚀 火力全開 (外資助攻)", "外資期現貨同步作多，支撐強勁。多單抱緊，甚至加碼。", "success"
             is_chip_bullish = True
         
-    # 4. 絕佳抄底 (空頭趨勢 + 融資斷頭)
+    # 4. 絕佳抄底
     elif ma5_slope < 0 and ((margin_ratio > 0 and margin_ratio < 135) or margin_chg < -15):
         sig, act, color = "💎 絕佳抄底 (斷頭清洗)", "空頭趨勢中見融資斷頭，醞釀反彈。", "primary"
         is_chip_bullish = True 
 
-    # 5. 多頭清洗 (多頭趨勢 + 融資大減)
+    # 5. 多頭清洗 vs 雙逃
     elif ma5_slope > 0 and margin_chg < -15:
-        # [修正] 增加外資現貨檢核：如果外資也大賣，那不是清洗，是雙逃
         if spot_net < -50:
             sig, act, color = "⚠️ 融資外資雙逃 (多頭潰散)", "融資減，但外資現貨也大賣。這不是洗盤，是多殺多，快逃。", "error"
             is_chip_bearish = True
@@ -441,7 +439,7 @@ def get_chip_strategy(ma5_slope, chips):
             sig, act, color = "🚿 多頭清洗 (甩轎)", "上升趨勢中融資大減，籌碼換手成功，有利後市。", "success"
             is_chip_bullish = True
 
-    # 6. 籌碼渙散
+    # 6. 籌碼渙散 vs 下跌中繼
     elif fut_chg < -3000 and margin_chg > 5: 
         if ma5_slope > 0:
             sig, act, color = "⚠️ 籌碼渙散 (主力落跑)", "指數漲但外資大逃亡，散戶在接最後一棒。多單減碼，小心反轉。", "warning"
@@ -702,6 +700,10 @@ def save_rec(d, t, b, tc, t_cur, t_prev, intra, total_v):
         last_d = str(df.iloc[-1]['Date'])
         last_t = str(df.iloc[-1]['Time'])[:5]
         
+        # [核心修正] 防重複寫入：如果日期與時間都相同，則不寫入
+        if last_d == str(d) and last_t == str(t_short):
+            return 
+
         if last_d != str(d): 
             pd.concat([df, row], ignore_index=True).to_csv(HIST_FILE, index=False)
         else:
@@ -1345,7 +1347,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (外資現貨絕對優先版)...")
+        print("正在啟動 Streamlit 介面 (防重複寫入版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
