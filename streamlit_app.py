@@ -19,9 +19,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.41 (極值通知+漲跌停修復版)
+# 設定區 v9.55.42 (註解提示增強版)
 # ==========================================
-APP_VER = "v9.55.41 (極值通知+漲跌停修復版)"
+APP_VER = "v9.55.42 (註解提示增強版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -76,8 +76,8 @@ def load_notify_state(today_str):
         "notified_drop_high": False,
         "notified_rise_low": False,
         "intraday_trend": None,
-        "record_high": -1.0,  # [新增] 紀錄當日最高
-        "record_low": 2.0     # [新增] 紀錄當日最低
+        "record_high": -1.0, 
+        "record_low": 2.0
     }
     
     state = load_json_file(NOTIFY_FILE)
@@ -152,7 +152,6 @@ def get_intraday_extremes(d_cur):
         if df.empty: return None, None
         df['Date'] = df['Date'].astype(str)
         
-        # [需求1] 只計算 09:00 ~ 13:30 的資料
         df_today = df[
             (df['Date'] == str(d_cur)) & 
             (df['Time'] >= "09:00") & 
@@ -555,7 +554,6 @@ def get_prices_twse_mis(codes, info_map):
                                     if l_val > 0: price = l_val; note = "跌停(L)"
                                 elif has_b and has_a:
                                     # 有買也有賣 -> 正常交易(暫無成交) -> 用委買價
-                                    # 嘗試解析 b_str，若失敗(市價單)則不勉強用H/L填充，寧可無價
                                     try: 
                                         price = float(b_str)
                                         note = "委買價"
@@ -672,6 +670,30 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
             
         with st.expander("查看詳細數據來源"):
             for msg in chip_diag: st.text(msg)
+            
+            st.markdown("---")
+            st.markdown("##### 📝 籌碼指標速查表")
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.caption("""
+                **期貨 (外資)**
+                * 🔴 **空單 > 1萬口** (避險/看空)
+                * 🟢 **多單 > 1萬口** (趨勢多)
+                
+                **選擇權 (P/C Ratio)**
+                * 🟢 **> 110%** (支撐強劲/偏多)
+                * 🔴 **< 90%** (壓力沈重/偏空)
+                """)
+            with col_b:
+                st.caption("""
+                **融資維持率**
+                * 🟢 **> 170%** (散戶獲利/多頭穩)
+                * 🔪 **< 140%** (面臨追繳/準備殺多)
+                
+                **融資餘額**
+                * 💎 **減少** (籌碼沈澱/安定)
+                * ⚠️ **大增** (籌碼凌亂/散戶進場)
+                """)
     else:
         st.error("⚠️ 無籌碼資料，請展開查看診斷報告")
         with st.expander("🔍 連線診斷報告", expanded=True):
@@ -728,6 +750,7 @@ def plot_chart():
     rule_g = alt.Chart(pd.DataFrame({'y':[BREADTH_LOW]})).mark_rule(color='green', strokeDash=[5,5]).encode(y='y')
     
     if not chart_data.empty:
+        # [圖表優化] 黃色廣度: 實線(細) + 點(小)
         l_b = base.mark_line(color='#ffc107', strokeWidth=1).encode(
             y=alt.Y('Breadth', title=None, scale=alt.Scale(domain=[0,1], nice=False), axis=y_axis)
         )
@@ -735,6 +758,8 @@ def plot_chart():
             y='Breadth', 
             tooltip=['DT', alt.Tooltip('Breadth', format='.1%')]
         )
+        
+        # [圖表優化] 藍色大盤: 實線(細) + 點(小)
         l_t = base.mark_line(color='#007bff', strokeWidth=1).encode(
             y=alt.Y('T_S', scale=alt.Scale(domain=[0,1]))
         )
@@ -1037,7 +1062,7 @@ def run_app():
             br = data['br']
             open_br = get_opening_breadth(data['d'])
              
-            # [修正] 極值計算僅限 09:00~13:30
+            # [極值] 計算僅限 09:00~13:30
             hist_max, hist_min = get_intraday_extremes(data['d'])
             
             current_time = datetime.now(timezone(timedelta(hours=8))).time()
@@ -1056,6 +1081,7 @@ def run_app():
         
             n_state = load_notify_state(data['d']) 
 
+            # 趨勢鎖定通知
             if open_br is not None and n_state['intraday_trend'] is None:
                 if br >= (open_br + 0.05):
                     n_state['intraday_trend'] = 'up'
@@ -1178,7 +1204,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (極值通知+漲跌停修復版)...")
+        print("正在啟動 Streamlit 介面 (註解提示增強版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
