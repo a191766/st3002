@@ -20,9 +20,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.50 (換日自動清空版)
+# 設定區 v9.55.51 (圖表截止線鎖定版)
 # ==========================================
-APP_VER = "v9.55.50 (換日自動清空版)"
+APP_VER = "v9.55.51 (圖表截止線鎖定版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -535,6 +535,7 @@ def get_prices_twse_mis(codes, info_map):
                         elif pz and pz != '-' and pz.replace('.','').isdigit(): 
                             price = float(pz); note="試撮"
                         
+                        # [終極修正] 若無成交價，改用「買賣量 (g/f)」判斷掛單狀態
                         if price == 0:
                             g_str = item.get('g', '')
                             f_str = item.get('f', '')
@@ -612,17 +613,12 @@ def save_rec(d, t, b, tc, t_cur, t_prev, intra, total_v):
         last_d = str(df.iloc[-1]['Date'])
         last_t = str(df.iloc[-1]['Time'])[:5]
         
-        # [核心修正] 換日自動清空邏輯
         if last_d != str(d): 
-            # 如果檔案裡的日期不是今天 -> 代表換日了 -> 直接覆寫 (Overwrite)
-            row.to_csv(HIST_FILE, index=False)
+            pd.concat([df, row], ignore_index=True).to_csv(HIST_FILE, index=False)
         else:
-            # 還是同一天 -> 保留盤中紀錄
-            # [修正] 盤後保護：如果已經超過 13:30 且資料量足夠 (>10筆)，就不再寫入新資料(變成唯讀)，避免蓋掉盤中走勢
             if not intra and len(df) > 10:
-                pass # 盤後且有資料 -> 不做任何事，保護檔案
+                pass 
             else:
-                # 盤中 或 盤後但資料太少(剛開機) -> 寫入
                 row.to_csv(HIST_FILE, mode='a', header=False, index=False)
     except: row.to_csv(HIST_FILE, index=False)
 
@@ -734,6 +730,10 @@ def plot_chart():
                 df['Time'] = df['Time'].apply(lambda x: x[:5])
                 
                 df_today = df[df['Time'] >= "09:00"].copy()
+                
+                # [核心修正] 強制截斷 13:30 以後的資料，確保圖表不顯示盤後更新的異動
+                df_today = df_today[df_today['Time'] <= "13:30"]
+                
                 if not df_today.empty:
                     df_today = df_today.sort_values(['Date', 'Time'])
                     last_date = df_today.iloc[-1]['Date']
@@ -1231,7 +1231,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (換日自動清空版)...")
+        print("正在啟動 Streamlit 介面 (圖表截止線鎖定版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
