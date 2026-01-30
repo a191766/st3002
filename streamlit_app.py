@@ -19,9 +19,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.40 (市價單/漲跌停修復版)
+# 設定區 v9.55.41 (極值通知+漲跌停修復版)
 # ==========================================
-APP_VER = "v9.55.40 (市價單/漲跌停修復版)"
+APP_VER = "v9.55.41 (極值通知+漲跌停修復版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -76,17 +76,17 @@ def load_notify_state(today_str):
         "notified_drop_high": False,
         "notified_rise_low": False,
         "intraday_trend": None,
-        "record_high": -1.0,
-        "record_low": 2.0
+        "record_high": -1.0,  # [新增] 紀錄當日最高
+        "record_low": 2.0     # [新增] 紀錄當日最低
     }
     
     state = load_json_file(NOTIFY_FILE)
     if not state or state.get("date") != today_str:
         return default_state
     
-    if "intraday_trend" not in state: state["intraday_trend"] = None
     if "record_high" not in state: state["record_high"] = -1.0
     if "record_low" not in state: state["record_low"] = 2.0
+    if "intraday_trend" not in state: state["intraday_trend"] = None
         
     return state
 
@@ -152,6 +152,7 @@ def get_intraday_extremes(d_cur):
         if df.empty: return None, None
         df['Date'] = df['Date'].astype(str)
         
+        # [需求1] 只計算 09:00 ~ 13:30 的資料
         df_today = df[
             (df['Date'] == str(d_cur)) & 
             (df['Time'] >= "09:00") & 
@@ -534,34 +535,31 @@ def get_prices_twse_mis(codes, info_map):
                         elif pz and pz != '-' and pz.replace('.','').isdigit(): 
                             price = float(pz); note="試撮"
                         
-                        # 3. [修復] 若無成交/試撮，改用當日最高/最低價來判斷漲跌停
-                        # 解決市價單(Market Order)導致 b/a 欄位非數字的問題
+                        # 3. [修正邏輯] 若無成交/試撮，精準判斷漲跌停
                         if price == 0:
                             b_str = item.get('b','').split('_')[0]
                             a_str = item.get('a','').split('_')[0]
                             
-                            has_bid = (b_str and b_str != '-' and b_str != '0')
-                            has_ask = (a_str and a_str != '-' and a_str != '0')
+                            has_b = (b_str and b_str != '-' and b_str != '0')
+                            has_a = (a_str and a_str != '-' and a_str != '0')
                             
                             try:
                                 h_val = float(item.get('h', '0'))
                                 l_val = float(item.get('l', '0'))
                                 
-                                if has_bid and not has_ask:
-                                    # 有買無賣 -> 漲停 -> 用當日最高價
-                                    if h_val > 0: 
-                                        price = h_val
-                                        note = "漲停(H)"
-                                elif has_ask and not has_bid:
-                                    # 有賣無買 -> 跌停 -> 用當日最低價
-                                    if l_val > 0:
-                                        price = l_val
-                                        note = "跌停(L)"
-                                else:
-                                    # 買賣都有但沒成交? 暫時用最高價當參考(避免無價)
-                                    if h_val > 0:
-                                        price = h_val
-                                        note = "參考(H)"
+                                if has_b and not has_a:
+                                    # 有買無賣 -> 漲停鎖死 -> 用當日最高價
+                                    if h_val > 0: price = h_val; note = "漲停(H)"
+                                elif has_a and not has_b:
+                                    # 有賣無買 -> 跌停鎖死 -> 用當日最低價
+                                    if l_val > 0: price = l_val; note = "跌停(L)"
+                                elif has_b and has_a:
+                                    # 有買也有賣 -> 正常交易(暫無成交) -> 用委買價
+                                    # 嘗試解析 b_str，若失敗(市價單)則不勉強用H/L填充，寧可無價
+                                    try: 
+                                        price = float(b_str)
+                                        note = "委買價"
+                                    except: pass 
                             except: pass
                         
                         if price > 0:
@@ -1039,7 +1037,7 @@ def run_app():
             br = data['br']
             open_br = get_opening_breadth(data['d'])
              
-            # [極值] 計算僅限 09:00~13:30
+            # [修正] 極值計算僅限 09:00~13:30
             hist_max, hist_min = get_intraday_extremes(data['d'])
             
             current_time = datetime.now(timezone(timedelta(hours=8))).time()
@@ -1058,7 +1056,6 @@ def run_app():
         
             n_state = load_notify_state(data['d']) 
 
-            # 趨勢鎖定通知
             if open_br is not None and n_state['intraday_trend'] is None:
                 if br >= (open_br + 0.05):
                     n_state['intraday_trend'] = 'up'
@@ -1181,7 +1178,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (市價單/漲跌停修復版)...")
+        print("正在啟動 Streamlit 介面 (極值通知+漲跌停修復版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
