@@ -20,9 +20,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.61 (防重複寫入版)
+# 設定區 v9.55.62 (手機版面優化版)
 # ==========================================
-APP_VER = "v9.55.61 (防重複寫入版)"
+APP_VER = "v9.55.62 (手機版面優化版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -700,7 +700,6 @@ def save_rec(d, t, b, tc, t_cur, t_prev, intra, total_v):
         last_d = str(df.iloc[-1]['Date'])
         last_t = str(df.iloc[-1]['Time'])[:5]
         
-        # [核心修正] 防重複寫入：如果日期與時間都相同，則不寫入
         if last_d == str(d) and last_t == str(t_short):
             return 
 
@@ -1283,14 +1282,16 @@ def run_app():
 
                 save_notify_state(n_state)
             
-            display_strategy_panel(data['slope'], open_br, br, n_state, data['chip_strat'], data['chip_diag'])
-
+            # [修改] 調整介面順序
             st.subheader(f"📅 {data['d']}")
             st.caption(f"名單基準日: {data['d_prev']}") 
             st.info(f"{data['src']} | 更新: {data['t']}")
+            
+            # 1. 圖表 (優先顯示)
             chart = plot_chart()
             if chart: st.altair_chart(chart, use_container_width=True)
             
+            # 2. 廣度數據與大盤
             c1,c2,c3 = st.columns(3)
             c1.metric("今日廣度", f"{br:.1%}", f"{data['h']}/{data['v']}")
             
@@ -1314,6 +1315,9 @@ def run_app():
             c2.metric("大盤漲跌", f"{data['tc']:.2%}")
             sl = data['slope']; icon = "📈 正" if sl > 0 else "📉 負"
             c3.metric("大盤MA5斜率", f"{sl:.2f}", icon)
+            
+            # 3. 戰略與籌碼 (往下移)
+            display_strategy_panel(data['slope'], open_br, br, n_state, data['chip_strat'], data['chip_diag'])
             
             st.dataframe(data['df'], use_container_width=True, hide_index=True)
         else: st.sidebar.warning("⏸ 休市")
@@ -1347,7 +1351,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (防重複寫入版)...")
+        print("正在啟動 Streamlit 介面 (手機版面優化版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
