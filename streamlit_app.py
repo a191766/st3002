@@ -20,9 +20,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.58 (外資定義精準隔離版)
+# 設定區 v9.55.59 (籌碼註解完善版)
 # ==========================================
-APP_VER = "v9.55.58 (外資定義精準隔離版)"
+APP_VER = "v9.55.59 (籌碼註解完善版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -320,10 +320,6 @@ def fetch_chips_from_network(token, target_date_str):
     df_spot, _ = call_finmind_api_try_versions(["TaiwanStockTotalInstitutionalInvestors"], None, start_date, token)
     if not df_spot.empty:
         name_col = 'name' if 'name' in df_spot.columns else 'type'
-        
-        # [核心修正] 嚴格篩選：
-        # 1. 必須包含 'Foreign' 或 '外資'
-        # 2. 必須【不包含】 'Dealer' 或 '自營商'
         mask_foreign = df_spot[name_col].astype(str).str.contains('Foreign|外資', case=False, na=False)
         mask_no_dealer = ~df_spot[name_col].astype(str).str.contains('Dealer|自營商', case=False, na=False)
         
@@ -334,7 +330,7 @@ def fetch_chips_from_network(token, target_date_str):
             buy = float(latest.get('buy', 0))
             sell = float(latest.get('sell', 0))
             net = buy - sell
-            res['spot_net'] = round(net / 1e8, 2) # 轉為億
+            res['spot_net'] = round(net / 1e8, 2) 
             res['spot_date'] = latest.get('date', '未知')
             diagnosis.append(f"✅ 外資現貨: {res['spot_net']}億 ({res['spot_date']})")
         else:
@@ -759,7 +755,6 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
     
     if chip_strategy and chip_strategy['data']:
         d = chip_strategy['data']
-        # 調整為6欄，加入現貨
         c1, c2, c3, c4, c5, c6 = st.columns([1.1, 1.1, 1.1, 1.3, 1.3, 2.5])
         
         date_fut = str(d.get('fut_date', '--')).replace('-', '/')[-5:]
@@ -805,8 +800,9 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
                 * 🔪 **< 140%** (面臨追繳/準備殺多)
                 
                 **外資現貨 (不含自營)**
-                * 💎 **大買 > 100億** (真多頭/軋空)
-                * ⚠️ **大賣 > 50億** (需警戒)
+                * 💎 **買超 > 100億** (真金白銀/軋空)
+                * ⚠️ **賣超 > 50億** (獲利調節/虛漲)
+                * 💀 **賣超 > 200億** (提款走人/大逃殺)
                 """)
     else:
         st.error("⚠️ 無籌碼資料，請展開查看診斷報告")
@@ -1337,7 +1333,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (外資定義精準隔離版)...")
+        print("正在啟動 Streamlit 介面 (籌碼註解完善版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
