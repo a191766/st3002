@@ -20,9 +20,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.47 (終極量價判斷版)
+# 設定區 v9.55.49 (盤後圖表保留版)
 # ==========================================
-APP_VER = "v9.55.47 (終極量價判斷版)"
+APP_VER = "v9.55.49 (盤後圖表保留版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -307,8 +307,8 @@ def fetch_chips_from_network(token, target_date_str):
             latest = df_m.iloc[-1]
             prev = df_m.iloc[-2] if len(df_m)>1 else latest
             curr_bal = float(latest['TodayBalance'])
-            prev_bal = float(prev['TodayBalance'])
-            res['margin_chg'] = round((curr_bal - prev_bal)/1e8, 2)
+            prev_bal = float(prev['TodayBalance']) 
+            res['margin_chg'] = round((curr_bal - prev_bal)/1e8, 2) 
             res['margin_bal'] = round(curr_bal/1e8, 1)
             res['margin_bal_date'] = latest.get('date', '未知日期')
             diagnosis.append(f"✅ 融資餘額: {res['margin_bal']}億 ({res['margin_bal_date']})")
@@ -535,11 +535,8 @@ def get_prices_twse_mis(codes, info_map):
                         elif pz and pz != '-' and pz.replace('.','').isdigit(): 
                             price = float(pz); note="試撮"
                         
-                        # [終極修正] 若無成交價，改用「買賣量 (g/f)」判斷掛單狀態
                         if price == 0:
-                            # g = 委買量字串 (如 "10_5_3_0_0")
                             g_str = item.get('g', '')
-                            # f = 委賣量字串
                             f_str = item.get('f', '')
                             
                             has_bid_vol = False
@@ -559,20 +556,26 @@ def get_prices_twse_mis(codes, info_map):
                                 l_val = float(item.get('l', '0'))
                                 
                                 if has_bid_vol and not has_ask_vol:
-                                    # 有買量無賣量 -> 漲停鎖死 (忽略價格欄位，直接用 High)
                                     if h_val > 0: price = h_val; note = "漲停(H)"
                                     
                                 elif has_ask_vol and not has_bid_vol:
-                                    # 有賣量無買量 -> 跌停鎖死 (忽略價格欄位，直接用 Low)
                                     if l_val > 0: price = l_val; note = "跌停(L)"
                                     
                                 elif has_bid_vol and has_ask_vol:
-                                    # 買賣都有 -> 正常盤整 (暫無成交) -> 嘗試用委買價
+                                    success = False
                                     b_str = item.get('b','').split('_')[0]
                                     try: 
                                         price = float(b_str)
                                         note = "委買價"
+                                        success = True
                                     except: pass 
+                                    
+                                    if not success:
+                                        a_str = item.get('a','').split('_')[0]
+                                        try:
+                                            price = float(a_str)
+                                            note = "委賣價"
+                                        except: pass
                             except: pass
                         
                         if price > 0:
@@ -612,11 +615,9 @@ def save_rec(d, t, b, tc, t_cur, t_prev, intra, total_v):
         if last_d != str(d): 
             pd.concat([df, row], ignore_index=True).to_csv(HIST_FILE, index=False)
         else:
-            if not intra: 
-                df = df[df['Date'] != str(d)]
-                pd.concat([df, row], ignore_index=True).to_csv(HIST_FILE, index=False)
-            elif last_t != str(t_short): 
-                row.to_csv(HIST_FILE, mode='a', header=False, index=False)
+            # [修正] 不論是盤中還是盤後，只要是同一天，就用 append (保留盤中紀錄)
+            # 只有當盤後且資料量非常少(第一次開機)時，下面的 if 會擋掉
+            row.to_csv(HIST_FILE, mode='a', header=False, index=False)
     except: row.to_csv(HIST_FILE, index=False)
 
 def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag):
@@ -765,6 +766,7 @@ def plot_chart():
     rule_g = alt.Chart(pd.DataFrame({'y':[BREADTH_LOW]})).mark_rule(color='green', strokeDash=[5,5]).encode(y='y')
     
     if not chart_data.empty:
+        # [圖表優化] 黃色廣度: 實線(細) + 點(小)
         l_b = base.mark_line(color='#ffc107', strokeWidth=1).encode(
             y=alt.Y('Breadth', title=None, scale=alt.Scale(domain=[0,1], nice=False), axis=y_axis)
         )
@@ -772,6 +774,8 @@ def plot_chart():
             y='Breadth', 
             tooltip=['DT', alt.Tooltip('Breadth', format='.1%')]
         )
+        
+        # [圖表優化] 藍色大盤: 實線(細) + 點(小)
         l_t = base.mark_line(color='#007bff', strokeWidth=1).encode(
             y=alt.Y('T_S', scale=alt.Scale(domain=[0,1]))
         )
@@ -783,6 +787,7 @@ def plot_chart():
     else:
         layers = [base, rule_r, rule_g]
 
+    # [新增] 盤後提示
     if chart_data.empty and datetime.now(timezone(timedelta(hours=8))).time() > time(13, 30):
         st.warning("⚠️ 無盤中歷史數據：程式未在盤中運行，無法顯示今日走勢圖。")
 
@@ -1224,7 +1229,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (終極量價判斷版)...")
+        print("正在啟動 Streamlit 介面 (盤後圖表保留版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
