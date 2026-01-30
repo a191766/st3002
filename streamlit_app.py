@@ -19,9 +19,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.38 (誤判修正+極值通知版)
+# 設定區 v9.55.39 (邏輯回退修復版)
 # ==========================================
-APP_VER = "v9.55.38 (誤判修正+極值通知版)"
+APP_VER = "v9.55.39 (邏輯回退修復版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -76,15 +76,14 @@ def load_notify_state(today_str):
         "notified_drop_high": False,
         "notified_rise_low": False,
         "intraday_trend": None,
-        "record_high": -1.0,  # [新增] 紀錄當日最高
-        "record_low": 2.0     # [新增] 紀錄當日最低
+        "record_high": -1.0,
+        "record_low": 2.0
     }
     
     state = load_json_file(NOTIFY_FILE)
     if not state or state.get("date") != today_str:
         return default_state
     
-    # 確保新欄位存在
     if "record_high" not in state: state["record_high"] = -1.0
     if "record_low" not in state: state["record_low"] = 2.0
     if "intraday_trend" not in state: state["intraday_trend"] = None
@@ -153,7 +152,7 @@ def get_intraday_extremes(d_cur):
         if df.empty: return None, None
         df['Date'] = df['Date'].astype(str)
         
-        # [需求1] 只計算 09:00 ~ 13:30 的資料
+        # 只取 09:00 ~ 13:30 的資料
         df_today = df[
             (df['Date'] == str(d_cur)) & 
             (df['Time'] >= "09:00") & 
@@ -529,44 +528,21 @@ def get_prices_twse_mis(codes, info_map):
                         price = 0
                         note = ""
                         
-                        # 1. 優先找成交價
+                        # [回退] 使用 v9.55.34 的判定邏輯
                         if z and z != '-' and z.replace('.','').isdigit(): 
                             price = float(z); note="成交"
-                        # 2. 其次找試撮價
                         elif pz and pz != '-' and pz.replace('.','').isdigit(): 
                             price = float(pz); note="試撮"
                         
-                        # 3. [修正] 若無成交/試撮，檢查買賣檔
                         if price == 0:
                             b_str = item.get('b','').split('_')[0]
                             a_str = item.get('a','').split('_')[0]
-                            
-                            bid_val = 0
-                            ask_val = 0
-                            
-                            # 嘗試轉型買價
                             if b_str and b_str != '-' and b_str != '0':
-                                try: bid_val = float(b_str)
+                                try: price = float(b_str); note = "漲停試算"
                                 except: pass
-                            
-                            # 嘗試轉型賣價
-                            if a_str and a_str != '-' and a_str != '0':
-                                try: ask_val = float(a_str)
+                            if price == 0 and a_str and a_str != '-' and a_str != '0':
+                                try: price = float(a_str); note = "跌停試算"
                                 except: pass
-                                
-                            # 判斷邏輯
-                            if bid_val > 0 and ask_val > 0:
-                                # 買賣都有，只是沒成交 -> 用委買價當現價，但標註 "委買價"
-                                price = bid_val
-                                note = "委買價"
-                            elif bid_val > 0 and ask_val == 0:
-                                # 有買無賣 -> 漲停鎖死
-                                price = bid_val
-                                note = "漲停試算"
-                            elif ask_val > 0 and bid_val == 0:
-                                # 有賣無買 -> 跌停鎖死
-                                price = ask_val
-                                note = "跌停試算"
                         
                         if price > 0:
                             val['z'] = price; val['note'] = note
@@ -1051,7 +1027,6 @@ def run_app():
             # [修正] 極值計算僅限 09:00~13:30
             hist_max, hist_min = get_intraday_extremes(data['d'])
             
-            # [修正] 判斷目前時間是否在有效區間
             current_time = datetime.now(timezone(timedelta(hours=8))).time()
             in_valid_window = time(9, 0) <= current_time <= time(13, 30)
             
@@ -1068,7 +1043,6 @@ def run_app():
         
             n_state = load_notify_state(data['d']) 
 
-            # 趨勢鎖定通知
             if open_br is not None and n_state['intraday_trend'] is None:
                 if br >= (open_br + 0.05):
                     n_state['intraday_trend'] = 'up'
@@ -1118,26 +1092,21 @@ def run_app():
                             n_state['notified_rise_low'] = True
                     else: n_state['notified_rise_low'] = False
 
-                # [新增功能] 創新高/新低通知 (只在 09:00~13:30 觸發)
+                # 創新高/新低通知
                 if in_valid_window:
-                    # 初始化紀錄 (若是當日第一次執行)
                     if n_state['record_high'] == -1.0:
                         n_state['record_high'] = br
                         n_state['record_low'] = br
                     else:
-                        # 檢查創新高
                         if br > n_state['record_high']:
                             send_tg(tg_tok, tg_id, f"🏆 <b>【創新高】</b>\n目前廣度: {br:.1%}\n超越前高: {n_state['record_high']:.1%}")
                             n_state['record_high'] = br
-                        
-                        # 檢查創新低
                         if br < n_state['record_low']:
                             send_tg(tg_tok, tg_id, f"📉 <b>【創新低】</b>\n目前廣度: {br:.1%}\n跌破前低: {n_state['record_low']:.1%}")
                             n_state['record_low'] = br
 
                 save_notify_state(n_state)
             
-            # 將診斷日誌傳入 UI
             display_strategy_panel(data['slope'], open_br, br, n_state, data['chip_strat'], data['chip_diag'])
 
             st.subheader(f"📅 {data['d']}")
@@ -1155,7 +1124,6 @@ def run_app():
             else:
                 caption_str += " | 開盤: 等待中..."
             
-            # [修正] 顯示經過時間濾網的極值
             caption_str += f"\n今日目前最高廣度: {today_max:.1%}"
             caption_str += f"\n今日目前最低廣度: {today_min:.1%}"
             
@@ -1197,7 +1165,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (誤判修正+極值通知版)...")
+        print("正在啟動 Streamlit 介面 (邏輯回退修復版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
