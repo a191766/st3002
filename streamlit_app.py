@@ -20,9 +20,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.65 (頂部留白微調版)
+# 設定區 v9.55.66 (空間極致壓縮版)
 # ==========================================
-APP_VER = "v9.55.65 (頂部留白微調版)"
+APP_VER = "v9.55.66 (空間極致壓縮版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -822,9 +822,9 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
         with st.expander("🔍 連線診斷報告", expanded=True):
             for msg in chip_diag: st.write(msg)
 
-def plot_chart():
+def plot_chart(base_d, date_prev):
+    # [修改] plot_chart 現在接收兩個參數，方便顯示在 title
     chart_data = pd.DataFrame()
-    base_d = ""
     
     if os.path.exists(HIST_FILE):
         try:
@@ -843,11 +843,9 @@ def plot_chart():
                     df_today = df_today.sort_values(['Date', 'Time'])
                     last_date = df_today.iloc[-1]['Date']
                     chart_data = df_today[df_today['Date'] == last_date].copy()
-                    base_d = last_date
         except: pass
 
-    if chart_data.empty or base_d == "":
-        base_d = datetime.now().strftime("%Y-%m-%d")
+    if chart_data.empty:
         start = pd.to_datetime(f"{base_d} 09:00:00")
         end = pd.to_datetime(f"{base_d} 13:30:00")
         chart_data = pd.DataFrame()
@@ -898,7 +896,8 @@ def plot_chart():
     if chart_data.empty and datetime.now(timezone(timedelta(hours=8))).time() > time(13, 30):
         st.warning("⚠️ 無盤中歷史數據：程式未在盤中運行，無法顯示今日走勢圖。")
 
-    return alt.layer(*layers).properties(height=400, title=f"走勢對照 - {base_d}").resolve_scale(y='shared')
+    # [修改] 這裡直接把名單基準日寫進標題
+    return alt.layer(*layers).properties(height=380, title=f"走勢對照 - {base_d} (名單: {date_prev})").resolve_scale(y='shared')
 
 def fetch_all():
     ft = get_finmind_token()
@@ -1140,21 +1139,20 @@ def fetch_all():
     }
 
 def run_app():
-    # [修正] 1. 設定頁面配置 (必須是第一行)，設定標題但不在頁面上顯示大標題
     st.set_page_config(page_title=APP_VER, layout="wide")
     
-    # [修正] 2. 注入 CSS 減少頂部留白，從 1rem 改為 3rem，避免被遮擋
+    # [修正] 頂部留白從 3rem 改回 1rem，因為按鈕區會自動往下推，這樣更緊湊
     st.markdown("""
         <style>
         .block-container {
-            padding-top: 3rem !important;
+            padding-top: 1rem !important;
             padding-bottom: 0rem !important;
         }
         </style>
     """, unsafe_allow_html=True)
     
-    # [修正] 3. 使用自訂的小型 HTML 標題 (不再使用 st.title)
-    st.markdown(f"<h3 style='font-size: 20px; margin: 0; padding-bottom: 10px;'>📈 {APP_VER}</h3>", unsafe_allow_html=True)
+    # [修正] 標題縮小且移除
+    st.markdown(f"<h3 style='font-size: 18px; margin: 0; padding-bottom: 5px;'>📈 {APP_VER}</h3>", unsafe_allow_html=True)
     
     with st.sidebar:
         st.subheader("設定")
@@ -1187,12 +1185,25 @@ def run_app():
                 time_module.sleep(1)
             st.rerun()
 
-    if st.button("🔄 刷新"): st.rerun()
+    # [核心修正] 按鈕區與日期整合
+    col_btn, col_date = st.columns([1, 3])
+    with col_btn:
+        if st.button("🔄 刷新"): st.rerun()
+    with col_date:
+        # 這裡不呼叫 fetch_all() 因為後面會叫，先暫時顯示載入中或空
+        # 為了即時顯示日期，我們還是要從後面拿，但因為 layout 順序，
+        # 這裡可以用一個空位，等資料拿到後再回填，或者把 fetch_all 移到最前面
+        pass # 等資料拿到後顯示
 
     try:
         data = fetch_all()
         if isinstance(data, str): st.error(f"❌ {data}")
         elif data:
+            # [修正] 回填日期資訊到上方
+            with col_date:
+                # 使用 vertical-align 讓文字對齊按鈕中間
+                st.markdown(f"<div style='padding-top: 5px; font-size: 14px; color: gray;'>📅 {data['d']} | 更新: {data['t']} | 來源: {data['src_type']}</div>", unsafe_allow_html=True)
+            
             st.sidebar.info(f"報價來源: {data['src_type']}")
             st.sidebar.caption(f"永豐API額度: {data.get('sj_usage', '未知')}")
             
@@ -1296,13 +1307,16 @@ def run_app():
 
                 save_notify_state(n_state)
             
-            st.subheader(f"📅 {data['d']}")
-            st.caption(f"名單基準日: {data['d_prev']}") 
-            st.info(f"{data['src']} | 更新: {data['t']}")
+            # [修正] 移除原本的 st.subheader 與 st.caption (改去上面)
+            # st.subheader(f"📅 {data['d']}")  <-- 移除
+            # st.caption(f"名單基準日: {data['d_prev']}") <-- 移除
+            # st.info(...) <-- 移除
             
-            chart = plot_chart()
+            # 1. 圖表 (這裡傳入 date_prev 給標題用)
+            chart = plot_chart(data['d'], data['d_prev'])
             if chart: st.altair_chart(chart, use_container_width=True)
             
+            # 2. 廣度數據與大盤
             c1,c2,c3 = st.columns(3)
             c1.metric("今日廣度", f"{br:.1%}", f"{data['h']}/{data['v']}")
             
@@ -1327,6 +1341,7 @@ def run_app():
             sl = data['slope']; icon = "📈 正" if sl > 0 else "📉 負"
             c3.metric("大盤MA5斜率", f"{sl:.2f}", icon)
             
+            # 3. 戰略與籌碼
             display_strategy_panel(data['slope'], open_br, br, n_state, data['chip_strat'], data['chip_diag'])
             
             st.dataframe(data['df'], use_container_width=True, hide_index=True)
@@ -1361,7 +1376,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (頂部留白微調版)...")
+        print("正在啟動 Streamlit 介面 (空間極致壓縮版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
