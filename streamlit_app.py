@@ -20,9 +20,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.71 (日期邏輯修正版)
+# 設定區 v9.55.72 (變數名稱修正版)
 # ==========================================
-APP_VER = "v9.55.71 (日期邏輯修正版)"
+APP_VER = "v9.55.72 (變數名稱修正版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -1130,7 +1130,7 @@ def fetch_all():
     gc.collect()
     
     return {
-        "d":d_cur, "d_prev": date_prev, 
+        "d":d_cur, "d_prev": d_prev,  # [修正] 這裡修正為 d_prev
         "br":br_c, "br_p":br_p, "h":h_c, "v":v_c, "h_p":h_p, "v_p":v_p,
         "df":pd.DataFrame(dtls), 
         "t":last_t, "tc":t_chg, "slope":slope, "src_type": data_source,
