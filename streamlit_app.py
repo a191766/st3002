@@ -20,9 +20,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.68 (列表收合版)
+# 設定區 v9.55.69 (去冗餘精簡版)
 # ==========================================
-APP_VER = "v9.55.68 (列表收合版)"
+APP_VER = "v9.55.69 (去冗餘精簡版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -1138,7 +1138,6 @@ def fetch_all():
 def run_app():
     st.set_page_config(page_title=APP_VER, layout="wide")
     
-    # [修正] 3rem 讓標題有足夠空間
     st.markdown("""
         <style>
         .block-container {
@@ -1148,7 +1147,6 @@ def run_app():
         </style>
     """, unsafe_allow_html=True)
     
-    # [修正] 使用 H3 標題
     st.markdown(f"<h3 style='text-align: left; margin: 0; padding-bottom: 10px;'>📈 {APP_VER}</h3>", unsafe_allow_html=True)
     
     with st.sidebar:
@@ -1182,23 +1180,14 @@ def run_app():
                 time_module.sleep(1)
             st.rerun()
 
-    # [修正] 按鈕與日期併排
-    col_btn, col_date = st.columns([1, 3])
-    with col_btn:
-        if st.button("🔄 刷新"): st.rerun()
-    
-    date_placeholder = col_date.empty()
+    # [修正] 移除按鈕右側的所有文字
+    if st.button("🔄 刷新"): st.rerun()
 
     try:
         data = fetch_all()
         if isinstance(data, str): st.error(f"❌ {data}")
         elif data:
-            date_placeholder.markdown(
-                f"<div style='padding-top: 8px; font-size: 14px; color: gray;'>📅 {data['d']} (名單: {data['d_prev']})</div>", 
-                unsafe_allow_html=True
-            )
-            
-            # [修正] 藍色資訊框顯示回來了
+            # [修正] 藍色資訊框緊貼按鈕下方
             st.info(f"{data['src']} | 更新: {data['t']} | 來源: {data['src_type']}")
             
             st.sidebar.info(f"報價來源: {data['src_type']}")
@@ -1215,7 +1204,6 @@ def run_app():
             open_br = get_opening_breadth(data['d'])
              
             hist_max, hist_min, hist_count = get_intraday_extremes(data['d'])
-            
             current_time = datetime.now(timezone(timedelta(hours=8))).time()
             is_valid_time = time(9, 0) <= current_time <= time(13, 30)
             is_valid_count = data['raw']['v'] >= OPEN_COUNT_THR
@@ -1330,7 +1318,6 @@ def run_app():
             
             display_strategy_panel(data['slope'], open_br, br, n_state, data['chip_strat'], data['chip_diag'])
             
-            # [修正] 列表收合
             with st.expander("📋 查看個股狀態表", expanded=False):
                 st.dataframe(data['df'], use_container_width=True, hide_index=True)
         else: st.sidebar.warning("⏸ 休市")
@@ -1364,7 +1351,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (介面修復回歸版)...")
+        print("正在啟動 Streamlit 介面 (去冗餘精簡版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
