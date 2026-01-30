@@ -20,9 +20,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.59 (籌碼註解完善版)
+# 設定區 v9.55.60 (外資現貨絕對優先版)
 # ==========================================
-APP_VER = "v9.55.59 (籌碼註解完善版)"
+APP_VER = "v9.55.60 (外資現貨絕對優先版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -402,15 +402,22 @@ def get_chip_strategy(ma5_slope, chips):
     
     sig, act, color = "籌碼中性", "觀察技術面為主", "info"
     
-    # 1. 殺戮盤 (空頭趨勢 + 外資大空 + 散戶接 + 選擇權看空)
+    # [核心修正] 絕對優先權 (Priority Override)
+    # 1. 法人大逃殺 (現貨大賣 > 200億)：這是一票否決權
+    if spot_net < -200:
+        sig, act, color = "💀 法人大逃殺 (全面崩潰)", "外資現貨狂殺，資金大撤退。這是系統性風險，絕對禁止做多。", "error"
+        is_chip_bearish = True
+        return {
+            "sig": sig, "act": act, "color": color, "data": chips,
+            "is_bull": is_chip_bullish, "is_bear": is_chip_bearish
+        }
+
+    # 2. 殺戮盤 (空頭趨勢 + 外資大空 + 散戶接 + 選擇權看空)
     if ma5_slope < 0 and fut_oi < -10000 and margin_chg > 5 and pc_ratio < 90:
-        if spot_net < -200:
-            sig, act, color = "💀 法人大逃殺 (全面崩潰)", "外資期現貨同步狂殺，散戶接刀。這是系統性風險，絕對禁止做多。", "error"
-        else:
-            sig, act, color = "📉 殺戮盤 (空方控盤)", "外資期權偏空，散戶逆勢接刀。強力做空，切勿猜底。", "error"
+        sig, act, color = "📉 殺戮盤 (空方控盤)", "外資期權偏空，散戶逆勢接刀。強力做空，切勿猜底。", "error"
         is_chip_bearish = True
 
-    # 2. 火力全開 vs 誘多
+    # 3. 火力全開 vs 誘多
     elif ma5_slope > 0 and fut_oi > 10000 and pc_ratio > 110:
         if spot_net < -50:
             sig, act, color = "⚠️ 虛漲 (期貨拉抬現貨出貨)", "外資期貨做多但現貨大賣，標準的『拉高出貨』。多單應獲利了結。", "warning"
@@ -419,17 +426,22 @@ def get_chip_strategy(ma5_slope, chips):
             sig, act, color = "🚀 火力全開 (外資助攻)", "外資期現貨同步作多，支撐強勁。多單抱緊，甚至加碼。", "success"
             is_chip_bullish = True
         
-    # 3. 絕佳抄底
+    # 4. 絕佳抄底 (空頭趨勢 + 融資斷頭)
     elif ma5_slope < 0 and ((margin_ratio > 0 and margin_ratio < 135) or margin_chg < -15):
         sig, act, color = "💎 絕佳抄底 (斷頭清洗)", "空頭趨勢中見融資斷頭，醞釀反彈。", "primary"
         is_chip_bullish = True 
 
-    # 4. 多頭清洗
+    # 5. 多頭清洗 (多頭趨勢 + 融資大減)
     elif ma5_slope > 0 and margin_chg < -15:
-        sig, act, color = "🚿 多頭清洗 (甩轎)", "上升趨勢中融資大減，籌碼換手成功，有利後市。", "success"
-        is_chip_bullish = True
+        # [修正] 增加外資現貨檢核：如果外資也大賣，那不是清洗，是雙逃
+        if spot_net < -50:
+            sig, act, color = "⚠️ 融資外資雙逃 (多頭潰散)", "融資減，但外資現貨也大賣。這不是洗盤，是多殺多，快逃。", "error"
+            is_chip_bearish = True
+        else:
+            sig, act, color = "🚿 多頭清洗 (甩轎)", "上升趨勢中融資大減，籌碼換手成功，有利後市。", "success"
+            is_chip_bullish = True
 
-    # 5. 籌碼渙散
+    # 6. 籌碼渙散
     elif fut_chg < -3000 and margin_chg > 5: 
         if ma5_slope > 0:
             sig, act, color = "⚠️ 籌碼渙散 (主力落跑)", "指數漲但外資大逃亡，散戶在接最後一棒。多單減碼，小心反轉。", "warning"
@@ -438,12 +450,12 @@ def get_chip_strategy(ma5_slope, chips):
             sig, act, color = "🔪 下跌中繼 (散戶接刀)", "趨勢向下且外資續賣，散戶沿路攤平。空頭未止，禁止做多。", "error"
             is_chip_bearish = True
 
-    # 6. 潛伏期
+    # 7. 潛伏期
     elif abs(ma5_slope) < 10 and fut_chg > 2000 and pc_ratio > 110:
         sig, act, color = "🟩 潛伏期 (主力吃貨)", "盤整中見外資偷佈局多單。建議提前建倉，等待噴出。", "success"
         is_chip_bullish = True
 
-    # 7. 假突破 vs 軋空助漲
+    # 8. 假突破 vs 軋空助漲
     elif ma5_slope > 0 and fut_oi < -10000:
         if spot_net > 100:
             sig, act, color = "🟢 軋空助漲 (外資避險)", "現貨大買但期貨空單鎖利。這是『多頭避險』，非看空，盤勢仍穩。", "success"
@@ -1333,7 +1345,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (籌碼註解完善版)...")
+        print("正在啟動 Streamlit 介面 (外資現貨絕對優先版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
