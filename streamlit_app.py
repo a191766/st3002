@@ -20,9 +20,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.51 (圖表截止線鎖定版)
+# 設定區 v9.55.52 (智慧補全版)
 # ==========================================
-APP_VER = "v9.55.51 (圖表截止線鎖定版)"
+APP_VER = "v9.55.52 (智慧補全版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -328,9 +328,18 @@ def get_chips_data_smart(token):
     target_str = target_date.strftime("%Y-%m-%d")
     cache = load_json_file(CHIPS_FILE)
     
+    # [修正邏輯] 即使快取有資料，也要檢查是否完整
     if target_str in cache:
-        return cache[target_str]['data'], cache[target_str]['diag']
+        cached_data = cache[target_str]['data']
+        # 檢查融資日期是否跟目標日期一樣 (代表已更新)
+        margin_date = cached_data.get('margin_date', '')
+        margin_bal_date = cached_data.get('margin_bal_date', '')
+        
+        # 如果融資資料是舊的 (不等於 target_str)，就強制重新抓取 (不 return)
+        if margin_date == target_str and margin_bal_date == target_str:
+            return cached_data, cache[target_str]['diag']
     
+    # 執行抓取 (快取沒中，或是快取資料不全)
     data, diag = fetch_chips_from_network(token, target_str)
     
     is_success = False
@@ -731,7 +740,7 @@ def plot_chart():
                 
                 df_today = df[df['Time'] >= "09:00"].copy()
                 
-                # [核心修正] 強制截斷 13:30 以後的資料，確保圖表不顯示盤後更新的異動
+                # 強制截斷 13:30 以後的資料
                 df_today = df_today[df_today['Time'] <= "13:30"]
                 
                 if not df_today.empty:
@@ -772,6 +781,7 @@ def plot_chart():
     rule_g = alt.Chart(pd.DataFrame({'y':[BREADTH_LOW]})).mark_rule(color='green', strokeDash=[5,5]).encode(y='y')
     
     if not chart_data.empty:
+        # [圖表優化] 黃色廣度: 實線(細) + 點(小)
         l_b = base.mark_line(color='#ffc107', strokeWidth=1).encode(
             y=alt.Y('Breadth', title=None, scale=alt.Scale(domain=[0,1], nice=False), axis=y_axis)
         )
@@ -779,6 +789,8 @@ def plot_chart():
             y='Breadth', 
             tooltip=['DT', alt.Tooltip('Breadth', format='.1%')]
         )
+        
+        # [圖表優化] 藍色大盤: 實線(細) + 點(小)
         l_t = base.mark_line(color='#007bff', strokeWidth=1).encode(
             y=alt.Y('T_S', scale=alt.Scale(domain=[0,1]))
         )
@@ -790,6 +802,7 @@ def plot_chart():
     else:
         layers = [base, rule_r, rule_g]
 
+    # [新增] 盤後提示
     if chart_data.empty and datetime.now(timezone(timedelta(hours=8))).time() > time(13, 30):
         st.warning("⚠️ 無盤中歷史數據：程式未在盤中運行，無法顯示今日走勢圖。")
 
@@ -1231,7 +1244,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (圖表截止線鎖定版)...")
+        print("正在啟動 Streamlit 介面 (智慧補全版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
