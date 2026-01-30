@@ -20,9 +20,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.63 (標題縮小版)
+# 設定區 v9.55.64 (極致瘦身修正版)
 # ==========================================
-APP_VER = "v9.55.63 (標題縮小版)"
+APP_VER = "v9.55.64 (極致瘦身修正版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -1140,13 +1140,21 @@ def fetch_all():
     }
 
 def run_app():
-    st.title(f"📈 {APP_VER}") # 保留 title 以相容，但實際上會被下面的 markdown 覆蓋或並存，等等，st.title 是必須的嗎？
-    # [修正] st.title 其實可以移除，直接用 markdown
-    # 但為了讓瀏覽器標籤頁顯示正確標題，通常 st.set_page_config 會用到，不過這裡沒有。
-    # 為了版面乾淨，我把 st.title 拿掉，改用全自訂 HTML。
+    # [修正] 1. 設定頁面配置 (必須是第一行)，設定標題但不在頁面上顯示大標題
+    st.set_page_config(page_title=APP_VER, layout="wide")
     
-    # [更正] run_app 裡面第一行
-    st.markdown(f"<h3 style='font-size: 24px; margin: 0; padding-top: 10px;'>📈 {APP_VER}</h3>", unsafe_allow_html=True)
+    # [修正] 2. 注入 CSS 減少頂部留白
+    st.markdown("""
+        <style>
+        .block-container {
+            padding-top: 1rem !important;
+            padding-bottom: 0rem !important;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+    
+    # [修正] 3. 使用自訂的小型 HTML 標題 (不再使用 st.title)
+    st.markdown(f"<h3 style='font-size: 20px; margin: 0; padding-bottom: 10px;'>📈 {APP_VER}</h3>", unsafe_allow_html=True)
     
     with st.sidebar:
         st.subheader("設定")
@@ -1353,7 +1361,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (標題縮小版)...")
+        print("正在啟動 Streamlit 介面 (極致瘦身修正版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
