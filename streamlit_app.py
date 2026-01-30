@@ -20,9 +20,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.69 (純期交所版)
+# 設定區 v9.55.71 (日期邏輯修正版)
 # ==========================================
-APP_VER = "v9.55.69 (純期交所版)"
+APP_VER = "v9.55.71 (日期邏輯修正版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -266,7 +266,6 @@ def fetch_chips_from_network(token, target_date_str):
                 except: diagnosis.append("❌ 期貨: 計算錯誤")
 
     # 2. 選擇權 (純期交所版)
-    # 不再呼叫 FinMind，只信賴期交所爬蟲
     pc_val = None; pc_date = None
     
     taifex_val, taifex_date, taifex_msg = get_taifex_pc_ratio(target_date_str)
@@ -893,29 +892,44 @@ def fetch_all():
     
     now = datetime.now(timezone(timedelta(hours=8)))
     today_str = now.strftime("%Y-%m-%d")
-    if not days: days = [today_str]
     
+    # [修正1] 日期判定邏輯修正
+    # 先抓 DB 最後一天 (通常是上一個交易日)
+    last_db_date = days[-1] if days else today_str
+    
+    if today_str > last_db_date:
+        # 如果今天是週六/週日，或連假，或資料庫還沒更新
+        # 「昨天」= DB 最後一天 (1/30)
+        # 「今天」= 系統日期 (1/31) -> 這樣顯示就會是今日0，昨日有數值
+        d_prev = last_db_date
+        d_cur = today_str
+    else:
+        # 正常交易日 (已開盤或盤中)
+        if len(days) > 1:
+            d_prev = days[-2]
+        else:
+            d_prev = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        d_cur = last_db_date
+
     info_map = get_stock_info_map(ft)
     
-    d_cur = days[-1]
     is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
     allow_live_fetch = (0<=now.weekday()<=4) and (now.time() >= time(8,45))
     
-    if len(days) > 1:
-        date_prev = days[-2]
-    else:
-        date_prev = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    
-    ranks_prev, _ = get_ranks_strict(ft, date_prev) 
-    
+    # 預設名單先用「昨日名單」 (解決 14:00 後抓不到新名單變空白的問題)
+    ranks_prev, _ = get_ranks_strict(ft, d_prev) 
     ranks_curr = ranks_prev 
-    msg_src = f"名單:{date_prev}(昨日/盤中)"
+    msg_src = f"名單:{d_prev}(昨日/盤中)"
     
-    if now.time() >= time(14, 0) and d_cur == today_str:
+    # [修正2] 下午兩點後嘗試更新，但如果失敗就維持原樣
+    is_trading_day = (0 <= now.weekday() <= 4)
+    if d_cur == today_str and is_trading_day and now.time() >= time(14, 0):
+        # 嘗試抓今日名單
         ranks_today, _ = get_ranks_strict(ft, today_str, min_count=1500)
+        # 只有抓到有效的名單才更新，否則繼續用舊的
         if ranks_today:
             ranks_curr = ranks_today
-            msg_src = f"名單:{today_str}(今日完整)"
+            msg_src = f"名單:{today_str}(完整)"
     
     all_targets = list(set(ranks_curr + ranks_prev))
 
@@ -1342,7 +1356,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (純期交所版)...")
+        print("正在啟動 Streamlit 介面 (日期邏輯修正版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
