@@ -19,9 +19,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.42 (註解提示增強版)
+# 設定區 v9.55.43 (盤後提示優化版)
 # ==========================================
-APP_VER = "v9.55.42 (註解提示增強版)"
+APP_VER = "v9.55.43 (盤後提示優化版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -534,7 +534,7 @@ def get_prices_twse_mis(codes, info_map):
                         elif pz and pz != '-' and pz.replace('.','').isdigit(): 
                             price = float(pz); note="試撮"
                         
-                        # 3. [修正邏輯] 若無成交/試撮，精準判斷漲跌停
+                        # 3. [回退至穩定版邏輯] 解決漲跌停市價單問題
                         if price == 0:
                             b_str = item.get('b','').split('_')[0]
                             a_str = item.get('a','').split('_')[0]
@@ -547,13 +547,10 @@ def get_prices_twse_mis(codes, info_map):
                                 l_val = float(item.get('l', '0'))
                                 
                                 if has_b and not has_a:
-                                    # 有買無賣 -> 漲停鎖死 -> 用當日最高價
                                     if h_val > 0: price = h_val; note = "漲停(H)"
                                 elif has_a and not has_b:
-                                    # 有賣無買 -> 跌停鎖死 -> 用當日最低價
                                     if l_val > 0: price = l_val; note = "跌停(L)"
                                 elif has_b and has_a:
-                                    # 有買也有賣 -> 正常交易(暫無成交) -> 用委買價
                                     try: 
                                         price = float(b_str)
                                         note = "委買價"
@@ -770,6 +767,10 @@ def plot_chart():
         layers = [l_b, p_b, l_t, p_t, rule_r, rule_g]
     else:
         layers = [base, rule_r, rule_g]
+
+    # [新增] 盤後提示
+    if chart_data.empty and datetime.now(timezone(timedelta(hours=8))).time() > time(13, 30):
+        st.warning("⚠️ 無盤中歷史數據：程式未在盤中運行，無法顯示今日走勢圖。")
 
     return alt.layer(*layers).properties(height=400, title=f"走勢對照 - {base_d}").resolve_scale(y='shared')
 
@@ -1062,7 +1063,7 @@ def run_app():
             br = data['br']
             open_br = get_opening_breadth(data['d'])
              
-            # [極值] 計算僅限 09:00~13:30
+            # [修正] 極值計算僅限 09:00~13:30
             hist_max, hist_min = get_intraday_extremes(data['d'])
             
             current_time = datetime.now(timezone(timedelta(hours=8))).time()
@@ -1204,7 +1205,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (註解提示增強版)...")
+        print("正在啟動 Streamlit 介面 (盤後提示優化版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
