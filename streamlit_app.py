@@ -20,9 +20,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.66 (空間極致壓縮版)
+# 設定區 v9.55.67 (介面修復回歸版)
 # ==========================================
-APP_VER = "v9.55.66 (空間極致壓縮版)"
+APP_VER = "v9.55.67 (介面修復回歸版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -823,7 +823,6 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
             for msg in chip_diag: st.write(msg)
 
 def plot_chart(base_d, date_prev):
-    # [修改] plot_chart 現在接收兩個參數，方便顯示在 title
     chart_data = pd.DataFrame()
     
     if os.path.exists(HIST_FILE):
@@ -896,7 +895,6 @@ def plot_chart(base_d, date_prev):
     if chart_data.empty and datetime.now(timezone(timedelta(hours=8))).time() > time(13, 30):
         st.warning("⚠️ 無盤中歷史數據：程式未在盤中運行，無法顯示今日走勢圖。")
 
-    # [修改] 這裡直接把名單基準日寫進標題
     return alt.layer(*layers).properties(height=380, title=f"走勢對照 - {base_d} (名單: {date_prev})").resolve_scale(y='shared')
 
 def fetch_all():
@@ -1139,20 +1137,21 @@ def fetch_all():
     }
 
 def run_app():
+    # [修正] 1. 設定頁面配置 (必須是第一行)
     st.set_page_config(page_title=APP_VER, layout="wide")
     
-    # [修正] 頂部留白從 3rem 改回 1rem，因為按鈕區會自動往下推，這樣更緊湊
+    # [修正] 2. 注入 CSS，這裡改回較寬鬆的 3rem 以確保標題顯示
     st.markdown("""
         <style>
         .block-container {
-            padding-top: 1rem !important;
+            padding-top: 3rem !important;
             padding-bottom: 0rem !important;
         }
         </style>
     """, unsafe_allow_html=True)
     
-    # [修正] 標題縮小且移除
-    st.markdown(f"<h3 style='font-size: 18px; margin: 0; padding-bottom: 5px;'>📈 {APP_VER}</h3>", unsafe_allow_html=True)
+    # [修正] 3. 標題回歸 (使用 H3 標籤)
+    st.markdown(f"<h3 style='text-align: left; margin: 0; padding-bottom: 10px;'>📈 {APP_VER}</h3>", unsafe_allow_html=True)
     
     with st.sidebar:
         st.subheader("設定")
@@ -1185,24 +1184,26 @@ def run_app():
                 time_module.sleep(1)
             st.rerun()
 
-    # [核心修正] 按鈕區與日期整合
+    # [修正] 按鈕與日期併排
     col_btn, col_date = st.columns([1, 3])
     with col_btn:
         if st.button("🔄 刷新"): st.rerun()
-    with col_date:
-        # 這裡不呼叫 fetch_all() 因為後面會叫，先暫時顯示載入中或空
-        # 為了即時顯示日期，我們還是要從後面拿，但因為 layout 順序，
-        # 這裡可以用一個空位，等資料拿到後再回填，或者把 fetch_all 移到最前面
-        pass # 等資料拿到後顯示
+    
+    # 先佔位，等資料回來後填入
+    date_placeholder = col_date.empty()
 
     try:
         data = fetch_all()
         if isinstance(data, str): st.error(f"❌ {data}")
         elif data:
-            # [修正] 回填日期資訊到上方
-            with col_date:
-                # 使用 vertical-align 讓文字對齊按鈕中間
-                st.markdown(f"<div style='padding-top: 5px; font-size: 14px; color: gray;'>📅 {data['d']} | 更新: {data['t']} | 來源: {data['src_type']}</div>", unsafe_allow_html=True)
+            # [修正] 填入日期與名單資訊到按鈕右側
+            date_placeholder.markdown(
+                f"<div style='padding-top: 8px; font-size: 14px; color: gray;'>📅 {data['d']} (名單: {data['d_prev']})</div>", 
+                unsafe_allow_html=True
+            )
+            
+            # [修正] 恢復顯示藍色資訊框 (在按鈕下方)
+            st.info(f"{data['src']} | 更新: {data['t']} | 來源: {data['src_type']}")
             
             st.sidebar.info(f"報價來源: {data['src_type']}")
             st.sidebar.caption(f"永豐API額度: {data.get('sj_usage', '未知')}")
@@ -1217,12 +1218,8 @@ def run_app():
             br = data['br']
             open_br = get_opening_breadth(data['d'])
              
-            # [修正] 取得極值 + 資料筆數 (底層已過濾 Total >= 290)
             hist_max, hist_min, hist_count = get_intraday_extremes(data['d'])
-            
             current_time = datetime.now(timezone(timedelta(hours=8))).time()
-            
-            # [修正] 有效視窗：時間在 09:00~13:30 且 當下有效家數(v) >= 290
             is_valid_time = time(9, 0) <= current_time <= time(13, 30)
             is_valid_count = data['raw']['v'] >= OPEN_COUNT_THR
             in_valid_window = is_valid_time and is_valid_count
@@ -1307,12 +1304,7 @@ def run_app():
 
                 save_notify_state(n_state)
             
-            # [修正] 移除原本的 st.subheader 與 st.caption (改去上面)
-            # st.subheader(f"📅 {data['d']}")  <-- 移除
-            # st.caption(f"名單基準日: {data['d_prev']}") <-- 移除
-            # st.info(...) <-- 移除
-            
-            # 1. 圖表 (這裡傳入 date_prev 給標題用)
+            # 1. 圖表 (優先顯示)
             chart = plot_chart(data['d'], data['d_prev'])
             if chart: st.altair_chart(chart, use_container_width=True)
             
@@ -1376,7 +1368,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (空間極致壓縮版)...")
+        print("正在啟動 Streamlit 介面 (介面修復回歸版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
