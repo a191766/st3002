@@ -19,9 +19,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.44 (提示訊息修復版)
+# 設定區 v9.55.45 (盤後狀態顯示優化版)
 # ==========================================
-APP_VER = "v9.55.44 (提示訊息修復版)"
+APP_VER = "v9.55.45 (盤後狀態顯示優化版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -152,6 +152,7 @@ def get_intraday_extremes(d_cur):
         if df.empty: return None, None
         df['Date'] = df['Date'].astype(str)
         
+        # 只取 09:00 ~ 13:30 的資料
         df_today = df[
             (df['Date'] == str(d_cur)) & 
             (df['Time'] >= "09:00") & 
@@ -304,7 +305,7 @@ def fetch_chips_from_network(token, target_date_str):
             latest = df_m.iloc[-1]
             prev = df_m.iloc[-2] if len(df_m)>1 else latest
             curr_bal = float(latest['TodayBalance'])
-            prev_val = float(prev['TodayBalance'])
+            prev_bal = float(prev['TodayBalance'])
             res['margin_chg'] = round((curr_bal - prev_val)/1e8, 2)
             res['margin_bal'] = round(curr_bal/1e8, 1)
             res['margin_bal_date'] = latest.get('date', '未知日期')
@@ -534,7 +535,7 @@ def get_prices_twse_mis(codes, info_map):
                         elif pz and pz != '-' and pz.replace('.','').isdigit(): 
                             price = float(pz); note="試撮"
                         
-                        # 3. [精準修復] 漲跌停 vs 暫無成交
+                        # 3. [回退至穩定版邏輯] 解決漲跌停市價單問題
                         if price == 0:
                             b_str = item.get('b','').split('_')[0]
                             a_str = item.get('a','').split('_')[0]
@@ -547,13 +548,10 @@ def get_prices_twse_mis(codes, info_map):
                                 l_val = float(item.get('l', '0'))
                                 
                                 if has_b and not has_a:
-                                    # 情境B: 有買無賣 -> 漲停鎖死 -> 用當日最高價
                                     if h_val > 0: price = h_val; note = "漲停(H)"
                                 elif has_a and not has_b:
-                                    # 情境C: 有賣無買 -> 跌停鎖死 -> 用當日最低價
                                     if l_val > 0: price = l_val; note = "跌停(L)"
                                 elif has_b and has_a:
-                                    # 情境A: 有買也有賣 -> 正常交易 -> 嘗試用委買價
                                     try: 
                                         price = float(b_str)
                                         note = "委買價"
@@ -1167,8 +1165,12 @@ def run_app():
             else:
                 caption_str += " | 開盤: 等待中..."
             
-            caption_str += f"\n今日目前最高廣度: {today_max:.1%}"
-            caption_str += f"\n今日目前最低廣度: {today_min:.1%}"
+            # [修正] 盤後若無歷史資料，不顯示誤導人的極值，改顯示提示
+            if hist_max is None and current_time > time(13, 30):
+                caption_str += "\n⚠️ 目前無盤中廣度資料 (未在盤中運行)"
+            else:
+                caption_str += f"\n今日目前最高廣度: {today_max:.1%}"
+                caption_str += f"\n今日目前最低廣度: {today_min:.1%}"
             
             c1.caption(caption_str)
             
@@ -1208,7 +1210,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (提示訊息修復版)...")
+        print("正在啟動 Streamlit 介面 (盤後狀態顯示優化版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
