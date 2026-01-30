@@ -19,9 +19,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.45 (盤後狀態顯示優化版)
+# 設定區 v9.55.46 (變數名稱修復版)
 # ==========================================
-APP_VER = "v9.55.45 (盤後狀態顯示優化版)"
+APP_VER = "v9.55.46 (變數名稱修復版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -305,8 +305,8 @@ def fetch_chips_from_network(token, target_date_str):
             latest = df_m.iloc[-1]
             prev = df_m.iloc[-2] if len(df_m)>1 else latest
             curr_bal = float(latest['TodayBalance'])
-            prev_bal = float(prev['TodayBalance'])
-            res['margin_chg'] = round((curr_bal - prev_val)/1e8, 2)
+            prev_bal = float(prev['TodayBalance']) # [修正] 統一名稱為 prev_bal
+            res['margin_chg'] = round((curr_bal - prev_bal)/1e8, 2) # [修正] 使用 prev_bal
             res['margin_bal'] = round(curr_bal/1e8, 1)
             res['margin_bal_date'] = latest.get('date', '未知日期')
             diagnosis.append(f"✅ 融資餘額: {res['margin_bal']}億 ({res['margin_bal_date']})")
@@ -528,14 +528,11 @@ def get_prices_twse_mis(codes, info_map):
                         price = 0
                         note = ""
                         
-                        # 1. 優先找成交價
                         if z and z != '-' and z.replace('.','').isdigit(): 
                             price = float(z); note="成交"
-                        # 2. 其次找試撮價
                         elif pz and pz != '-' and pz.replace('.','').isdigit(): 
                             price = float(pz); note="試撮"
                         
-                        # 3. [回退至穩定版邏輯] 解決漲跌停市價單問題
                         if price == 0:
                             b_str = item.get('b','').split('_')[0]
                             a_str = item.get('a','').split('_')[0]
@@ -748,7 +745,6 @@ def plot_chart():
     rule_g = alt.Chart(pd.DataFrame({'y':[BREADTH_LOW]})).mark_rule(color='green', strokeDash=[5,5]).encode(y='y')
     
     if not chart_data.empty:
-        # [圖表優化] 黃色廣度: 實線(細) + 點(小)
         l_b = base.mark_line(color='#ffc107', strokeWidth=1).encode(
             y=alt.Y('Breadth', title=None, scale=alt.Scale(domain=[0,1], nice=False), axis=y_axis)
         )
@@ -756,8 +752,6 @@ def plot_chart():
             y='Breadth', 
             tooltip=['DT', alt.Tooltip('Breadth', format='.1%')]
         )
-        
-        # [圖表優化] 藍色大盤: 實線(細) + 點(小)
         l_t = base.mark_line(color='#007bff', strokeWidth=1).encode(
             y=alt.Y('T_S', scale=alt.Scale(domain=[0,1]))
         )
@@ -769,7 +763,7 @@ def plot_chart():
     else:
         layers = [base, rule_r, rule_g]
 
-    # [新增] 盤後提示
+    # 盤後提示
     if chart_data.empty and datetime.now(timezone(timedelta(hours=8))).time() > time(13, 30):
         st.warning("⚠️ 無盤中歷史數據：程式未在盤中運行，無法顯示今日走勢圖。")
 
@@ -1083,7 +1077,6 @@ def run_app():
         
             n_state = load_notify_state(data['d']) 
 
-            # 趨勢鎖定通知
             if open_br is not None and n_state['intraday_trend'] is None:
                 if br >= (open_br + 0.05):
                     n_state['intraday_trend'] = 'up'
@@ -1210,7 +1203,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (盤後狀態顯示優化版)...")
+        print("正在啟動 Streamlit 介面 (變數名稱修復版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
