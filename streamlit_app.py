@@ -10,6 +10,7 @@ import altair as alt
 import time as time_module
 import random
 import io 
+import gc
 
 # 引入 curl_cffi 
 try:
@@ -19,9 +20,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.46 (變數名修復+精準無資料提示版)
+# 設定區 v9.55.47 (終極量價判斷版)
 # ==========================================
-APP_VER = "v9.55.46 (變數名修復+精準無資料提示版)"
+APP_VER = "v9.55.47 (終極量價判斷版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -152,7 +153,6 @@ def get_intraday_extremes(d_cur):
         if df.empty: return None, None, 0
         df['Date'] = df['Date'].astype(str)
         
-        # 只取 09:00 ~ 13:30 的資料
         df_today = df[
             (df['Date'] == str(d_cur)) & 
             (df['Time'] >= "09:00") & 
@@ -160,11 +160,10 @@ def get_intraday_extremes(d_cur):
         ]
         
         if df_today.empty: return None, None, 0
-        # [修正] 多回傳一個 count，用來判斷資料是否足夠
         return df_today['Breadth'].max(), df_today['Breadth'].min(), len(df_today)
     except: return None, None, 0
 
-@st.cache_resource(ttl=3600) 
+@st.cache_resource
 def get_api():
     api = sj.Shioaji(simulation=False)
     try: 
@@ -186,11 +185,12 @@ def call_finmind_api_try_versions(dataset_candidates, data_id, start_date, token
             params = {"dataset": dataset, "start_date": start_date, "token": token}
             if data_id: params["data_id"] = data_id
             try:
-                r = cffi_requests.get(url, params=params, impersonate="chrome", timeout=10)
-                if r.status_code == 200:
-                    res_json = r.json()
-                    if "data" in res_json and len(res_json["data"]) > 0:
-                        return pd.DataFrame(res_json["data"]), f"{dataset} ({v})"
+                with cffi_requests.Session() as session:
+                    r = session.get(url, params=params, impersonate="chrome", timeout=10)
+                    if r.status_code == 200:
+                        res_json = r.json()
+                        if "data" in res_json and len(res_json["data"]) > 0:
+                            return pd.DataFrame(res_json["data"]), f"{dataset} ({v})"
             except Exception as e: last_error = str(e)
     return pd.DataFrame(), last_error
 
@@ -204,17 +204,18 @@ def get_taifex_pc_ratio(target_date_str):
             'queryEndDate': end_dt.strftime("%Y/%m/%d"),
             'queryDate': end_dt.strftime("%Y/%m/%d")
         }
-        r = cffi_requests.post(url, data=payload, impersonate="chrome", timeout=10)
-        if r.status_code == 200:
-            dfs = pd.read_html(io.StringIO(r.text))
-            for df in dfs:
-                if df.shape[1] >= 7:
-                    top_row = df.iloc[0] 
-                    try:
-                        val = float(top_row.iloc[6])
-                        date_str = str(top_row.iloc[0]) 
-                        return val, date_str, f"期交所官網 ({date_str})"
-                    except: continue
+        with cffi_requests.Session() as session:
+            r = session.post(url, data=payload, impersonate="chrome", timeout=10)
+            if r.status_code == 200:
+                dfs = pd.read_html(io.StringIO(r.text))
+                for df in dfs:
+                    if df.shape[1] >= 7:
+                        top_row = df.iloc[0] 
+                        try:
+                            val = float(top_row.iloc[6])
+                            date_str = str(top_row.iloc[0]) 
+                            return val, date_str, f"期交所官網 ({date_str})"
+                        except: continue
     except Exception as e:
         return None, None, str(e)
     return None, None, "找不到表格"
@@ -306,8 +307,8 @@ def fetch_chips_from_network(token, target_date_str):
             latest = df_m.iloc[-1]
             prev = df_m.iloc[-2] if len(df_m)>1 else latest
             curr_bal = float(latest['TodayBalance'])
-            prev_bal = float(prev['TodayBalance']) # [修正] 名稱修正
-            res['margin_chg'] = round((curr_bal - prev_bal)/1e8, 2) # [修正] 使用 prev_bal
+            prev_bal = float(prev['TodayBalance'])
+            res['margin_chg'] = round((curr_bal - prev_bal)/1e8, 2)
             res['margin_bal'] = round(curr_bal/1e8, 1)
             res['margin_bal_date'] = latest.get('date', '未知日期')
             diagnosis.append(f"✅ 融資餘額: {res['margin_bal']}億 ({res['margin_bal_date']})")
@@ -529,30 +530,45 @@ def get_prices_twse_mis(codes, info_map):
                         price = 0
                         note = ""
                         
-                        # 1. 優先找成交價
                         if z and z != '-' and z.replace('.','').isdigit(): 
                             price = float(z); note="成交"
-                        # 2. 其次找試撮價
                         elif pz and pz != '-' and pz.replace('.','').isdigit(): 
                             price = float(pz); note="試撮"
                         
-                        # 3. [回退至穩定版邏輯] 解決漲跌停市價單問題
+                        # [終極修正] 若無成交價，改用「買賣量 (g/f)」判斷掛單狀態
                         if price == 0:
-                            b_str = item.get('b','').split('_')[0]
-                            a_str = item.get('a','').split('_')[0]
+                            # g = 委買量字串 (如 "10_5_3_0_0")
+                            g_str = item.get('g', '')
+                            # f = 委賣量字串
+                            f_str = item.get('f', '')
                             
-                            has_b = (b_str and b_str != '-' and b_str != '0')
-                            has_a = (a_str and a_str != '-' and a_str != '0')
-                            
+                            has_bid_vol = False
+                            if g_str:
+                                g_top = g_str.split('_')[0]
+                                if g_top and g_top != '0' and g_top != '-':
+                                    has_bid_vol = True
+                                    
+                            has_ask_vol = False
+                            if f_str:
+                                f_top = f_str.split('_')[0]
+                                if f_top and f_top != '0' and f_top != '-':
+                                    has_ask_vol = True
+
                             try:
                                 h_val = float(item.get('h', '0'))
                                 l_val = float(item.get('l', '0'))
                                 
-                                if has_b and not has_a:
+                                if has_bid_vol and not has_ask_vol:
+                                    # 有買量無賣量 -> 漲停鎖死 (忽略價格欄位，直接用 High)
                                     if h_val > 0: price = h_val; note = "漲停(H)"
-                                elif has_a and not has_b:
+                                    
+                                elif has_ask_vol and not has_bid_vol:
+                                    # 有賣量無買量 -> 跌停鎖死 (忽略價格欄位，直接用 Low)
                                     if l_val > 0: price = l_val; note = "跌停(L)"
-                                elif has_b and has_a:
+                                    
+                                elif has_bid_vol and has_ask_vol:
+                                    # 買賣都有 -> 正常盤整 (暫無成交) -> 嘗試用委買價
+                                    b_str = item.get('b','').split('_')[0]
                                     try: 
                                         price = float(b_str)
                                         note = "委買價"
@@ -749,7 +765,6 @@ def plot_chart():
     rule_g = alt.Chart(pd.DataFrame({'y':[BREADTH_LOW]})).mark_rule(color='green', strokeDash=[5,5]).encode(y='y')
     
     if not chart_data.empty:
-        # [圖表優化] 黃色廣度: 實線(細) + 點(小)
         l_b = base.mark_line(color='#ffc107', strokeWidth=1).encode(
             y=alt.Y('Breadth', title=None, scale=alt.Scale(domain=[0,1], nice=False), axis=y_axis)
         )
@@ -757,8 +772,6 @@ def plot_chart():
             y='Breadth', 
             tooltip=['DT', alt.Tooltip('Breadth', format='.1%')]
         )
-        
-        # [圖表優化] 藍色大盤: 實線(細) + 點(小)
         l_t = base.mark_line(color='#007bff', strokeWidth=1).encode(
             y=alt.Y('T_S', scale=alt.Scale(domain=[0,1]))
         )
@@ -770,7 +783,6 @@ def plot_chart():
     else:
         layers = [base, rule_r, rule_g]
 
-    # [新增] 盤後提示
     if chart_data.empty and datetime.now(timezone(timedelta(hours=8))).time() > time(13, 30):
         st.warning("⚠️ 無盤中歷史數據：程式未在盤中運行，無法顯示今日走勢圖。")
 
@@ -1001,6 +1013,9 @@ def fetch_all():
     chips_data, chips_diag = get_chips_data_smart(ft)
     chip_strategy = get_chip_strategy(slope, chips_data)
     
+    # [優化] 強制執行垃圾回收，釋放記憶體
+    gc.collect()
+    
     return {
         "d":d_cur, "d_prev": date_prev, 
         "br":br_c, "br_p":br_p, "h":h_c, "v":v_c, "h_p":h_p, "v_p":v_p,
@@ -1209,7 +1224,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (變數名修復+精準無資料提示版)...")
+        print("正在啟動 Streamlit 介面 (終極量價判斷版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
