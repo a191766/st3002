@@ -1215,4 +1215,4 @@ if __name__ == "__main__":
             print(f"啟動失敗: {e}")
             print("請確認已安裝 streamlit (pip install streamlit) 和 curl_cffi (pip install curl_cffi)")
         
-        input("\n程式執行結束 (或發生錯誤)，請按 Enter 鍵離開...")ㄋ
+        input("\n程式執行結束 (或發生錯誤)，請按 Enter 鍵離開...")
