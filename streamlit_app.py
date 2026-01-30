@@ -20,9 +20,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.53 (分母門檻過濾版)
+# 設定區 v9.55.54 (綜合戰略優化版)
 # ==========================================
-APP_VER = "v9.55.53 (分母門檻過濾版)"
+APP_VER = "v9.55.54 (綜合戰略優化版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -153,9 +153,8 @@ def get_intraday_extremes(d_cur):
         if df.empty: return None, None, 0
         df['Date'] = df['Date'].astype(str)
         
-        if 'Total' not in df.columns: df['Total'] = 0 # 防呆：確保舊版CSV也有此欄位
+        if 'Total' not in df.columns: df['Total'] = 0
         
-        # [修正] 增加 Total >= OPEN_COUNT_THR (290) 的條件
         df_today = df[
             (df['Date'] == str(d_cur)) & 
             (df['Time'] >= "09:00") & 
@@ -371,22 +370,36 @@ def get_chip_strategy(ma5_slope, chips):
     margin_ratio = chips.get('margin_ratio', 0) 
     margin_chg = chips.get('margin_chg', 0)
     
+    # 定義籌碼偏多/偏空的標籤
+    is_chip_bearish = False
+    is_chip_bullish = False
+    
     sig, act, color = "籌碼中性", "觀察技術面為主", "info"
     
-    if ma5_slope <= 0 and fut_oi < -10000 and margin_chg > 0:
+    # 判斷籌碼狀態
+    if fut_oi < -10000 and margin_chg > 0:
         sig, act, color = "📉 殺戮盤 (散戶接刀)", "主力殺、散戶接，籌碼極亂。全力放空，不要猜底。", "error"
-    elif ma5_slope > 0 and fut_oi > 10000 and pc_ratio > 110:
+        is_chip_bearish = True
+    elif fut_oi > 10000 and pc_ratio > 110:
         sig, act, color = "🚀 火力全開 (外資助攻)", "外資期現貨同步作多，支撐強勁。多單抱緊，甚至加碼。", "success"
-    elif ma5_slope < 0 and ((margin_ratio > 0 and margin_ratio < 135) or margin_chg < -15):
+        is_chip_bullish = True
+    elif (margin_ratio > 0 and margin_ratio < 135) or margin_chg < -15:
         sig, act, color = "💎 絕佳抄底 (斷頭清洗)", "融資斷頭清洗中，留意止跌訊號。", "primary"
-    elif ma5_slope > 0 and fut_chg < -3000 and margin_chg > 5: 
+        is_chip_bullish = True # 視為潛在多頭訊號
+    elif fut_chg < -3000 and margin_chg > 5: 
         sig, act, color = "⚠️ 籌碼渙散 (拉高出貨)", "指數漲但外資大逃亡，散戶在接最後一棒。獲利了結，小心反轉。", "warning"
+        is_chip_bearish = True
     elif abs(ma5_slope) < 10 and fut_chg > 2000 and pc_ratio > 110:
         sig, act, color = "🟩 潛伏期 (主力吃貨)", "盤整中見外資偷佈局多單。建議提前建倉，等待噴出。", "success"
-    elif ma5_slope > 0 and fut_oi < -3000:
+        is_chip_bullish = True
+    elif fut_oi < -3000:
         sig, act, color = "🟨 假突破警戒", "現貨漲但期貨空單留倉。可能是假突破，多單要設緊停損。", "warning"
+        is_chip_bearish = True
         
-    return {"sig": sig, "act": act, "color": color, "data": chips}
+    return {
+        "sig": sig, "act": act, "color": color, "data": chips,
+        "is_bull": is_chip_bullish, "is_bear": is_chip_bearish
+    }
 
 # ==========================================
 # 資料處理 (一般)
@@ -645,9 +658,22 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
     st.subheader("♟️ 戰略指揮所")
     strategies = []
     
-    if slope > 0: strategies.append({"sig": "MA5斜率為正 ➜ 大盤偏多", "act": "只做多單，放棄空單", "type": "success"})
-    elif slope < 0: strategies.append({"sig": "MA5斜率為負 ➜ 大盤偏空", "act": "只做空單，放棄多單", "type": "error"})
-    else: strategies.append({"sig": "MA5斜率持平", "act": "", "type": "info"})
+    # [核心修改] 綜合判斷技術面(MA5)與籌碼面
+    chip_bull = chip_strategy.get('is_bull', False) if chip_strategy else False
+    chip_bear = chip_strategy.get('is_bear', False) if chip_strategy else False
+    
+    if slope > 0:
+        if chip_bear:
+            strategies.append({"sig": "⚠️ 技術偏多但籌碼轉弱", "act": "籌碼渙散或假突破，多單應減碼或設緊停損", "type": "warning"})
+        else:
+            strategies.append({"sig": "MA5斜率為正 ➜ 大盤偏多", "act": "順勢操作，以做多為主", "type": "success"})
+    elif slope < 0:
+        if chip_bull:
+            strategies.append({"sig": "💎 技術偏空但籌碼進駐", "act": "外資抄底或斷頭清洗中，空單回補，可嘗試搶反彈", "type": "primary"})
+        else:
+            strategies.append({"sig": "MA5斜率為負 ➜ 大盤偏空", "act": "順勢操作，以做空為主", "type": "error"})
+    else:
+        strategies.append({"sig": "MA5斜率持平", "act": "區間震盪，觀察突破方向", "type": "info"})
     
     trend_status = n_state.get('intraday_trend')
     if trend_status == 'up': strategies.append({"sig": "🔒 已觸發【開盤+5%】", "act": "今日偏多確認，留意回檔", "type": "success"})
@@ -666,7 +692,7 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
             if s["type"] == "success": st.success(f"**{title}**\n\n{body}")
             elif s["type"] == "error": st.error(f"**{title}**\n\n{body}")
             elif s["type"] == "warning": st.warning(f"**{title}**\n\n{body}")
-            elif s["type"] == "primary": st.info(f"**{title}**\n\n{body}")
+            elif s["type"] == "primary": st.info(f"**{title}**\n\n{body}", icon="💎")
             else: st.info(f"**{title}**\n\n{body}")
     
     st.markdown("---")
@@ -1116,11 +1142,9 @@ def run_app():
                     today_max = hist_max
                     today_min = hist_min
             else:
-                # 無歷史紀錄 (可能剛開盤或沒開機)
                 if in_valid_window:
                     today_max = br
                     today_min = br
-                # 如果連當下都不valid，那 today_max 就維持 None
         
             n_state = load_notify_state(data['d']) 
 
@@ -1204,7 +1228,6 @@ def run_app():
             else:
                 caption_str += " | 開盤: 等待中..."
             
-            # [修正] 盤後若無盤中紀錄(count<5) 或 當下沒有有效極值(today_max is None)，都顯示提示
             if (current_time > time(13, 30) and hist_count < 5) or (today_max is None):
                 if current_time > time(13, 30):
                     caption_str += "\n⚠️ 目前無盤中廣度資料 (未在盤中運行)"
@@ -1252,7 +1275,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (分母門檻過濾版)...")
+        print("正在啟動 Streamlit 介面 (綜合戰略優化版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
