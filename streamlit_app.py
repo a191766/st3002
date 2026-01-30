@@ -20,9 +20,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.64 (極致瘦身修正版)
+# 設定區 v9.55.65 (頂部留白微調版)
 # ==========================================
-APP_VER = "v9.55.64 (極致瘦身修正版)"
+APP_VER = "v9.55.65 (頂部留白微調版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -1143,11 +1143,11 @@ def run_app():
     # [修正] 1. 設定頁面配置 (必須是第一行)，設定標題但不在頁面上顯示大標題
     st.set_page_config(page_title=APP_VER, layout="wide")
     
-    # [修正] 2. 注入 CSS 減少頂部留白
+    # [修正] 2. 注入 CSS 減少頂部留白，從 1rem 改為 3rem，避免被遮擋
     st.markdown("""
         <style>
         .block-container {
-            padding-top: 1rem !important;
+            padding-top: 3rem !important;
             padding-bottom: 0rem !important;
         }
         </style>
@@ -1361,7 +1361,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (極致瘦身修正版)...")
+        print("正在啟動 Streamlit 介面 (頂部留白微調版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
