@@ -20,9 +20,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.52 (智慧補全版)
+# 設定區 v9.55.53 (分母門檻過濾版)
 # ==========================================
-APP_VER = "v9.55.52 (智慧補全版)"
+APP_VER = "v9.55.53 (分母門檻過濾版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -153,10 +153,14 @@ def get_intraday_extremes(d_cur):
         if df.empty: return None, None, 0
         df['Date'] = df['Date'].astype(str)
         
+        if 'Total' not in df.columns: df['Total'] = 0 # 防呆：確保舊版CSV也有此欄位
+        
+        # [修正] 增加 Total >= OPEN_COUNT_THR (290) 的條件
         df_today = df[
             (df['Date'] == str(d_cur)) & 
             (df['Time'] >= "09:00") & 
-            (df['Time'] <= "13:30")
+            (df['Time'] <= "13:30") &
+            (df['Total'] >= OPEN_COUNT_THR)
         ]
         
         if df_today.empty: return None, None, 0
@@ -328,18 +332,14 @@ def get_chips_data_smart(token):
     target_str = target_date.strftime("%Y-%m-%d")
     cache = load_json_file(CHIPS_FILE)
     
-    # [修正邏輯] 即使快取有資料，也要檢查是否完整
     if target_str in cache:
         cached_data = cache[target_str]['data']
-        # 檢查融資日期是否跟目標日期一樣 (代表已更新)
         margin_date = cached_data.get('margin_date', '')
         margin_bal_date = cached_data.get('margin_bal_date', '')
         
-        # 如果融資資料是舊的 (不等於 target_str)，就強制重新抓取 (不 return)
         if margin_date == target_str and margin_bal_date == target_str:
             return cached_data, cache[target_str]['diag']
     
-    # 執行抓取 (快取沒中，或是快取資料不全)
     data, diag = fetch_chips_from_network(token, target_str)
     
     is_success = False
@@ -544,7 +544,6 @@ def get_prices_twse_mis(codes, info_map):
                         elif pz and pz != '-' and pz.replace('.','').isdigit(): 
                             price = float(pz); note="試撮"
                         
-                        # [終極修正] 若無成交價，改用「買賣量 (g/f)」判斷掛單狀態
                         if price == 0:
                             g_str = item.get('g', '')
                             f_str = item.get('f', '')
@@ -781,7 +780,6 @@ def plot_chart():
     rule_g = alt.Chart(pd.DataFrame({'y':[BREADTH_LOW]})).mark_rule(color='green', strokeDash=[5,5]).encode(y='y')
     
     if not chart_data.empty:
-        # [圖表優化] 黃色廣度: 實線(細) + 點(小)
         l_b = base.mark_line(color='#ffc107', strokeWidth=1).encode(
             y=alt.Y('Breadth', title=None, scale=alt.Scale(domain=[0,1], nice=False), axis=y_axis)
         )
@@ -789,8 +787,6 @@ def plot_chart():
             y='Breadth', 
             tooltip=['DT', alt.Tooltip('Breadth', format='.1%')]
         )
-        
-        # [圖表優化] 藍色大盤: 實線(細) + 點(小)
         l_t = base.mark_line(color='#007bff', strokeWidth=1).encode(
             y=alt.Y('T_S', scale=alt.Scale(domain=[0,1]))
         )
@@ -802,7 +798,6 @@ def plot_chart():
     else:
         layers = [base, rule_r, rule_g]
 
-    # [新增] 盤後提示
     if chart_data.empty and datetime.now(timezone(timedelta(hours=8))).time() > time(13, 30):
         st.warning("⚠️ 無盤中歷史數據：程式未在盤中運行，無法顯示今日走勢圖。")
 
@@ -1041,7 +1036,7 @@ def fetch_all():
         "br":br_c, "br_p":br_p, "h":h_c, "v":v_c, "h_p":h_p, "v_p":v_p,
         "df":pd.DataFrame(dtls), 
         "t":last_t, "tc":t_chg, "slope":slope, "src_type": data_source,
-        "raw":{'Date':d_cur,'Time':rec_t,'Breadth':br_c}, "src":msg_src,
+        "raw":{'Date':d_cur,'Time':rec_t,'Breadth':br_c, 'v':v_c}, "src":msg_src,
         "api_status": api_status_code, "sj_err": sj_err, "sj_usage": sj_usage_info,
         "chip_strat": chip_strategy,
         "chip_diag": chips_diag 
@@ -1100,14 +1095,18 @@ def run_app():
             br = data['br']
             open_br = get_opening_breadth(data['d'])
              
-            # [修正] 取得極值 + 資料筆數
+            # [修正] 取得極值 + 資料筆數 (底層已過濾 Total >= 290)
             hist_max, hist_min, hist_count = get_intraday_extremes(data['d'])
             
             current_time = datetime.now(timezone(timedelta(hours=8))).time()
-            in_valid_window = time(9, 0) <= current_time <= time(13, 30)
             
-            today_max = br
-            today_min = br
+            # [修正] 有效視窗：時間在 09:00~13:30 且 當下有效家數(v) >= 290
+            is_valid_time = time(9, 0) <= current_time <= time(13, 30)
+            is_valid_count = data['raw']['v'] >= OPEN_COUNT_THR
+            in_valid_window = is_valid_time and is_valid_count
+            
+            today_max = None
+            today_min = None
             
             if hist_max is not None:
                 if in_valid_window:
@@ -1116,6 +1115,12 @@ def run_app():
                 else:
                     today_max = hist_max
                     today_min = hist_min
+            else:
+                # 無歷史紀錄 (可能剛開盤或沒開機)
+                if in_valid_window:
+                    today_max = br
+                    today_min = br
+                # 如果連當下都不valid，那 today_max 就維持 None
         
             n_state = load_notify_state(data['d']) 
 
@@ -1148,7 +1153,7 @@ def run_app():
                     if is_dev_high and not n_state['was_dev_high']: n_state['was_dev_high'] = True
                     if is_dev_low and not n_state['was_dev_low']: n_state['was_dev_low'] = True
                 
-                    if br <= (today_max - 0.05):
+                    if today_max is not None and br <= (today_max - 0.05):
                         if not n_state['notified_drop_high']:
                             should_notify = False
                             if data['slope'] > 0 and n_state['intraday_trend'] == 'up': should_notify = True
@@ -1158,7 +1163,7 @@ def run_app():
                             n_state['notified_drop_high'] = True
                     else: n_state['notified_drop_high'] = False
                     
-                    if br >= (today_min + 0.05):
+                    if today_min is not None and br >= (today_min + 0.05):
                         if not n_state['notified_rise_low']:
                             should_notify = False
                             if data['slope'] < 0 and n_state['intraday_trend'] == 'down': should_notify = True
@@ -1199,9 +1204,12 @@ def run_app():
             else:
                 caption_str += " | 開盤: 等待中..."
             
-            # [修正] 盤後若歷史資料少於 5 筆 (判定為無盤中紀錄)，顯示警告
-            if current_time > time(13, 30) and hist_count < 5:
-                caption_str += "\n⚠️ 目前無盤中廣度資料 (未在盤中運行)"
+            # [修正] 盤後若無盤中紀錄(count<5) 或 當下沒有有效極值(today_max is None)，都顯示提示
+            if (current_time > time(13, 30) and hist_count < 5) or (today_max is None):
+                if current_time > time(13, 30):
+                    caption_str += "\n⚠️ 目前無盤中廣度資料 (未在盤中運行)"
+                else:
+                    caption_str += "\n(資料累積中...)"
             else:
                 caption_str += f"\n今日目前最高廣度: {today_max:.1%}"
                 caption_str += f"\n今日目前最低廣度: {today_min:.1%}"
@@ -1244,7 +1252,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (智慧補全版)...")
+        print("正在啟動 Streamlit 介面 (分母門檻過濾版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
