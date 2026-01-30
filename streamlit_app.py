@@ -18,9 +18,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.21 (修復高低點顯示)
+# 設定區 v9.55.20 (高低點時間限制版)
 # ==========================================
-APP_VER = "v9.55.21 (修復高低點顯示)"
+APP_VER = "v9.55.20 (高低點時間限制版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -1177,10 +1177,6 @@ def run_app():
                 caption_str += f" | 開盤: {open_br:.1%}"
             else:
                 caption_str += " | 開盤: 等待中..."
-            
-            # [修正]: 補回顯示高低點
-            caption_str += f" | 高: {today_max:.1%} | 低: {today_min:.1%}"
-
             c1.caption(caption_str)
             
             c2.metric("大盤漲跌", f"{data['tc']:.2%}")
@@ -1219,7 +1215,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (修復高低點顯示)...")
+        print("正在啟動 Streamlit 介面 (圖表崩潰修復版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
