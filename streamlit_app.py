@@ -277,7 +277,7 @@ def fetch_chips_from_network(token, target_date_str):
             if call > 0: 
                 pc_val = round((put/call)*100, 2)
                 pc_date = latest.iloc[0]['date']
-                # [修改] 顯示詳細 Put/Call 數值以供除錯
+                # [修正] 顯示詳細 Put/Call 數值以供除錯
                 diagnosis.append(f"✅ 選擇權(FinMind): {pc_val}% (Put={int(put):,}/Call={int(call):,}) ({pc_date})")
 
     if pc_val is None or pc_val == 0:
