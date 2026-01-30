@@ -20,9 +20,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.69 (去冗餘精簡版)
+# 設定區 v9.55.69 (去冗餘精簡版 + P/C 除錯)
 # ==========================================
-APP_VER = "v9.55.69 (去冗餘精簡版)"
+APP_VER = "v9.55.69 (去冗餘精簡版 + P/C 除錯)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -217,6 +217,7 @@ def get_taifex_pc_ratio(target_date_str):
                         try:
                             val = float(top_row.iloc[6])
                             date_str = str(top_row.iloc[0]) 
+                
                             return val, date_str, f"期交所官網 ({date_str})"
                         except: continue
     except Exception as e:
@@ -276,7 +277,8 @@ def fetch_chips_from_network(token, target_date_str):
             if call > 0: 
                 pc_val = round((put/call)*100, 2)
                 pc_date = latest.iloc[0]['date']
-                diagnosis.append(f"✅ 選擇權(FinMind): {pc_val}% ({pc_date})")
+                # [修改] 顯示詳細 Put/Call 數值以供除錯
+                diagnosis.append(f"✅ 選擇權(FinMind): {pc_val}% (Put={int(put):,}/Call={int(call):,}) ({pc_date})")
 
     if pc_val is None or pc_val == 0:
         taifex_val, taifex_date, taifex_msg = get_taifex_pc_ratio(target_date_str)
@@ -717,10 +719,10 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
         <style>
         div[data-testid="stMetricValue"] {
             font-size: 18px !important;
-        }
+}
         div[data-testid="stMetricLabel"] {
             font-size: 14px !important;
-        }
+}
         </style>
     """, unsafe_allow_html=True)
 
@@ -789,7 +791,7 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
             elif color == 'warning': st.warning(f"**{sig}**\n\n{act}")
             elif color == 'primary': st.info(f"**{sig}**\n\n{act}", icon="💎")
             else: st.info(f"**{sig}**\n\n{act}")
-            
+        
         with st.expander("查看詳細數據來源"):
             for msg in chip_diag: st.text(msg)
             
@@ -957,6 +959,7 @@ def fetch_all():
                                     'price': float(s.close),
                                     'y_close': float(s.reference_price) 
                                 }
+                
                         time_module.sleep(0.2)
                     
                     if len(pmap) > 0:
@@ -1043,7 +1046,7 @@ def fetch_all():
         if curr_p > 0 and p_price > 0 and not df.empty:
             hist_closes = []
             if df.iloc[-1]['date'] == today_str:
-                 hist_closes = df['close'].iloc[:-1].tail(4).tolist()
+                hist_closes = df['close'].iloc[:-1].tail(4).tolist()
             else:
                  hist_closes = df['close'].tail(4).tolist()
                  
@@ -1054,7 +1057,7 @@ def fetch_all():
                 if curr_p > c_ma5: h_c += 1; c_stt="✅"
                 else: c_stt="📉"
                 v_c += 1
-        
+    
         dtls.append({
             "代號":c, "市場": m_display,
             "昨收":p_price, "昨MA5":round(p_ma5,2), "昨狀態":p_stt,
@@ -1202,7 +1205,7 @@ def run_app():
             
             br = data['br']
             open_br = get_opening_breadth(data['d'])
-             
+        
             hist_max, hist_min, hist_count = get_intraday_extremes(data['d'])
             current_time = datetime.now(timezone(timedelta(hours=8))).time()
             is_valid_time = time(9, 0) <= current_time <= time(13, 30)
@@ -1231,8 +1234,8 @@ def run_app():
                     n_state['intraday_trend'] = 'up'
                     if tg_tok and tg_id: send_tg(tg_tok, tg_id, f"🔒 <b>【趨勢鎖定】</b>\n廣度先達開盤+5% (目前{br:.1%})，今日確認偏多！")
                 elif br <= (open_br - 0.05):
-                     n_state['intraday_trend'] = 'down'
-                     if tg_tok and tg_id: send_tg(tg_tok, tg_id, f"🔒 <b>【趨勢鎖定】</b>\n廣度先達開盤-5% (目前{br:.1%})，今日確認偏空！")
+                    n_state['intraday_trend'] = 'down'
+                    if tg_tok and tg_id: send_tg(tg_tok, tg_id, f"🔒 <b>【趨勢鎖定】</b>\n廣度先達開盤-5% (目前{br:.1%})，今日確認偏空！")
 
             if tg_tok and tg_id:
                 stt = 'normal'
