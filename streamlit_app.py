@@ -18,9 +18,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.21 (修復高低點顯示)
+# 設定區 v9.55.22 (新增高低點通知)
 # ==========================================
-APP_VER = "v9.55.21 (修復高低點顯示)"
+APP_VER = "v9.55.22 (新增高低點通知)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -60,7 +60,10 @@ def load_notify_state(today_str):
         "was_dev_low": False,
         "notified_drop_high": False,
         "notified_rise_low": False,
-        "intraday_trend": None  
+        "intraday_trend": None,
+        # 新增記錄當日已通知過的最高/最低點，避免重啟程式時重複通知
+        "last_high_record": None,
+        "last_low_record": None
     }
     
     if not os.path.exists(NOTIFY_FILE):
@@ -73,6 +76,10 @@ def load_notify_state(today_str):
                 return default_state
             if "intraday_trend" not in state:
                 state["intraday_trend"] = None
+            # 確保舊版狀態檔也能讀到新欄位
+            if "last_high_record" not in state: state["last_high_record"] = None
+            if "last_low_record" not in state: state["last_low_record"] = None
+            
             return state
     except:
         return default_state
@@ -1157,6 +1164,26 @@ def run_app():
                             n_state['notified_rise_low'] = True
                     else:
                         n_state['notified_rise_low'] = False
+
+                # [新增]: 創新高/創新低通知 (僅限 09:00 ~ 13:30)
+                if is_valid_time:
+                    # 初始化 (若是空值，先設為目前值，不發通知)
+                    if n_state.get('last_high_record') is None:
+                         n_state['last_high_record'] = today_max
+                    if n_state.get('last_low_record') is None:
+                         n_state['last_low_record'] = today_min
+
+                    # 創新高
+                    if today_max > n_state['last_high_record']:
+                         msg = f"🏆 <b>【創新高】</b>\n廣度突破 {today_max:.1%} (原: {n_state['last_high_record']:.1%})"
+                         send_tg(tg_tok, tg_id, msg)
+                         n_state['last_high_record'] = today_max
+
+                    # 創新低
+                    if today_min < n_state['last_low_record']:
+                         msg = f"📉 <b>【創新低】</b>\n廣度跌破 {today_min:.1%} (原: {n_state['last_low_record']:.1%})"
+                         send_tg(tg_tok, tg_id, msg)
+                         n_state['last_low_record'] = today_min
             
                 save_notify_state(n_state)
             
@@ -1219,7 +1246,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (修復高低點顯示)...")
+        print("正在啟動 Streamlit 介面 (新增高低點通知)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
