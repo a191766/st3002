@@ -20,9 +20,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.49 (盤後圖表保留版)
+# 設定區 v9.55.50 (換日自動清空版)
 # ==========================================
-APP_VER = "v9.55.49 (盤後圖表保留版)"
+APP_VER = "v9.55.50 (換日自動清空版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -612,12 +612,18 @@ def save_rec(d, t, b, tc, t_cur, t_prev, intra, total_v):
         last_d = str(df.iloc[-1]['Date'])
         last_t = str(df.iloc[-1]['Time'])[:5]
         
+        # [核心修正] 換日自動清空邏輯
         if last_d != str(d): 
-            pd.concat([df, row], ignore_index=True).to_csv(HIST_FILE, index=False)
+            # 如果檔案裡的日期不是今天 -> 代表換日了 -> 直接覆寫 (Overwrite)
+            row.to_csv(HIST_FILE, index=False)
         else:
-            # [修正] 不論是盤中還是盤後，只要是同一天，就用 append (保留盤中紀錄)
-            # 只有當盤後且資料量非常少(第一次開機)時，下面的 if 會擋掉
-            row.to_csv(HIST_FILE, mode='a', header=False, index=False)
+            # 還是同一天 -> 保留盤中紀錄
+            # [修正] 盤後保護：如果已經超過 13:30 且資料量足夠 (>10筆)，就不再寫入新資料(變成唯讀)，避免蓋掉盤中走勢
+            if not intra and len(df) > 10:
+                pass # 盤後且有資料 -> 不做任何事，保護檔案
+            else:
+                # 盤中 或 盤後但資料太少(剛開機) -> 寫入
+                row.to_csv(HIST_FILE, mode='a', header=False, index=False)
     except: row.to_csv(HIST_FILE, index=False)
 
 def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag):
@@ -766,7 +772,6 @@ def plot_chart():
     rule_g = alt.Chart(pd.DataFrame({'y':[BREADTH_LOW]})).mark_rule(color='green', strokeDash=[5,5]).encode(y='y')
     
     if not chart_data.empty:
-        # [圖表優化] 黃色廣度: 實線(細) + 點(小)
         l_b = base.mark_line(color='#ffc107', strokeWidth=1).encode(
             y=alt.Y('Breadth', title=None, scale=alt.Scale(domain=[0,1], nice=False), axis=y_axis)
         )
@@ -774,8 +779,6 @@ def plot_chart():
             y='Breadth', 
             tooltip=['DT', alt.Tooltip('Breadth', format='.1%')]
         )
-        
-        # [圖表優化] 藍色大盤: 實線(細) + 點(小)
         l_t = base.mark_line(color='#007bff', strokeWidth=1).encode(
             y=alt.Y('T_S', scale=alt.Scale(domain=[0,1]))
         )
@@ -787,7 +790,6 @@ def plot_chart():
     else:
         layers = [base, rule_r, rule_g]
 
-    # [新增] 盤後提示
     if chart_data.empty and datetime.now(timezone(timedelta(hours=8))).time() > time(13, 30):
         st.warning("⚠️ 無盤中歷史數據：程式未在盤中運行，無法顯示今日走勢圖。")
 
@@ -1229,7 +1231,7 @@ if __name__ == "__main__":
     if 'streamlit' in sys.modules and any('streamlit' in arg for arg in sys.argv):
         run_app()
     else:
-        print("正在啟動 Streamlit 介面 (盤後圖表保留版)...")
+        print("正在啟動 Streamlit 介面 (換日自動清空版)...")
         try:
             subprocess.call(["streamlit", "run", __file__])
         except Exception as e:
