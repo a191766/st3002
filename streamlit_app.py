@@ -20,9 +20,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.67 (介面修復回歸版)
+# 設定區 v9.55.68 (列表收合版)
 # ==========================================
-APP_VER = "v9.55.67 (介面修復回歸版)"
+APP_VER = "v9.55.68 (列表收合版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -835,7 +835,6 @@ def plot_chart(base_d, date_prev):
                 
                 df_today = df[df['Time'] >= "09:00"].copy()
                 
-                # 強制截斷 13:30 以後的資料
                 df_today = df_today[df_today['Time'] <= "13:30"]
                 
                 if not df_today.empty:
@@ -1137,10 +1136,9 @@ def fetch_all():
     }
 
 def run_app():
-    # [修正] 1. 設定頁面配置 (必須是第一行)
     st.set_page_config(page_title=APP_VER, layout="wide")
     
-    # [修正] 2. 注入 CSS，這裡改回較寬鬆的 3rem 以確保標題顯示
+    # [修正] 3rem 讓標題有足夠空間
     st.markdown("""
         <style>
         .block-container {
@@ -1150,7 +1148,7 @@ def run_app():
         </style>
     """, unsafe_allow_html=True)
     
-    # [修正] 3. 標題回歸 (使用 H3 標籤)
+    # [修正] 使用 H3 標題
     st.markdown(f"<h3 style='text-align: left; margin: 0; padding-bottom: 10px;'>📈 {APP_VER}</h3>", unsafe_allow_html=True)
     
     with st.sidebar:
@@ -1189,20 +1187,18 @@ def run_app():
     with col_btn:
         if st.button("🔄 刷新"): st.rerun()
     
-    # 先佔位，等資料回來後填入
     date_placeholder = col_date.empty()
 
     try:
         data = fetch_all()
         if isinstance(data, str): st.error(f"❌ {data}")
         elif data:
-            # [修正] 填入日期與名單資訊到按鈕右側
             date_placeholder.markdown(
                 f"<div style='padding-top: 8px; font-size: 14px; color: gray;'>📅 {data['d']} (名單: {data['d_prev']})</div>", 
                 unsafe_allow_html=True
             )
             
-            # [修正] 恢復顯示藍色資訊框 (在按鈕下方)
+            # [修正] 藍色資訊框顯示回來了
             st.info(f"{data['src']} | 更新: {data['t']} | 來源: {data['src_type']}")
             
             st.sidebar.info(f"報價來源: {data['src_type']}")
@@ -1219,6 +1215,7 @@ def run_app():
             open_br = get_opening_breadth(data['d'])
              
             hist_max, hist_min, hist_count = get_intraday_extremes(data['d'])
+            
             current_time = datetime.now(timezone(timedelta(hours=8))).time()
             is_valid_time = time(9, 0) <= current_time <= time(13, 30)
             is_valid_count = data['raw']['v'] >= OPEN_COUNT_THR
@@ -1304,11 +1301,9 @@ def run_app():
 
                 save_notify_state(n_state)
             
-            # 1. 圖表 (優先顯示)
             chart = plot_chart(data['d'], data['d_prev'])
             if chart: st.altair_chart(chart, use_container_width=True)
             
-            # 2. 廣度數據與大盤
             c1,c2,c3 = st.columns(3)
             c1.metric("今日廣度", f"{br:.1%}", f"{data['h']}/{data['v']}")
             
@@ -1333,10 +1328,11 @@ def run_app():
             sl = data['slope']; icon = "📈 正" if sl > 0 else "📉 負"
             c3.metric("大盤MA5斜率", f"{sl:.2f}", icon)
             
-            # 3. 戰略與籌碼
             display_strategy_panel(data['slope'], open_br, br, n_state, data['chip_strat'], data['chip_diag'])
             
-            st.dataframe(data['df'], use_container_width=True, hide_index=True)
+            # [修正] 列表收合
+            with st.expander("📋 查看個股狀態表", expanded=False):
+                st.dataframe(data['df'], use_container_width=True, hide_index=True)
         else: st.sidebar.warning("⏸ 休市")
 
     except Exception as e: 
