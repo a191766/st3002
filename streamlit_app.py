@@ -20,9 +20,9 @@ except ImportError:
     st.stop()
 
 # ==========================================
-# 設定區 v9.55.69 (純期交所版)
+# 設定區 v9.55.70 (純期交所版)
 # ==========================================
-APP_VER = "v9.55.69 (純期交所版)"
+APP_VER = "v9.55.70 (純期交所版)"
 TOP_N = 300              
 BREADTH_THR = 0.65 
 BREADTH_LOW = 0.55 
@@ -217,7 +217,6 @@ def get_taifex_pc_ratio(target_date_str):
                         try:
                             val = float(top_row.iloc[6])
                             date_str = str(top_row.iloc[0]) 
-                
                             return val, date_str, f"期交所官網 ({date_str})"
                         except: continue
     except Exception as e:
@@ -525,7 +524,7 @@ def get_ranks_strict(token, target_date_str, min_count=0):
     df = df[df['ID'].str.len()==4]
     df = df[df['ID'].str.isdigit()]
     for p in EXCL_PFX: df = df[~df['ID'].str.startswith(p)]
-     
+    
     ranks = df.sort_values('Money', ascending=False).head(TOP_N)['ID'].tolist()
     
     if ranks and (min_count == 0 or len(df) > 1500):
@@ -579,7 +578,7 @@ def get_prices_twse_mis(codes, info_map):
                 q_list.append(f"tse_{c}.tw")
             else:
                 q_list.append(f"otc_{c}.tw")
-                 
+                
         if q_list:
             req_strs.append("|".join(q_list))
     
@@ -604,6 +603,7 @@ def get_prices_twse_mis(codes, info_map):
                         y = item.get('y', '-') 
                         pz = item.get('pz', '-') 
                         val = {}
+                        
                         if y!='-' and y!='': val['y'] = float(y)
                         price = 0
                         note = ""
@@ -662,7 +662,7 @@ def get_prices_twse_mis(codes, info_map):
                         else: debug_log[c] = "無價"
                 except: pass
         except: pass
-             
+                
     return results, debug_log
 
 def save_rec(d, t, b, tc, t_cur, t_prev, intra, total_v):
@@ -707,10 +707,10 @@ def display_strategy_panel(slope, open_br, br, n_state, chip_strategy, chip_diag
         <style>
         div[data-testid="stMetricValue"] {
             font-size: 18px !important;
-}
+        }
         div[data-testid="stMetricLabel"] {
             font-size: 14px !important;
-}
+        }
         </style>
     """, unsafe_allow_html=True)
 
@@ -898,8 +898,8 @@ def fetch_all():
     info_map = get_stock_info_map(ft)
     
     d_cur = days[-1]
-    is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
-    allow_live_fetch = (0<=now.weekday()<=4) and (now.time() >= time(8,45))
+    is_intra = (time(9,0)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
+    allow_live_fetch = (0<=now.weekday()<=4) and (now.time() >= time(9,0))
     
     if len(days) > 1:
         date_prev = days[-2]
@@ -911,7 +911,7 @@ def fetch_all():
     ranks_curr = ranks_prev 
     msg_src = f"名單:{date_prev}(昨日/盤中)"
     
-    if now.time() >= time(14, 0) and d_cur == today_str:
+    if now.time() >= time(15, 0) and d_cur == today_str:
         ranks_today, _ = get_ranks_strict(ft, today_str, min_count=1500)
         if ranks_today:
             ranks_curr = ranks_today
@@ -948,7 +948,7 @@ def fetch_all():
                                     'y_close': float(s.reference_price) 
                                 }
                 
-                        time_module.sleep(0.2)
+                    time_module.sleep(0.2)
                     
                     if len(pmap) > 0:
                         data_source = "永豐API"
@@ -1193,7 +1193,7 @@ def run_app():
             
             br = data['br']
             open_br = get_opening_breadth(data['d'])
-        
+            
             hist_max, hist_min, hist_count = get_intraday_extremes(data['d'])
             current_time = datetime.now(timezone(timedelta(hours=8))).time()
             is_valid_time = time(9, 0) <= current_time <= time(13, 30)
@@ -1319,7 +1319,7 @@ def run_app():
 
     if auto:
         now = datetime.now(timezone(timedelta(hours=8)))
-        is_intra = (time(8,45)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
+        is_intra = (time(9,0)<=now.time()<time(13,30)) and (0<=now.weekday()<=4)
         if is_intra:
             sec = 120
             with st.sidebar:
