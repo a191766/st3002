@@ -414,10 +414,15 @@ def get_chip_strategy(ma5_slope, chips):
             sig, act, color = "🚀 火力全開 (外資助攻)", "外資期現貨同步作多，支撐強勁。多單抱緊，甚至加碼。", "success"
             is_chip_bullish = True
         
-    # 4. 絕佳抄底
+    # 4. 絕佳抄底 (修正版：加入殺多陷阱判斷)
     elif ma5_slope < 0 and ((margin_ratio > 0 and margin_ratio < 135) or margin_chg < -15):
-        sig, act, color = "💎 絕佳抄底 (斷頭清洗)", "空頭趨勢中見融資斷頭，醞釀反彈。", "primary"
-        is_chip_bullish = True 
+        # [新增劇本] 判斷是否為陷阱：外資期貨空單重押且維持率未殺透
+        if fut_oi < -15000 and margin_ratio > 150:
+            sig, act, color = "⚠️ 殺多陷阱 (外資重空)", "融資雖減但維持率仍高，且外資期貨重倉空單。這是誘空或續殺，禁止接刀。", "error"
+            is_chip_bearish = True
+        else:
+            sig, act, color = "💎 絕佳抄底 (斷頭清洗)", "空頭趨勢中見融資斷頭，醞釀反彈。", "primary"
+            is_chip_bullish = True
 
     # 5. 多頭清洗 vs 雙逃
     elif ma5_slope > 0 and margin_chg < -15:
