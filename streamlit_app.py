@@ -418,7 +418,7 @@ def get_chip_strategy(ma5_slope, chips):
     elif ma5_slope < 0 and ((margin_ratio > 0 and margin_ratio < 135) or margin_chg < -15):
         # [新增劇本] 判斷是否為陷阱：外資期貨空單重押且維持率未殺透
         if fut_oi < -15000 and margin_ratio > 150:
-            sig, act, color = "⚠️ 殺多陷阱 (外資重空)", "融資雖減但維持率仍高，且外資期貨重倉空單。這是誘空或續殺，禁止接刀。", "error"
+            sig, act, color = "⚠️ 殺多陷阱 (外資重空)", "融資雖減但維持率仍高，且外資期貨重倉空單。這是誘多或續殺，禁止接刀。", "error"
             is_chip_bearish = True
         else:
             sig, act, color = "💎 絕佳抄底 (斷頭清洗)", "空頭趨勢中見融資斷頭，醞釀反彈。", "primary"
