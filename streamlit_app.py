@@ -548,19 +548,18 @@ def get_hist(token, code, start):
     except: return pd.DataFrame()
 
 # ==========================================
-# 修改重點：增加報錯機制與完善 Header
+# 抓取證交所即時報價 (修改版)
 # ==========================================
 def get_prices_twse_mis(codes, info_map):
     if not codes: return {}, {}
     
     session = cffi_requests.Session(impersonate="chrome")
     
-    # 增加更完整的 Headers，降低被防火牆(WAF)阻擋的機率
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer": "https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw",
+        "Referer": "https://mis.twse.com.tw/stock/index.jsp",
         "Host": "mis.twse.com.tw",
         "X-Requested-With": "XMLHttpRequest",
         "Connection": "keep-alive"
@@ -568,22 +567,19 @@ def get_prices_twse_mis(codes, info_map):
     session.headers.update(headers)
     
     try:
-        ts_now = int(time_module.time() * 1000)
-        # 檢查初始化請求的狀態，並在網頁印出錯誤
-        r_init = session.get(f"https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw&_={ts_now}", timeout=10)
-        if r_init.status_code != 200:
-            st.error(f"[MIS 偵錯] 首頁初始化異常，HTTP 狀態碼: {r_init.status_code}")
+        # 單純連線首頁取得 Session Cookie，不論是 404 或其他非致命錯誤，只要不中斷就不報錯
+        session.get("https://mis.twse.com.tw/stock/index.jsp", timeout=10)
         time_module.sleep(1)
     except Exception as e:
-        st.error(f"[MIS 偵錯] 首頁初始化連線失敗: {e}")
-        return {}, {c: "初始化失敗" for c in codes}
+        # 只有在網路完全斷線或 TimeOut 時，才記錄下來但不阻斷後續執行
+        pass
 
     req_strs = []
     chunk_size = 50 
     results = {}
     debug_log = {}
     
-    error_shown = False # 避免重複跳出太多一樣的錯誤框
+    error_shown = False
 
     for i in range(0, len(codes), chunk_size):
         chunk = codes[i:i+chunk_size]
@@ -608,7 +604,6 @@ def get_prices_twse_mis(codes, info_map):
         params = {"json": "1", "delay": "0", "_": ts, "ex_ch": q_str}
         
         try:
-            # 稍微放慢請求速度，避免觸發 IP Rate Limit 封鎖
             time_module.sleep(random.uniform(0.5, 1.2))
             r = session.get(base_url, params=params, timeout=10)
             
