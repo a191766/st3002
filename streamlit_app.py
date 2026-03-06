@@ -547,29 +547,43 @@ def get_hist(token, code, start):
     try: return api.taiwan_stock_daily(stock_id=code, start_date=start)
     except: return pd.DataFrame()
 
+# ==========================================
+# 修改重點：增加報錯機制與完善 Header
+# ==========================================
 def get_prices_twse_mis(codes, info_map):
     if not codes: return {}, {}
     
     session = cffi_requests.Session(impersonate="chrome")
+    
+    # 增加更完整的 Headers，降低被防火牆(WAF)阻擋的機率
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
         "Referer": "https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw",
         "Host": "mis.twse.com.tw",
         "X-Requested-With": "XMLHttpRequest",
+        "Connection": "keep-alive"
     }
     session.headers.update(headers)
     
     try:
         ts_now = int(time_module.time() * 1000)
-        session.get(f"https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw&_={ts_now}", timeout=10)
+        # 檢查初始化請求的狀態，並在網頁印出錯誤
+        r_init = session.get(f"https://mis.twse.com.tw/stock/fibest.jsp?lang=zh_tw&_={ts_now}", timeout=10)
+        if r_init.status_code != 200:
+            st.error(f"[MIS 偵錯] 首頁初始化異常，HTTP 狀態碼: {r_init.status_code}")
         time_module.sleep(1)
-    except:
+    except Exception as e:
+        st.error(f"[MIS 偵錯] 首頁初始化連線失敗: {e}")
         return {}, {c: "初始化失敗" for c in codes}
 
     req_strs = []
     chunk_size = 50 
     results = {}
     debug_log = {}
+    
+    error_shown = False # 避免重複跳出太多一樣的錯誤框
 
     for i in range(0, len(codes), chunk_size):
         chunk = codes[i:i+chunk_size]
@@ -594,13 +608,18 @@ def get_prices_twse_mis(codes, info_map):
         params = {"json": "1", "delay": "0", "_": ts, "ex_ch": q_str}
         
         try:
-            time_module.sleep(random.uniform(0.3, 0.8))
+            # 稍微放慢請求速度，避免觸發 IP Rate Limit 封鎖
+            time_module.sleep(random.uniform(0.5, 1.2))
             r = session.get(base_url, params=params, timeout=10)
             
             if r.status_code == 200:
                 try:
                     data = r.json()
-                    if 'msgArray' not in data: continue
+                    if 'msgArray' not in data: 
+                        if not error_shown:
+                            st.warning(f"[MIS 偵錯] 請求成功，但未包含 msgArray (可能被轉址或擋下)。回傳前100字元:\n{str(data)[:100]}")
+                            error_shown = True
+                        continue
                     
                     for item in data['msgArray']:
                         c = item.get('c', '') 
@@ -665,10 +684,23 @@ def get_prices_twse_mis(codes, info_map):
                             val['z'] = price; val['note'] = note
                             results[c] = val
                         else: debug_log[c] = "無價"
-                except: pass
-        except: pass
+                except Exception as json_e:
+                    if not error_shown:
+                        st.error(f"[MIS 偵錯] JSON 解析失敗 ({json_e})。伺服器實際回傳前200字元:\n{r.text[:200]}")
+                        error_shown = True
+            else:
+                if not error_shown:
+                    st.error(f"[MIS 偵錯] 請求失敗，HTTP 狀態碼: {r.status_code}，回傳前200字元:\n{r.text[:200]}")
+                    error_shown = True
+                for c in chunk: debug_log[c] = f"HTTP {r.status_code}"
+        except Exception as req_e: 
+            if not error_shown:
+                st.error(f"[MIS 偵錯] 發送 API 請求時發生網路例外: {req_e}")
+                error_shown = True
+            for c in chunk: debug_log[c] = "連線異常"
                 
     return results, debug_log
+
 
 def save_rec(d, t, b, tc, t_cur, t_prev, intra, total_v):
     if t_cur == 0: return 
@@ -1176,14 +1208,12 @@ def run_app():
                 time_module.sleep(1)
             st.rerun()
 
-    # [修正] 移除按鈕右側的所有文字
     if st.button("🔄 刷新"): st.rerun()
 
     try:
         data = fetch_all()
         if isinstance(data, str): st.error(f"❌ {data}")
         elif data:
-            # [修正] 藍色資訊框緊貼按鈕下方
             st.info(f"{data['src']} | 更新: {data['t']} | 來源: {data['src_type']}")
             
             st.sidebar.info(f"報價來源: {data['src_type']}")
